@@ -359,7 +359,7 @@ func looksXML(txt string) bool {
 	return strings.HasPrefix(strings.TrimLeft(txt, " \t\r\n"), "<")
 }
 
-// CleanJSON 配置 JSON 容错：去 BOM、去 // 注释行、把保留字 class 改名。
+// CleanJSON 配置 JSON 容错：去 BOM、去 // 和 # 注释行、把保留字 class 改名。
 // 注意："class" 仅当后跟 [ 时才替换，避免误匹配 "class_name"、"className" 等字段。
 func CleanJSON(txt string) string {
 	t := txt
@@ -370,7 +370,8 @@ func CleanJSON(txt string) string {
 	var keep []string
 	for _, line := range lines {
 		line = strings.TrimRight(line, "\r")
-		if strings.HasPrefix(strings.TrimLeft(line, " \t"), "//") {
+		trimmed := strings.TrimLeft(line, " \t")
+		if strings.HasPrefix(trimmed, "//") || strings.HasPrefix(trimmed, "#") {
 			continue
 		}
 		keep = append(keep, line)

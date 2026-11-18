@@ -351,7 +351,7 @@ func BuildSites(cfg model.RawConfig) {
 	var out []model.Site
 	for i, r := range cfg.Sites {
 		s := model.Site{
-			Key: r.Key, Name: r.Name, Type: r.Type, API: r.API,
+			Key: r.Key, Name: r.Name, Type: int(r.Type), API: r.API,
 			Searchable:  r.Searchable == 1,
 			QuickSearch: r.QuickSearch == 1,
 		}

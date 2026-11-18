@@ -34,20 +34,20 @@ func (f FlexInt) MarshalJSON() ([]byte, error) {
 // ============ TVBox 配置 JSON 原始结构 ============
 
 type RawSite struct {
-	Key         string `json:"key"`
-	Name        string `json:"name"`
-	Type        int    `json:"type"`
-	API         string `json:"api"`
-	Searchable  int    `json:"searchable"`
-	QuickSearch int    `json:"quickSearch"`
-	Filterable  int    `json:"filterable"`
-	Ext         any    `json:"ext"` // 可能是字符串或对象
-	Jar         string `json:"jar"`
+	Key         string  `json:"key"`
+	Name        string  `json:"name"`
+	Type        FlexInt `json:"type"`
+	API         string  `json:"api"`
+	Searchable  FlexInt `json:"searchable"`
+	QuickSearch FlexInt `json:"quickSearch"`
+	Filterable  FlexInt `json:"filterable"`
+	Ext         any     `json:"ext"` // 可能是字符串或对象
+	Jar         string  `json:"jar"`
 }
 
 type RawParse struct {
 	Name string      `json:"name"`
-	Type int         `json:"type"`
+	Type FlexInt     `json:"type"`
 	URL  string      `json:"url"`
 	Ext  RawParseExt `json:"ext"`
 }
