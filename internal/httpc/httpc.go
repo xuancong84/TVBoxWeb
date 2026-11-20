@@ -154,6 +154,37 @@ func PeekCtx(ctx context.Context, u string, ms time.Duration) (string, error) {
 	return s, nil
 }
 
+// RangeTimedCtx 只取开头 maxBytes（默认 16KB）字节，返回耗时(ms)与实际读到的
+// 字节数——不下载真正的视频数据，几乎不占带宽，用来给直播线路估算延迟/粗略吞吐。
+// 复用 sharedTransport 连接池，不单独起新连接造成的握手时间不会污染测速结果。
+func RangeTimedCtx(ctx context.Context, u string, timeout time.Duration, maxBytes int) (ms int, n int, err error) {
+	if maxBytes <= 0 {
+		maxBytes = 16384
+	}
+	ctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, "GET", u, nil)
+	if err != nil {
+		return -1, 0, err
+	}
+	req.Header.Set("User-Agent", UA)
+	req.Header.Set("Accept", "*/*")
+	req.Header.Set("Range", fmt.Sprintf("bytes=0-%d", maxBytes-1))
+	t0 := time.Now()
+	client := &http.Client{Transport: sharedTransport}
+	res, err := client.Do(req)
+	if err != nil {
+		return -1, 0, fmt.Errorf("连接失败：%v", err)
+	}
+	defer res.Body.Close()
+	if res.StatusCode >= 400 {
+		return -1, 0, fmt.Errorf("HTTP %d", res.StatusCode)
+	}
+	buf := make([]byte, maxBytes)
+	nn, _ := io.ReadFull(res.Body, buf)
+	return int(time.Since(t0).Milliseconds()), nn, nil
+}
+
 // Propfind 发送 WebDAV PROPFIND 请求，Depth: 1 列当前目录直接子项。
 func Propfind(u string, extra map[string]string, timeout time.Duration) (string, error) {
 	return PropfindCtx(context.Background(), u, extra, timeout)

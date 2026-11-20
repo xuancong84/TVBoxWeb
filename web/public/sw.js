@@ -4,12 +4,12 @@
  * 缓存策略：
  * 1. 应用壳（index.html / manifest / 图标）：预缓存 + Network-First
  * 2. 静态资源（/assets/* 带 hash 文件名）：Cache-First（不可变）
- * 3. API GET 请求（/api/*）：Stale-While-Revalidate（离线兜底）
+ * 3. API GET 请求（/api/*）：Network-First（离线兜底）
  * 4. 视频代理流（/api/proxy/*）：不缓存（流媒体）
  * 5. WebSocket（/ws）：不拦截
  */
 
-const VERSION = 'yzz-v1'
+const VERSION = 'yzz-v25'
 
 const CACHE_SHELL = `${VERSION}-shell`
 const CACHE_STATIC = `${VERSION}-static`
@@ -75,9 +75,21 @@ self.addEventListener('fetch', (event) => {
   // 视频代理流：不缓存（流媒体，实时性优先）
   if (url.pathname.startsWith('/api/proxy')) return
 
-  // API GET 请求：Stale-While-Revalidate（离线兜底）
+  // API GET 请求：Network-First（离线兜底）
+  //
+  // 这里原来是 Stale-While-Revalidate：有缓存就直接返回缓存，网络请求只在
+  // 后台悄悄把缓存更新成最新的，供「下一次」请求使用。问题是像首页「最近
+  // 更新」(/api/feed) 这类接口，页面只在 mount 时 fetch 一次、拿到结果就
+  // 渲染，不会再去感知「缓存后台更新好了」这件事——如果缓存里恰好存的是
+  // 一次空列表/过期快照（比如服务重启后、crawl 还没跑完时的那一次响应），
+  // 那它会被永远当成「最新结果」直接渲染出来，表现为「返回/刷新回首页后
+  // 列表突然空了，怎么等都不会自己恢复」，要等再跳一次别的页面触发新的
+  // fetch（这次缓存已经被上一次的后台更新刷新过了）才会恢复正常。
+  // 换成 Network-First：在线时永远以网络结果为准（同时更新缓存），只有
+  // 请求失败（离线/断网）时才回退到缓存，离线兜底能力不丢，但不会再把
+  // 过期快照当成当前结果展示。
   if (url.pathname.startsWith('/api/')) {
-    event.respondWith(staleWhileRevalidate(request, CACHE_API))
+    event.respondWith(networkFirstAPI(request, CACHE_API))
     return
   }
 
@@ -141,36 +153,24 @@ async function networkFirst(request, cacheName) {
 }
 
 /**
- * Stale-While-Revalidate：先返回缓存（秒开），后台更新缓存。
- * 适用于 API GET 请求（离线兜底 + 实时更新兼顾）。
+ * Network-First：优先请求网络并更新缓存；网络失败（离线/断网）才回退缓存。
+ * 适用于 API GET 请求——保证在线时永远拿到当前最新结果，离线时兜底缓存。
  */
-async function staleWhileRevalidate(request, cacheName) {
+async function networkFirstAPI(request, cacheName) {
   const cache = await caches.open(cacheName)
-  const cached = await cache.match(request)
-
-  // 后台更新（不阻塞响应）
-  const fetchPromise = fetch(request)
-    .then((response) => {
-      if (response.ok) {
-        cache.put(request, response.clone())
-      }
-      return response
+  try {
+    const response = await fetch(request)
+    if (response.ok) {
+      cache.put(request, response.clone())
+    }
+    return response
+  } catch (err) {
+    const cached = await cache.match(request)
+    if (cached) return cached
+    // 完全离线且无缓存
+    return new Response(JSON.stringify({ error: 'offline', offline: true }), {
+      status: 503,
+      headers: { 'Content-Type': 'application/json' }
     })
-    .catch(() => null)
-
-  // 有缓存直接返回，否则等网络
-  if (cached) {
-    // 触发后台更新（不 await，避免阻塞）
-    fetchPromise
-    return cached
   }
-
-  const response = await fetchPromise
-  if (response) return response
-
-  // 完全离线且无缓存
-  return new Response(JSON.stringify({ error: 'offline', offline: true }), {
-    status: 503,
-    headers: { 'Content-Type': 'application/json' }
-  })
 }

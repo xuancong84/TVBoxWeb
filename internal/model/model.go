@@ -59,6 +59,12 @@ type RawParseExt struct {
 type RawLive struct {
 	Name string `json:"name"`
 	URL  string `json:"url"`
+	// Enabled/Subs 只在「直播源」API 返回时现填，用户自己保存的订阅上游
+	// 配置文本里从来不会有这两个字段（二者只在应用层有意义）：
+	//   Enabled 是否参与直播频道合并（store.EnabledLiveURLs，空=全部启用）
+	//   Subs    贡献了这条直播源的「单仓源」列表，判断该不该拉黑用
+	Enabled bool     `json:"enabled"`
+	Subs    []SubRef `json:"subs,omitempty"`
 }
 
 type RawConfig struct {
@@ -123,6 +129,30 @@ type Site struct {
 	Usable      bool   `json:"usable"`
 	Reason      string `json:"reason"`
 	Enabled     bool   `json:"enabled"`
+	// Dead 不是「站源不可用」，而是最近一次内容更新时该站源 ac=list 返回了
+	// 0 条（域名过期被停放/返回空列表等），数据来自 store.DeadKeys()。
+	Dead bool `json:"dead"`
+	// Count 是最近一次内容更新时该站源报告的影片总数，没抓取过/抓取失败
+	// 时是 0，供点播页下拉按数量排序。
+	Count int `json:"count"`
+	// Severity 是 Count=0 时的「严重程度」细分，供下拉在数量相同（都是 0）
+	// 时还能分出先后：
+	//   0 = 有内容（Count>0），不参与这个细分
+	//   1 = 连上了、确实是空列表
+	//   2 = 这次没连上，但 24 小时内成功过，可能只是暂时不可用
+	//   3 = 24 小时内没成功过（或从没成功过）：更像过期/损坏/完全失联
+	Severity int `json:"severity"`
+	// Subs 是贡献了这个站源的「单仓源」（展开后的叶子订阅）列表，用来
+	// 帮用户判断这个站源该不该拉黑——同一个站源可能被多条订阅重复收录。
+	// 按需现查现填，不落盘。
+	Subs []SubRef `json:"subs,omitempty"`
+}
+
+// SubRef 标识一条「单仓源」（crawler.SyncSubscriptionRoots 展开后的叶子
+// 订阅），用于反查「这个站源/直播源是哪条单仓源带来的」。
+type SubRef struct {
+	Name   string `json:"name"`
+	Source string `json:"source"`
 }
 
 type Category struct {
@@ -193,6 +223,10 @@ type Channel struct {
 	Logo  string   `json:"logo"`
 	Group string   `json:"group"`
 	URLs  []string `json:"urls"`
+	// Status 这个频道「真实播放过」的结果：ok=播过且能播，fail=播过但播不出来，
+	// 空="没播过/不知道"。服务端持久化，不随时间过期，只会被下一次真实播放
+	// 结果覆盖。只在 /api/live/channels 响应里现查现填，不参与站源合并/去重。
+	Status string `json:"status,omitempty"`
 }
 
 type ChannelGroup struct {

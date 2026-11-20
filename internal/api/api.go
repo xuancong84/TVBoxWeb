@@ -20,6 +20,7 @@ import (
 	"github.com/xxl6097/TVBoxWeb/internal/cms"
 	"github.com/xxl6097/TVBoxWeb/internal/crawler"
 	"github.com/xxl6097/TVBoxWeb/internal/httpc"
+	"github.com/xxl6097/TVBoxWeb/internal/imgcache"
 	"github.com/xxl6097/TVBoxWeb/internal/live"
 	"github.com/xxl6097/TVBoxWeb/internal/liveprobe"
 	"github.com/xxl6097/TVBoxWeb/internal/metrics"
@@ -103,10 +104,18 @@ func Handler() *http.ServeMux {
 	mux.HandleFunc("/api/sites/health", hSitesHealth)
 	mux.HandleFunc("/api/config", hConfig)
 	mux.HandleFunc("/api/subscription", hSubscription)
+	mux.HandleFunc("/api/subscriptions", hSubscriptionsList)
+	mux.HandleFunc("/api/subscription/remove", hSubscriptionRemove)
+	mux.HandleFunc("/api/subscription/toggle", hSubscriptionToggle)
+	mux.HandleFunc("/api/subscriptions/bulk-enabled", hSubscriptionsBulkEnabled)
+	mux.HandleFunc("/api/subscriptions/roots", hSubscriptionRoots)
+	mux.HandleFunc("/api/subscriptions/sync", hSubscriptionsSync)
 	mux.HandleFunc("/api/categories", hCategories)
 	mux.HandleFunc("/api/vod", hVod)
 	mux.HandleFunc("/api/vod/detail", hVodDetail)
 	mux.HandleFunc("/api/search", hSearch)
+	mux.HandleFunc("/api/search/start", hSearchStart)
+	mux.HandleFunc("/api/search/poll", hSearchPoll)
 	mux.HandleFunc("/api/suggest", hSuggest)
 	mux.HandleFunc("/api/resolve", hResolve)
 	mux.HandleFunc("/api/pinyin/abbr", hPinyinAbbr)
@@ -131,6 +140,8 @@ func Handler() *http.ServeMux {
 
 	mux.HandleFunc("/api/live/url", hLiveURL)
 	mux.HandleFunc("/api/live/sources", hLiveSources)
+	mux.HandleFunc("/api/live/sources/enabled", hLiveSourcesEnabled)
+	mux.HandleFunc("/api/live/channel-status", hLiveChannelStatus)
 	mux.HandleFunc("/api/live/channels", hLiveChannels)
 	mux.HandleFunc("/api/live/favs", hLiveFavs)
 	mux.HandleFunc("/api/live/epg", hLiveEpg)
@@ -138,6 +149,7 @@ func Handler() *http.ServeMux {
 	mux.HandleFunc("/api/live/rank/one", hLiveRankOne)
 	mux.HandleFunc("/api/live/rank", hLiveRank)
 	mux.HandleFunc("/api/live/probe/channels", hLiveProbeChannels)
+	mux.HandleFunc("/api/live/lines/probe", hLiveLinesProbe)
 	mux.HandleFunc("/api/peek", hPeek)
 
 	mux.HandleFunc("/api/crawl", hCrawl)
@@ -163,6 +175,7 @@ func Handler() *http.ServeMux {
 	mux.HandleFunc("/api/reset", hReset)
 
 	mux.HandleFunc("/api/proxy", hProxy)
+	mux.HandleFunc("/api/img", hImg)
 	// MKV 等浏览器不支持的容器：服务端实时转封装成 fMP4
 	mux.HandleFunc("/api/remux", hRemux)
 	// 用源 id 换播放所需的 Basic Auth（列表接口的密码是掩码，不能直接用）
@@ -433,6 +446,7 @@ func hStatus(w http.ResponseWriter, r *http.Request) {
 		"isCustom":      store.IsCustom(),
 		"subName":       store.SubName(),
 		"configUrl":     store.GetConfigURL(),
+		"subscriptions": len(store.Subscriptions()),
 		"totalSites":    store.TotalSites(),
 		"activeSites":   len(store.ActiveSites()),
 		"feedCount":     len(store.Feed()),
@@ -565,9 +579,10 @@ func hSites(w http.ResponseWriter, r *http.Request) {
 	if store.TotalSites() == 0 {
 		crawler.Restore()
 	}
-	// 生成 ETag（基于站源版本号 + 启用列表）
+	// 生成 ETag（基于站源版本号 + 启用列表 + 最近一次内容更新时间，
+	// 最后一项是因为 dead 标记来自内容更新，站源列表本身不变也要能刷新）
 	explicitKeys := store.EnabledKeys()
-	etag := fmt.Sprintf("sites-%d-%d", store.SitesVersion(), len(explicitKeys))
+	etag := fmt.Sprintf("sites-%d-%d-%d", store.SitesVersion(), len(explicitKeys), store.LastCrawlAt())
 	// 检查 If-None-Match，匹配则返回 304
 	if checkETag(w, r, etag) {
 		return
@@ -579,18 +594,49 @@ func hSites(w http.ResponseWriter, r *http.Request) {
 	for _, k := range explicitKeys {
 		enabled[k] = true
 	}
+	dead := map[string]bool{}
+	for _, k := range store.DeadKeys() {
+		dead[k] = true
+	}
+	healthMap := store.SiteHealthMap()
 	sites := store.Sites()
 	out := make([]model.Site, len(sites))
 	copy(out, sites)
+	byAPI, _ := crawler.SiteLiveProvenance()
 	for i := range out {
 		if useAll {
 			out[i].Enabled = out[i].Usable
 		} else {
 			out[i].Enabled = enabled[out[i].Key]
 		}
+		out[i].Dead = dead[out[i].Key]
+		stat := healthMap[out[i].Key]
+		out[i].Count = stat.LastTotal
+		out[i].Severity = siteSeverity(stat, out[i].Count)
+		out[i].Subs = byAPI[out[i].API]
 	}
 	// 设置缓存 5 分钟
 	writeJSONWithCache(w, 200, out, 300, etag)
+}
+
+// siteSeverity 给 Count=0 的站源分个「严重程度」，供点播页下拉在数量都是
+// 0 的站之间也能排出先后：
+//
+//	0 有内容（count>0），不用判断
+//	1 最近一次内容更新连上了、解析成功，只是报告 0 条——站没坏，是真的空
+//	2 最近一次内容更新没连上，但 24 小时内成功过——大概率只是暂时不可用
+//	3 24 小时内没成功过（或者从没成功过）——更像过期域名/配置损坏/彻底失联
+func siteSeverity(stat store.SiteHealthStat, count int) int {
+	if count > 0 {
+		return 0
+	}
+	if stat.LastCrawlOK {
+		return 1
+	}
+	if stat.LastSuccess > 0 && time.Now().Unix()-stat.LastSuccess <= 86400 {
+		return 2
+	}
+	return 3
 }
 
 func hSitesEnabled(w http.ResponseWriter, r *http.Request) {
@@ -602,7 +648,20 @@ func hSitesEnabled(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	store.SetEnabledKeys(req.Keys)
-	store.SaveFeed(nil) // 清空旧 feed，避免首页显示过期站源的内容
+	// 只摘掉刚被停用的站源那些条目，其余保留——不用整个清空首页「最近
+	// 更新」干等下一轮抓取，参考 crawler.RebuildFromSubscriptions 里同样
+	// 的考虑。
+	active := map[string]bool{}
+	for _, s := range store.ActiveSites() {
+		active[s.Key] = true
+	}
+	var kept []model.Vod
+	for _, v := range store.Feed() {
+		if active[v.SiteKey] {
+			kept = append(kept, v)
+		}
+	}
+	store.SaveFeed(kept)
 	cms.ClearCache()
 	ok(w, map[string]any{"ok": true})
 }
@@ -680,6 +739,9 @@ func hConfig(w http.ResponseWriter, r *http.Request) {
 	ok(w, map[string]any{"count": n})
 }
 
+// hSubscription 添加（或按地址/文本原地更新）一条订阅源。可以多次调用来
+// 同时订阅多个来源——站源/直播源/解析规则会按 crawler.RebuildFromSubscriptions
+// 的规则合并去重，不会互相替换。
 func hSubscription(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Source string `json:"source"`
@@ -693,6 +755,101 @@ func hSubscription(w http.ResponseWriter, r *http.Request) {
 		fail(w, 400, err.Error())
 		return
 	}
+	cms.ClearCache()
+	RefreshTrustedHosts()
+	ok(w, res)
+}
+
+// hSubscriptionsList 列出当前所有订阅源（不含缓存的配置文本）。
+func hSubscriptionsList(w http.ResponseWriter, r *http.Request) {
+	ok(w, store.SubscriptionSummaries())
+}
+
+// hSubscriptionRoots GET：返回「订阅」文本框上次保存的原始根地址列表
+// （一行一个，可能含聚合清单地址），供前端回填文本框。
+func hSubscriptionRoots(w http.ResponseWriter, r *http.Request) {
+	ok(w, store.SubscriptionRoots())
+}
+
+// hSubscriptionsSync POST：把文本框里的根地址列表（一行一个）递归展开成
+// 叶子（单链接）订阅并同步，见 crawler.SyncSubscriptionRoots。
+func hSubscriptionsSync(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Roots []string `json:"roots"`
+	}
+	if err := body(r, &req); err != nil {
+		fail(w, 400, "参数错误")
+		return
+	}
+	res, err := crawler.SyncSubscriptionRoots(r.Context(), req.Roots)
+	if err != nil {
+		fail(w, 400, err.Error())
+		return
+	}
+	cms.ClearCache()
+	RefreshTrustedHosts()
+	ok(w, res)
+}
+
+// hSubscriptionRemove 删除一条订阅，并用剩下已启用的订阅重新合并站源列表。
+func hSubscriptionRemove(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		ID string `json:"id"`
+	}
+	if err := body(r, &req); err != nil || req.ID == "" {
+		fail(w, 400, "参数错误")
+		return
+	}
+	if !store.RemoveSubscription(req.ID) {
+		fail(w, 404, "订阅不存在")
+		return
+	}
+	res := crawler.RebuildFromSubscriptions()
+	cms.ClearCache()
+	RefreshTrustedHosts()
+	ok(w, res)
+}
+
+// hSubscriptionToggle 启用/停用一条订阅（不删除，保留缓存的配置文本，
+// 方便随时重新启用），然后重新合并站源列表。
+func hSubscriptionToggle(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		ID      string `json:"id"`
+		Enabled bool   `json:"enabled"`
+	}
+	if err := body(r, &req); err != nil || req.ID == "" {
+		fail(w, 400, "参数错误")
+		return
+	}
+	if !store.SetSubscriptionEnabled(req.ID, req.Enabled) {
+		fail(w, 404, "订阅不存在")
+		return
+	}
+	res := crawler.RebuildFromSubscriptions()
+	cms.ClearCache()
+	RefreshTrustedHosts()
+	ok(w, res)
+}
+
+// hSubscriptionsBulkEnabled 一次性批量启停多条订阅（设置页「单仓源」列表的
+// 「全选 / 全部反选」）。不能直接在前端挨个调 hSubscriptionToggle——那样
+// 几十条订阅就是几十次并发请求，每次还各自触发一遍 RebuildFromSubscriptions
+// （重新解析全部订阅缓存文本、重建整份合并站源列表），在树莓派这种算力下
+// 并发几十次这个量级的重建，互相抢占导致响应变慢甚至超时，表现为「点了
+// 全部反选，结果只有一部分真的变了」。这里只在循环里做便宜的
+// SetSubscriptionEnabled（纯内存字段赋值），重建只在最后做一次。
+func hSubscriptionsBulkEnabled(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Updates map[string]bool `json:"updates"`
+	}
+	if err := body(r, &req); err != nil || len(req.Updates) == 0 {
+		fail(w, 400, "参数错误")
+		return
+	}
+	for id, enabled := range req.Updates {
+		store.SetSubscriptionEnabled(id, enabled)
+	}
+	res := crawler.RebuildFromSubscriptions()
 	cms.ClearCache()
 	RefreshTrustedHosts()
 	ok(w, res)
@@ -1154,7 +1311,21 @@ func hLiveURL(w http.ResponseWriter, r *http.Request) {
 func hLiveSources(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodGet:
-		ok(w, store.SubLives())
+		list := store.SubLives()
+		explicit := store.EnabledLiveURLs()
+		useAll := len(explicit) == 0
+		enabled := map[string]bool{}
+		for _, u := range explicit {
+			enabled[u] = true
+		}
+		_, byLiveURL := crawler.SiteLiveProvenance()
+		out := make([]model.RawLive, len(list))
+		copy(out, list)
+		for i := range out {
+			out[i].Enabled = useAll || enabled[out[i].URL]
+			out[i].Subs = byLiveURL[out[i].URL]
+		}
+		ok(w, out)
 	case http.MethodPost:
 		var req struct {
 			Lives []model.RawLive `json:"lives"`
@@ -1166,6 +1337,20 @@ func hLiveSources(w http.ResponseWriter, r *http.Request) {
 		}
 		ok(w, map[string]any{"ok": true})
 	}
+}
+
+// hLiveSourcesEnabled POST {urls}：设置哪些「直播源」参与直播频道合并，
+// 跟 hSitesEnabled 对站源的语义一致（urls 为空 = 全部启用）。
+func hLiveSourcesEnabled(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		URLs []string `json:"urls"`
+	}
+	if err := body(r, &req); err != nil {
+		fail(w, 400, "参数错误")
+		return
+	}
+	store.SetEnabledLiveURLs(req.URLs)
+	ok(w, map[string]any{"ok": true})
 }
 
 // hLiveFavs GET: 返回收藏的直播频道列表。
@@ -1205,25 +1390,140 @@ func hLiveFavToggle(w http.ResponseWriter, r *http.Request) {
 	ok(w, map[string]any{"added": added})
 }
 
-func hLiveChannels(w http.ResponseWriter, r *http.Request) {
-	u := q(r, "url")
-	if u == "" {
-		u = store.LiveURL()
+// liveAllSources 汇总「订阅合并出的直播源」+「设置里手动填的直播源」，按 URL
+// 去重，并按 store.EnabledLiveURLs() 过滤掉用户手动停用的直播源（空 = 全部
+// 启用）——跟「站源」的启停语义一致，拉黑某个直播源之后它就不会再出现在
+// 合并后的频道目录里。
+func liveAllSources() []model.RawLive {
+	explicit := store.EnabledLiveURLs()
+	useAll := len(explicit) == 0
+	enabled := map[string]bool{}
+	for _, u := range explicit {
+		enabled[u] = true
 	}
-	if u == "" {
+	seen := map[string]bool{}
+	var out []model.RawLive
+	for _, s := range store.SubLives() {
+		if s.URL == "" || seen[s.URL] || (!useAll && !enabled[s.URL]) {
+			continue
+		}
+		seen[s.URL] = true
+		out = append(out, s)
+	}
+	if manual := store.LiveURL(); manual != "" && !seen[manual] && (useAll || enabled[manual]) {
+		out = append(out, model.RawLive{Name: "手动直播源", URL: manual})
+	}
+	return out
+}
+
+// hLiveChannels GET：返回「所有已启用直播源合并」后的统一频道目录——同一个
+// 频道（比如 CCTV1）的所有线路都会在 Channel.urls 里，前端播放时可以展示全部
+// 线路供手动切换，也用于播放器里的自动测速切换。
+//
+// 每个直播源的抓取结果都落了磁盘缓存（见 live.Channels/store.LiveCacheEntry），
+// 超过 live.CacheMaxAge（1 天）才需要重新联网；哪怕过期/缺失也永远不在这次
+// 请求里等网络——直接用缓存里现有的（哪怕是旧的）拼一份结果立即返回，缺失/
+// 过期的源在后台异步刷新，下次请求自然拿到新结果。跟 /api/feed 对点播列表
+// 的处理是同一套思路。
+//
+// 带 ?url= 时走旧的单源模式（兼容用途，正常不会用到）。
+// 带 ?refresh=1 时额外让后台把没过期的缓存也重新抓一遍（用户手动点刷新）。
+func hLiveChannels(w http.ResponseWriter, r *http.Request) {
+	if u := q(r, "url"); u != "" {
+		if !guardSourceURL(w, u) {
+			return
+		}
+		groups, err := live.LoadCtx(r.Context(), u, 25*time.Second)
+		if err != nil {
+			fail(w, 500, err.Error())
+			return
+		}
+		groups = postProcessLive(groups)
+		root := live.BuildTree(groups)
+		ok(w, map[string]any{"root": root, "groups": groups, "url": u})
+		return
+	}
+
+	sources := liveAllSources()
+	if len(sources) == 0 {
 		fail(w, 400, "暂无直播源，先去「设置 → 订阅」导入")
 		return
 	}
-	if !guardSourceURL(w, u) {
-		return
-	}
-	groups, err := live.LoadCtx(r.Context(), u, 25*time.Second)
-	if err != nil {
-		fail(w, 500, err.Error())
-		return
-	}
+	force := q(r, "refresh") == "1"
+	groups, errs := live.Channels(sources, force)
+	groups = postProcessLive(groups)
 	root := live.BuildTree(groups)
-	ok(w, map[string]any{"root": root, "groups": groups, "url": u})
+	ok(w, map[string]any{"root": root, "groups": groups, "sources": len(sources), "errs": errs})
+}
+
+// postProcessLive 统一排序 + （按用户设置）过滤脏数据，merge 后的原始缓存
+// 内容本身不受过滤设置影响——这样用户切换「过滤垃圾频道」开关不需要清缓存
+// 重新抓一遍，下次请求当场就能看到效果。
+func postProcessLive(groups []model.ChannelGroup) []model.ChannelGroup {
+	if store.LiveJunkFilterOn() {
+		groups = live.FilterJunk(groups)
+	}
+	live.SortGroups(groups)
+	annotateChannelStatus(groups)
+	return groups
+}
+
+// annotateChannelStatus 给每个频道填上「真实播放过」的结果（见
+// store.ChannelStatus），供前端按「播过且能播/播过但不行/没播过」三态上色。
+// 现查现填，不参与缓存/去重——播放状态变了，下次打开直播页立刻能看到新结果。
+func annotateChannelStatus(groups []model.ChannelGroup) {
+	for gi := range groups {
+		chs := groups[gi].Channels
+		for ci := range chs {
+			if ok, known := store.GetChannelStatus(chs[ci].Name); known {
+				if ok {
+					chs[ci].Status = "ok"
+				} else {
+					chs[ci].Status = "fail"
+				}
+			}
+		}
+	}
+}
+
+// hLiveChannelStatus POST {name, ok}：记录一次直播频道「真实播放」的结果——
+// 播放页在 <video> 真正起播（onplaying）或者判定这个频道所有线路都播不通
+// 时各调一次，不是靠 /api/peek 那种轻量连通性探测（那只能判断「连得上」，
+// 不代表「播得出来」，两者在这个功能上的语义正好相反——一条线连不上但
+// 换了别的线播成了，频道整体还是「能播」）。
+func hLiveChannelStatus(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Name string `json:"name"`
+		OK   bool   `json:"ok"`
+	}
+	if err := body(r, &req); err != nil || req.Name == "" {
+		fail(w, http.StatusBadRequest, "参数错误")
+		return
+	}
+	store.SetChannelStatus(req.Name, req.OK)
+	ok(w, map[string]any{"ok": true})
+}
+
+// hLiveLinesProbe POST：轻量批量测一批播放线路的延迟/粗略吞吐（只取开头
+// 16KB，不下载真正的视频数据），用于「当前频道所有线路」的质量监控，
+// 判断要不要自动切换到更好的线路。
+func hLiveLinesProbe(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		URLs []string `json:"urls"`
+	}
+	if err := body(r, &req); err != nil {
+		fail(w, 400, "参数错误")
+		return
+	}
+	if len(req.URLs) > 16 {
+		req.URLs = req.URLs[:16]
+	}
+	for _, u := range req.URLs {
+		if !guardSourceURL(w, u) {
+			return
+		}
+	}
+	ok(w, live.ProbeLinesCtx(r.Context(), req.URLs, 4*time.Second))
 }
 
 func hLiveRankOne(w http.ResponseWriter, r *http.Request) {
@@ -1303,12 +1603,20 @@ func hCrawl(w http.ResponseWriter, r *http.Request) {
 			"total":     total,
 		})
 	case http.MethodPost:
-		var req struct {
-			Force bool `json:"force"`
+		// 全站抓取是后台按 crawler.CrawlInterval 预先跑的（见 startScheduler），
+		// 不是「这次调用」现抓现等——这里点一下（首页自动触发也好，用户手动点
+		// 「更新」也好）只决定「要不要在后台补跑一轮」，从不在这次请求里等
+		// 它跑完，也从不因为点了一下就把当前列表清空：GET /api/feed 永远
+		// 立刻原样返回当前缓存的列表，新结果等后台这轮抓完了自然替换上去。
+		switch {
+		case crawler.IsRunning():
+			ok(w, map[string]any{"started": false, "running": true})
+		case !crawler.DueForRefresh():
+			ok(w, map[string]any{"started": false, "running": false})
+		default:
+			go crawler.Run(true)
+			ok(w, map[string]any{"started": true})
 		}
-		_ = body(r, &req)
-		go crawler.Run(true)
-		ok(w, map[string]any{"started": true})
 	}
 }
 
@@ -1361,9 +1669,10 @@ func hPrefs(w http.ResponseWriter, r *http.Request) {
 			"curOutroSkip": curSkip.Outro,
 			"skipOwn":      ownSkip,
 			"skipScoped":   hasSkipScope,
-			"tapSound":     store.TapSound(),
-			"tapVibrate":   store.TapVibrate(),
-			"skipCfgCount": store.SkipCfgCount(),
+			"tapSound":       store.TapSound(),
+			"tapVibrate":     store.TapVibrate(),
+			"skipCfgCount":   store.SkipCfgCount(),
+			"liveJunkFilter": store.LiveJunkFilterOn(),
 		})
 	case http.MethodPost:
 		var req map[string]any
@@ -1419,6 +1728,11 @@ func hPrefs(w http.ResponseWriter, r *http.Request) {
 		}
 		if v, ok := req["tapVibrate"]; ok {
 			store.SetTapVibrate(int(toFloat(v)))
+		}
+		if v, ok := req["liveJunkFilter"]; ok {
+			if b, ok2 := v.(bool); ok2 {
+				store.SetLiveJunkFilterOn(b)
+			}
 		}
 		// EPG 地址可能指向内网 NAS，变了就刷新可信域名
 		RefreshTrustedHosts()
@@ -1775,6 +2089,43 @@ func hProxy(w http.ResponseWriter, r *http.Request) {
 	}
 	w.WriteHeader(res.StatusCode)
 	_, _ = io.Copy(w, res.Body)
+}
+
+// hImg GET /api/img?url=<封面图原始地址>：优先命中本地缓存（见 imgcache，
+// 落在 /dev/shm 即内存里），没有才联网拉一次并顺手缓存——同一张封面图
+// 第二次访问不用再找原始站源重新下载。
+func hImg(w http.ResponseWriter, r *http.Request) {
+	target := q(r, "url")
+	if target == "" {
+		fail(w, http.StatusBadRequest, "缺少 url 参数")
+		return
+	}
+	if !strings.HasPrefix(target, "http://") && !strings.HasPrefix(target, "https://") {
+		fail(w, http.StatusBadRequest, "url 必须以 http:// 或 https:// 开头")
+		return
+	}
+	if !guardURL(w, target) {
+		return
+	}
+	data, ct, pending, err := imgcache.Get(r.Context(), target)
+	if pending {
+		// 这张图上次没拉成功，这次不再同步阻塞重试——后台已经在悄悄重试，
+		// 这次直接回一张空图：前端 <img> 会触发 onerror 走现成的占位图逻辑，
+		// 不会卡在这等。不能给缓存头，否则浏览器会把这次「空」当真缓存住，
+		// 下次用户请求就没机会再触发重试了。
+		w.Header().Set("Cache-Control", "no-store")
+		w.Header().Set("Content-Type", "image/gif")
+		w.WriteHeader(http.StatusOK)
+		return
+	}
+	if err != nil {
+		fail(w, http.StatusBadGateway, "无法获取图片："+err.Error())
+		return
+	}
+	w.Header().Set("Content-Type", ct)
+	w.Header().Set("Cache-Control", "public, max-age=604800, immutable")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(data)
 }
 
 // rewriteM3u8 把 m3u8 里所有 URI（分片行 + #EXT-X-KEY/#EXT-X-MAP/#EXT-X-MEDIA 的 URI 属性）

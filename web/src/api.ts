@@ -17,8 +17,10 @@ import type {
   ChannelGroup,
   Channel,
   LiveScore,
+  LineQuality,
   EpgResult,
   QLevel,
+  Subscription,
   WebdavSource,
   WebdavEntry,
   WebdavVod
@@ -26,6 +28,15 @@ import type {
 import { idbGet, idbSet, idbDelete, idbKeys } from '@/idb'
 
 const BASE = '/api'
+
+// 封面图代理：服务端会把原图缓存到内存文件系统（/dev/shm），同一张图
+// 第二次访问直接秒出，不用再找原始站源重新下载。所有 <img :src> 渲染
+// vod.pic / h.pic 之类字段时都应该过这一层，而不是直接拿原始地址。
+export function imgUrl(url?: string | null): string {
+  if (!url) return ''
+  if (url.startsWith(`${BASE}/img?`)) return url // 已经是代理过的地址，避免重复包一层
+  return `${BASE}/img?url=${encodeURIComponent(url)}`
+}
 
 // ===== 401 统一处理 =====
 // api 层不直接依赖路由，由 main.ts 注入「跳登录页」的动作，避免循环依赖。
@@ -287,7 +298,26 @@ export const api = {
   sitesHealth: () =>
     get<{ statuses: SiteHealthStatus[]; time: number }>('/sites/health').catch(() => ({ statuses: [], time: 0 })),
   loadConfig: (source: string) => post<{ count: number }>('/config', { source }),
+  // 添加（或按地址/文本原地更新）一条订阅；可以多次调用来同时订阅多个来源，
+  // 不会互相替换，站源/直播源按去重规则合并。
   subscribe: (source: string) => post<{ name: string; sites: number; lives: number }>('/subscription', { source }),
+  subscriptions: () => get<Subscription[]>('/subscriptions'),
+  removeSubscription: (id: string) => post<{ name: string; sites: number; lives: number }>('/subscription/remove', { id }),
+  toggleSubscription: (id: string, enabled: boolean) =>
+    post<{ name: string; sites: number; lives: number }>('/subscription/toggle', { id, enabled }),
+  // 批量启停（设置页「单仓源」的全选/全部反选）：一次请求、后端只重建一遍
+  // 合并站源列表，不要挨个调 toggleSubscription 并发几十次。
+  bulkToggleSubscriptions: (updates: Record<string, boolean>) =>
+    post<{ name: string; sites: number; lives: number }>('/subscriptions/bulk-enabled', { updates }),
+  // 「订阅」文本框上次保存的原始根地址（一行一个，可能含聚合清单地址）
+  subscriptionRoots: () => get<string[]>('/subscriptions/roots'),
+  // 把文本框当前的根地址列表递归展开成叶子（单链接）订阅并同步：新出现的
+  // 新增，不再出现的删除，还在的只刷新内容、保留原有启停状态。
+  syncSubscriptionRoots: (roots: string[]) =>
+    post<{ name: string; sites: number; lives: number; leaves: number; added: number; removed: number; errs?: Record<string, string> }>(
+      '/subscriptions/sync',
+      { roots }
+    ),
 
   categories: (site: string) => get<Category[]>(`/categories?site=${encodeURIComponent(site)}`),
   vodList: (site: string, tid: string, page: number, ext = '', children = '') =>
@@ -299,6 +329,14 @@ export const api = {
   vodDetail: (site: string, id: string) =>
     get<Vod>(`/vod/detail?site=${encodeURIComponent(site)}&id=${encodeURIComponent(id)}`),
   search: (kw: string, signal?: AbortSignal) => get<{ list: Vod[]; sites: number; total: number }>(`/search?kw=${encodeURIComponent(kw)}`, signal),
+  // 搜索改成边搜边出：start 立即拿到 session id（不等任何站源返回），
+  // poll 取目前为止的结果快照 + 进度，直到 finished=true。
+  searchStart: (kw: string) => post<{ id: string; total: number }>('/search/start', { kw }),
+  searchPoll: (id: string, signal?: AbortSignal) =>
+    get<{ list: Vod[]; total: number; done: number; sites: number; finished: boolean }>(
+      `/search/poll?id=${encodeURIComponent(id)}`,
+      signal
+    ),
   suggest: (kw: string, signal?: AbortSignal) => get<string[]>(`/suggest?kw=${encodeURIComponent(kw)}`, signal),
   resolve: (url: string) => post<{ url: string; header: Record<string, string>; via: string; ok: boolean }>('/resolve', { url }),
 
@@ -331,21 +369,37 @@ export const api = {
   setLiveUrl: (url: string) => post('/live/url', { url }),
   liveSources: () => get<RawLive[]>('/live/sources'),
   setLiveSources: (lives: RawLive[]) => post('/live/sources', { lives }),
-  liveChannels: (url?: string) =>
-    get<{ root: LiveDir; groups: ChannelGroup[]; url: string }>(
-      `/live/channels${url ? `?url=${encodeURIComponent(url)}` : ''}`
-    ),
+  setLiveSourcesEnabled: (urls: string[]) => post('/live/sources/enabled', { urls }),
+  // 上报一次直播频道「真实播放」的结果，服务端持久化、不过期，
+  // 用于直播页频道列表按「播过能播/播过不行/没播过」上色。
+  setLiveChannelStatus: (name: string, ok: boolean) => post('/live/channel-status', { name, ok }),
+  // 不传 url：返回所有已启用直播源合并后的统一频道目录（同一频道的全部线路
+  // 都在 Channel.urls 里）；force 跳过服务端缓存强制重新拉取全部源。
+  liveChannels: (opts?: { url?: string; force?: boolean }) => {
+    const params: string[] = []
+    if (opts?.url) params.push(`url=${encodeURIComponent(opts.url)}`)
+    if (opts?.force) params.push('refresh=1')
+    return get<{ root: LiveDir; groups: ChannelGroup[]; sources?: number; errs?: Record<string, string> }>(
+      `/live/channels${params.length ? '?' + params.join('&') : ''}`
+    )
+  },
   liveFavs: () => get<Channel[]>('/live/favs'),
   toggleLiveFav: (ch: Channel) => post<{ added: boolean }>('/live/fav/toggle', ch),
   liveRankOne: (name: string, url: string) => post<LiveScore>('/live/rank/one', { name, url }),
   liveRank: (items: LiveScore[]) => post<LiveScore[]>('/live/rank', { items }),
   liveProbeChannels: (channels: Channel[]) => post<{ dead: number; total: number }>('/live/probe/channels', { channels }),
+  // 轻量批量测一批播放线路的延迟/粗略吞吐（只取开头 16KB），用于判断要不要
+  // 自动切换到更好的线路；最多一次测 16 条。
+  liveLinesProbe: (urls: string[]) => post<LineQuality[]>('/live/lines/probe', { urls }),
   liveEpg: (name: string, url?: string) =>
     get<EpgResult>(`/live/epg?name=${encodeURIComponent(name)}` + (url ? `&url=${encodeURIComponent(url)}` : '')),
   peek: (url: string) => get<{ alive: boolean }>(`/peek?url=${encodeURIComponent(url)}`),
 
   crawlSummary: () => get<{ summary: string; last: number; running: boolean; processed: number; total: number }>('/crawl'),
-  triggerCrawl: () => post('/crawl', { force: true }),
+  // 全站抓取现在是后台按 24 小时间隔预先跑的（见 crawler.CrawlInterval），
+  // 这个调用只是「问一下要不要补跑一轮」：没到间隔、或者已经在跑，
+  // started 都是 false，不会真的现抓现等。
+  triggerCrawl: () => post<{ started: boolean; running?: boolean }>('/crawl', {}),
   feed: () => get<{ feed: Vod[]; deadKeys: string[]; summary: string }>('/feed'),
   qualityMaster: (url: string) => post<QLevel[]>('/quality/master', { url }),
 
@@ -363,13 +417,14 @@ export const api = {
       skipScoped: boolean
       skipCfgCount: number
       tapSound: number; tapVibrate: number
+      liveJunkFilter: boolean
     }>(
       '/prefs' +
         (skipA && skipB
           ? `?skipA=${encodeURIComponent(skipA)}&skipB=${encodeURIComponent(skipB)}`
           : '')
     ),
-  setPrefs: (p: Record<string, number | string>, opts?: { skipA: string; skipB: string }) => {
+  setPrefs: (p: Record<string, number | string | boolean>, opts?: { skipA: string; skipB: string }) => {
     // 带 skipA/skipB 时表示「只改这部剧的片头片尾」，不带则改全局默认值
     const suffix =
       opts && opts.skipA && opts.skipB

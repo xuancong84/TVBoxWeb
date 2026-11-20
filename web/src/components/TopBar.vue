@@ -120,22 +120,22 @@ function navigate(path: string) {
 .topbar {
   display: flex;
   align-items: center;
-  padding: 12px 20px 8px;
-  gap: 20px;
+  padding: 6px 14px 5px;
+  gap: 12px;
   position: relative;
   z-index: 100;
 }
 .logo {
   display: flex;
   align-items: center;
-  gap: 10px;
+  gap: 8px;
   cursor: pointer;
   flex-shrink: 0;
 }
 .logo-badge,
 .logo-icon {
-  width: 36px;
-  height: 36px;
+  width: 44px;
+  height: 44px;
   border-radius: 10px;
   background: #fff;
   color: #141218;
@@ -150,19 +150,19 @@ function navigate(path: string) {
   background: transparent;
 }
 .title {
-  font-size: 20px;
+  font-size: 40px;
   font-weight: 700;
 }
 .navs {
   display: flex;
-  gap: 4px;
+  gap: 2px;
   flex: 1;
   flex-wrap: wrap;
 }
 .nav-item {
-  padding: 6px 14px;
+  padding: 4px 10px;
   border-radius: 20px;
-  font-size: 14px;
+  font-size: 28px;
   color: var(--sub);
   cursor: pointer;
   transition: all 0.14s;
@@ -176,10 +176,10 @@ function navigate(path: string) {
   background: var(--card-hi);
 }
 .clock {
-  font-size: 15px;
+  font-size: 30px;
   color: var(--dim);
   /* 固定宽 + 等宽数字：秒数每秒变化时不会推挤后面的元素，也不会左右抖动 */
-  min-width: 76px;
+  min-width: 150px;
   flex-shrink: 0;
   text-align: right;
   font-variant-numeric: tabular-nums;
@@ -233,11 +233,11 @@ function navigate(path: string) {
   border-bottom: 1px solid var(--border);
   display: flex;
   flex-direction: column;
-  padding: 8px 0 16px;
+  padding: 6px 0 10px;
 }
 .mobile-nav-item {
-  padding: 14px 24px;
-  font-size: 16px;
+  padding: 10px 18px;
+  font-size: 32px;
   color: var(--sub);
   cursor: pointer;
   border-left: 3px solid transparent;

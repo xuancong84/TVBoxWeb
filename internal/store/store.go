@@ -40,6 +40,10 @@ type Data struct {
 	SkipCfgs      map[string]SkipCfg           `json:"skipCfgs"`
 	TapSound      int                          `json:"tapSound"`
 	TapVibrate    int                          `json:"tapVibrate"`
+	// LiveJunkFilterOff 关闭「直播频道列表过滤」：部分直播源会把更新时间戳、
+	// DJ 音乐合集歌曲名之类的脏数据解析成「频道」，默认过滤掉；置 true 时
+	// 原样展示未过滤的全部频道（给想自己核对源内容的用户用）。
+	LiveJunkFilterOff bool `json:"liveJunkFilterOff"`
 	Feed          []model.Vod                  `json:"feed"`
 	CrawlAt       int64                        `json:"crawlAt"`
 	CrawlSummary  string                       `json:"crawlSummary"`
@@ -52,6 +56,47 @@ type Data struct {
 	WdHist        []model.WdHistory            `json:"wdHist"`
 	SiteHealth    map[string]SiteHealthStat    `json:"siteHealth"` // 站源健康度统计
 	FavGroups     []FavGroup                   `json:"favGroups"`  // 收藏分组列表
+	Subscriptions []Subscription               `json:"subscriptions"` // 多订阅源列表
+	// SubscriptionRoots 是用户在「订阅」文本框里填的原始根地址列表（一行一个），
+	// 可以是普通订阅地址，也可以是聚合清单地址（如 tvboxmuti.json）。
+	// 点一次「保存」就会把这些根地址递归展开到叶子（单链接）去重后同步进
+	// Subscriptions；保留这份原始列表是为了下次「保存」能重新展开——
+	// 聚合清单上游的内容是会变的，光靠展开出来的叶子记不住它们的出处。
+	SubscriptionRoots []string `json:"subscriptionRoots"`
+	// EnabledLives 是用户手动勾过的「直播源」URL 列表（空 = 全部启用，
+	// 跟 Enabled 对站源的语义一致——没手动点过开关之前，默认全开）。
+	EnabledLives []string `json:"enabledLives"`
+}
+
+// Subscription 是一条订阅源记录。支持同时启用多条订阅——合并后的站源/直播源/
+// 解析规则会在 crawler.RebuildFromSubscriptions 里统一去重后生成。
+// Text 缓存的是最近一次成功拉取（必要时已经过地区限制跳板中转/base64 解包）
+// 的原始配置文本，重启后无需重新联网即可恢复站源列表。
+type Subscription struct {
+	ID        string `json:"id"`
+	Name      string `json:"name"`
+	Source    string `json:"source"` // 订阅地址，或用户直接粘贴的 JSON 文本
+	Enabled   bool   `json:"enabled"`
+	Text      string `json:"text,omitempty"`
+	Sites     int    `json:"sites"`
+	Lives     int    `json:"lives"`
+	Parses    int    `json:"parses"`
+	UpdatedAt int64  `json:"updatedAt"`
+	Err       string `json:"err,omitempty"` // 最近一次刷新失败原因（为空=正常）
+}
+
+// SubscriptionSummary 是 Subscription 去掉 Text 字段的对外展示版本，
+// 避免大体积的已缓存配置文本随列表接口一起传给前端。
+type SubscriptionSummary struct {
+	ID        string `json:"id"`
+	Name      string `json:"name"`
+	Source    string `json:"source"`
+	Enabled   bool   `json:"enabled"`
+	Sites     int    `json:"sites"`
+	Lives     int    `json:"lives"`
+	Parses    int    `json:"parses"`
+	UpdatedAt int64  `json:"updatedAt"`
+	Err       string `json:"err,omitempty"`
 }
 
 // SiteHealthStat 站源健康度统计数据。
@@ -61,6 +106,8 @@ type SiteHealthStat struct {
 	TotalReq    int   `json:"totalReq"`    // 总请求数
 	FailCount   int   `json:"failCount"`   // 失败次数
 	AvgMs       int   `json:"avgMs"`       // 平均响应时间（毫秒）
+	LastTotal   int   `json:"lastTotal"`   // 最近一次内容更新时该站源报告的影片总数
+	LastCrawlOK bool  `json:"lastCrawlOk"` // 最近一次内容更新抓取是否成功拿到响应（哪怕 0 条也算成功）
 }
 
 type HistItem struct {
@@ -417,7 +464,7 @@ func Sites() []model.Site { return siteList }
 func SourceURLs() []string {
 	mu.RLock()
 	defer mu.RUnlock()
-	out := make([]string, 0, len(siteList)+len(data.SubLives)+len(data.WebdavList)+3)
+	out := make([]string, 0, len(siteList)+len(data.SubLives)+len(data.WebdavList)+len(data.Subscriptions)+3)
 	for i := range siteList {
 		out = append(out, siteList[i].API)
 	}
@@ -427,6 +474,10 @@ func SourceURLs() []string {
 	for _, w := range data.WebdavList {
 		out = append(out, w.URL)
 	}
+	for _, s := range data.Subscriptions {
+		out = append(out, s.Source)
+	}
+	out = append(out, data.SubscriptionRoots...)
 	out = append(out, data.LiveURL, data.EpgURL, data.CfgURL)
 	return out
 }
@@ -477,6 +528,16 @@ func EnabledKeys() []string { mu.RLock(); defer mu.RUnlock(); return data.Enable
 func SetEnabledKeys(keys []string) {
 	mu.Lock()
 	data.Enabled = keys
+	mu.Unlock()
+	flush()
+}
+
+// EnabledLiveURLs/SetEnabledLiveURLs：直播源（RawLive，按 URL 识别）的启停
+// 列表，空 = 全部启用，跟 EnabledKeys 对站源的语义一致。
+func EnabledLiveURLs() []string { mu.RLock(); defer mu.RUnlock(); return data.EnabledLives }
+func SetEnabledLiveURLs(urls []string) {
+	mu.Lock()
+	data.EnabledLives = urls
 	mu.Unlock()
 	flush()
 }
@@ -876,6 +937,114 @@ func SetEpgURL(u string)               { mu.Lock(); data.EpgURL = u; mu.Unlock()
 func SubLives() []model.RawLive        { mu.RLock(); defer mu.RUnlock(); return data.SubLives }
 func SetSubLives(list []model.RawLive) { mu.Lock(); data.SubLives = list; mu.Unlock(); flush() }
 
+// LiveJunkFilterOn 默认开启（过滤掉明显不是频道的脏数据条目）。
+func LiveJunkFilterOn() bool { mu.RLock(); defer mu.RUnlock(); return !data.LiveJunkFilterOff }
+func SetLiveJunkFilterOn(on bool) {
+	mu.Lock()
+	data.LiveJunkFilterOff = !on
+	mu.Unlock()
+	flush()
+}
+
+// ---------- 多订阅源 ----------
+
+// Subscriptions 返回订阅列表的拷贝（含缓存的配置文本，供合并重建使用）。
+func Subscriptions() []Subscription {
+	mu.RLock()
+	defer mu.RUnlock()
+	out := make([]Subscription, len(data.Subscriptions))
+	copy(out, data.Subscriptions)
+	return out
+}
+
+// SubscriptionSummaries 返回不含 Text 字段的对外展示列表。
+func SubscriptionSummaries() []SubscriptionSummary {
+	mu.RLock()
+	defer mu.RUnlock()
+	out := make([]SubscriptionSummary, 0, len(data.Subscriptions))
+	for _, s := range data.Subscriptions {
+		out = append(out, SubscriptionSummary{
+			ID: s.ID, Name: s.Name, Source: s.Source, Enabled: s.Enabled,
+			Sites: s.Sites, Lives: s.Lives, Parses: s.Parses,
+			UpdatedAt: s.UpdatedAt, Err: s.Err,
+		})
+	}
+	return out
+}
+
+// UpsertSubscription 按 ID 新增或原地更新一条订阅（ID 相同 = 同一个来源再次导入/刷新）。
+func UpsertSubscription(sub Subscription) {
+	mu.Lock()
+	found := false
+	for i := range data.Subscriptions {
+		if data.Subscriptions[i].ID == sub.ID {
+			data.Subscriptions[i] = sub
+			found = true
+			break
+		}
+	}
+	if !found {
+		data.Subscriptions = append(data.Subscriptions, sub)
+	}
+	mu.Unlock()
+	flush()
+}
+
+// RemoveSubscription 删除一条订阅，返回是否真的删掉了什么。
+func RemoveSubscription(id string) bool {
+	mu.Lock()
+	out := data.Subscriptions[:0]
+	removed := false
+	for _, s := range data.Subscriptions {
+		if s.ID == id {
+			removed = true
+			continue
+		}
+		out = append(out, s)
+	}
+	data.Subscriptions = out
+	mu.Unlock()
+	if removed {
+		flush()
+	}
+	return removed
+}
+
+// SetSubscriptionEnabled 切换某条订阅是否参与合并，返回订阅是否存在。
+func SetSubscriptionEnabled(id string, enabled bool) bool {
+	mu.Lock()
+	found := false
+	for i := range data.Subscriptions {
+		if data.Subscriptions[i].ID == id {
+			data.Subscriptions[i].Enabled = enabled
+			found = true
+			break
+		}
+	}
+	mu.Unlock()
+	if found {
+		flush()
+	}
+	return found
+}
+
+// SubscriptionRoots 返回用户保存的「订阅」文本框原始根地址列表。
+func SubscriptionRoots() []string {
+	mu.RLock()
+	defer mu.RUnlock()
+	out := make([]string, len(data.SubscriptionRoots))
+	copy(out, data.SubscriptionRoots)
+	return out
+}
+
+// SetSubscriptionRoots 保存「订阅」文本框的原始根地址列表（一行一个）。
+func SetSubscriptionRoots(roots []string) {
+	mu.Lock()
+	data.SubscriptionRoots = append([]string(nil), roots...)
+	mu.Unlock()
+	flush()
+}
+
 // ---------- 直播频道收藏 ----------
 
 // LiveFavs 返回收藏的直播频道列表。
@@ -1257,6 +1426,34 @@ func isSpace(b byte) bool {
 }
 
 // ---------- 站源健康度 ----------
+
+// RecordSiteCrawl 记录站源最近一次内容更新抓取的结果：ok 表示有没有成功
+// 拿到响应并解析出来（哪怕报告 0 条也算 ok=true；网络错误/解析失败才是
+// false），total 是报告的影片总数。供点播页下拉排序用：
+//   - 有内容的站按数量从多到少排在最前面；
+//   - 没内容的站里，「连上了、确实是空」比「这次压根没连上」更靠前——
+//     后者更像站源过期/损坏/暂时失联，参见 api.siteSeverity。
+//
+// 只改内存，不单独落盘——调用方（crawler.Run，一次要给几十上百个站源各
+// 记一次）跑完一整轮后自己会调用别的 Save* 落盘一次，不需要这里每条都
+// 单独 flush（878 个站源每条都 flush 一次会是 878 次整份配置的磁盘写）。
+func RecordSiteCrawl(siteKey string, ok bool, total int) {
+	mu.Lock()
+	defer mu.Unlock()
+	if data.SiteHealth == nil {
+		data.SiteHealth = make(map[string]SiteHealthStat)
+	}
+	stat := data.SiteHealth[siteKey]
+	stat.LastCrawlOK = ok
+	stat.LastTotal = total
+	now := time.Now().Unix()
+	if ok {
+		stat.LastSuccess = now
+	} else {
+		stat.LastFail = now
+	}
+	data.SiteHealth[siteKey] = stat
+}
 
 // RecordSiteRequest 记录站源请求（成功/失败 + 响应时间）。
 func RecordSiteRequest(siteKey string, success bool, ms int) {

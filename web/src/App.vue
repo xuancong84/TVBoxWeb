@@ -159,7 +159,9 @@ function disagree() {
     </transition>
 
     <router-view v-slot="{ Component }">
-      <component :is="Component" />
+      <keep-alive include="SearchView,LiveView">
+        <component :is="Component" />
+      </keep-alive>
     </router-view>
 
     <TipToast />

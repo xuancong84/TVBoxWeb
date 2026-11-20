@@ -1,6 +1,9 @@
 <script setup lang="ts">
-import { ref, computed } from 'vue'
-import type { Vod } from '@/types'
+import { ref, computed, onMounted } from 'vue'
+import { useRouter } from 'vue-router'
+import type { Vod, SubRef } from '@/types'
+import { siteInfoMap } from '@/siteInfo'
+import { imgUrl } from '@/api'
 
 const props = defineProps<{
   vod: Vod
@@ -10,6 +13,26 @@ const props = defineProps<{
 
 const emit = defineEmits<{ (e: 'click', vod: Vod): void }>()
 
+const router = useRouter()
+// 真实 <a href>：中键/ctrl/cmd+点击让浏览器原生在新标签页打开，不用自己写
+// window.open 逻辑——跟详情页路由一致（VodGrid.open 同样的 query）。
+const href = computed(() =>
+  router.resolve({
+    name: 'detail',
+    query: { site: props.vod.siteKey, siteName: props.vod.siteName, id: props.vod.id }
+  }).href
+)
+
+function onClick(e: MouseEvent) {
+  // 中键点击不会触发 click（走 auxclick），这里只需要拦住普通左键：
+  // 保持 SPA 内部跳转（emit 给父组件走 router.push），不要让浏览器真的
+  // 按 href 做整页跳转。ctrl/cmd/shift+左键和中键都交给浏览器原生处理
+  // （新标签页打开），什么都不做。
+  if (e.button !== 0 || e.metaKey || e.ctrlKey || e.shiftKey || e.altKey) return
+  e.preventDefault()
+  emit('click', props.vod)
+}
+
 const failed = ref(false)
 
 function onErr() {
@@ -17,20 +40,30 @@ function onErr() {
 }
 
 const firstChar = computed(() => (props.vod.name ? props.vod.name.trim()[0] || '影' : '影'))
+
+// 鼠标悬停卡片时顺带标出「点播源 / 单仓源」——方便挑出要拉黑的垃圾/色情
+// 源头，不用点进详情页再去查。subs 现查现填，拿不到也不影响卡片本身。
+const subs = ref<SubRef[]>([])
+onMounted(async () => {
+  const map = await siteInfoMap()
+  subs.value = map.get(props.vod.siteKey)?.subs || []
+})
+const subsTitle = computed(() => {
+  if (!subs.value.length) return '单仓源：未知'
+  return '单仓源：\n' + subs.value.map((s) => s.name || s.source).join('\n')
+})
 </script>
 
 <template>
-  <div
+  <a
     class="vod-card"
-    role="button"
-    tabindex="0"
+    :href="href"
     :aria-label="`打开 ${vod.name}`"
-    @click="emit('click', vod)"
-    @keydown.enter="emit('click', vod)"
+    @click="onClick"
     @keydown.space.prevent="emit('click', vod)"
   >
     <div class="poster">
-      <img v-if="!failed && vod.pic" :src="vod.pic" :alt="vod.name" loading="lazy" @error="onErr" />
+      <img v-if="!failed && vod.pic" :src="imgUrl(vod.pic)" :alt="vod.name" loading="lazy" @error="onErr" />
       <div v-else class="placeholder">
         <span class="ph-char">{{ firstChar }}</span>
         <span class="ph-name">{{ vod.name }}</span>
@@ -39,14 +72,21 @@ const firstChar = computed(() => (props.vod.name ? props.vod.name.trim()[0] || '
       <div v-if="showProgress !== undefined && showProgress > 0" class="progress">
         <div class="progress-bar" :style="{ width: showProgress * 100 + '%' }"></div>
       </div>
+      <!-- 悬停才出现：点播源徽标，再悬停它本身用原生 tooltip 展开单仓源列表 -->
+      <div v-if="vod.siteName" class="src-badge" :title="subsTitle" @click.stop>
+        {{ vod.siteName }}
+      </div>
     </div>
     <div class="name">{{ vod.name }}</div>
     <div v-if="vod.year" class="meta">{{ vod.year }}</div>
-  </div>
+  </a>
 </template>
 
 <style scoped>
 .vod-card {
+  display: block;
+  color: inherit;
+  text-decoration: none;
   cursor: pointer;
   transition: transform 0.14s ease-out;
 }
@@ -120,6 +160,30 @@ const firstChar = computed(() => (props.vod.name ? props.vod.name.trim()[0] || '
 .progress-bar {
   height: 100%;
   background: var(--live);
+}
+/* 点播源徽标：平时隐藏，卡片悬停才出现；再悬停它本身触发原生 title
+   tooltip 展开单仓源列表，不用额外写一套弹层组件 */
+.src-badge {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  padding: 3px 7px;
+  font-size: 11px;
+  line-height: 1.4;
+  color: #fff;
+  background: rgba(0, 0, 0, 0.62);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.14s;
+}
+.vod-card:hover .src-badge {
+  opacity: 1;
+  pointer-events: auto;
+  cursor: help;
 }
 .name {
   margin-top: 8px;

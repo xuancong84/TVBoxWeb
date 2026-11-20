@@ -17,6 +17,8 @@ const props = withDefaults(defineProps<{
   /** 直播线路地址列表 */
   lines: string[]
   rawUrl: string
+  /** 各条线路的轻量测速结果（url -> {ok, ms, kbps}），没测过的线路取不到值 */
+  lineQuality?: Record<string, { ok: boolean; ms: number; kbps: number }>
   subDelay: number
   subFontSize: number
   externalSubActive: boolean
@@ -38,6 +40,7 @@ const props = withDefaults(defineProps<{
   globalOutroSkip?: number
 }>(), {
   subTracks: () => [],
+  lineQuality: () => ({}),
   subTrackIdx: -1,
   skipOwn: false,
   globalIntroSkip: 0,
@@ -69,6 +72,18 @@ const SUB_SIZES = [16, 20, 26, 32]
 // 模板里所有内嵌轨道相关的地方都走这里，保证永远不会是 undefined。
 // withDefaults 已兜住「不传」，这里再兜住「显式传 null」。
 const subTrackList = computed<SubtitleTrack[]>(() => props.subTracks || [])
+
+// 线路测速徽标：没测过时只显示「线路 N」，测过且连通时附上延迟，连不上标红字。
+function lineLabel(u: string, i: number): string {
+  const q = props.lineQuality?.[u]
+  if (!q) return `线路 ${i + 1}`
+  if (!q.ok) return `线路 ${i + 1} · 超时`
+  return `线路 ${i + 1} · ${q.ms}ms`
+}
+function lineBad(u: string): boolean {
+  const q = props.lineQuality?.[u]
+  return !!q && !q.ok
+}
 
 function close() {
   emit('update:modelValue', false)
@@ -111,9 +126,9 @@ function delayLabel(d: number) {
             v-for="(u, i) in props.lines"
             :key="'line' + i"
             class="chip"
-            :class="{ active: u === props.rawUrl }"
+            :class="{ active: u === props.rawUrl, 'chip-bad': lineBad(u) }"
             @click="emit('switch-line', u)"
-          >线路 {{ i + 1 }}</span>
+          >{{ lineLabel(u, i) }}</span>
         </div>
       </template>
 
@@ -243,9 +258,9 @@ function delayLabel(d: number) {
             v-for="(u, i) in props.lines"
             :key="'line' + i"
             class="chip"
-            :class="{ active: u === props.rawUrl }"
+            :class="{ active: u === props.rawUrl, 'chip-bad': lineBad(u) }"
             @click="emit('switch-line', u)"
-          >线路 {{ i + 1 }}</span>
+          >{{ lineLabel(u, i) }}</span>
         </div>
       </template>
 
@@ -392,6 +407,10 @@ function delayLabel(d: number) {
   background: var(--live);
   color: #fff;
   font-weight: 600;
+}
+.chip-bad {
+  color: var(--warn, #ffb4ab);
+  border-color: var(--warn, #ffb4ab);
 }
 
 /* ===== 跳过片头/片尾：两行紧凑排布 ===== */

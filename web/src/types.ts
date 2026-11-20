@@ -9,6 +9,12 @@ export interface SiteHealthStatus {
   avgMs: number
 }
 
+/** 一条「单仓源」（展开后的叶子订阅）引用，标识是谁带来了某个站源/直播源 */
+export interface SubRef {
+  name: string
+  source: string
+}
+
 export interface Site {
   key: string
   name: string
@@ -20,6 +26,14 @@ export interface Site {
   usable: boolean
   reason: string
   enabled: boolean
+  /** 最近一次内容更新时该站源返回了 0 条（域名过期/空列表等），不等于不可用 */
+  dead: boolean
+  /** 最近一次内容更新时该站源报告的影片总数，没抓取过/失败时是 0 */
+  count: number
+  /** count=0 时的严重程度细分：1=连上了确实空 2=暂时不可用 3=过期/损坏/失联 */
+  severity: number
+  /** 贡献了这个站源的单仓源列表（GET /api/sites 现查现填） */
+  subs?: SubRef[]
 }
 
 export interface Category {
@@ -81,6 +95,8 @@ export interface Channel {
   logo: string
   group: string
   urls: string[]
+  /** 这个频道真实播放过的结果：'ok'=播过且能播，'fail'=播过但播不出来，不带=没播过 */
+  status?: 'ok' | 'fail'
 }
 
 export interface ChannelGroup {
@@ -93,6 +109,14 @@ export interface LiveDir {
   count: number
   children: LiveDir[]
   channels: Channel[]
+}
+
+/** 单条播放线路的轻量测速结果（GET /api/live/lines/probe），只取开头 16KB */
+export interface LineQuality {
+  url: string
+  ok: boolean
+  ms: number
+  kbps: number
 }
 
 export interface LiveScore {
@@ -136,6 +160,19 @@ export interface FavGroup {
   name: string
   time: number
   count?: number  // 该分组内收藏数量（由后端聚合计算）
+}
+
+/** 一条订阅源（GET /api/subscriptions）。可以同时启用多条，站源/直播源会合并去重。 */
+export interface Subscription {
+  id: string
+  name: string
+  source: string
+  enabled: boolean
+  sites: number
+  lives: number
+  parses: number
+  updatedAt: number
+  err?: string
 }
 
 export interface WebdavSource {
@@ -194,6 +231,10 @@ export interface WdHistory {
 export interface RawLive {
   name: string
   url: string
+  /** 是否参与直播频道合并（GET /api/live/sources 现查现填，空启停列表=全部启用） */
+  enabled?: boolean
+  /** 贡献了这条直播源的单仓源列表 */
+  subs?: SubRef[]
 }
 
 export interface EpgProgram {

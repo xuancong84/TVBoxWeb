@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { ref, computed, onMounted } from 'vue'
 import { useRouter } from 'vue-router'
-import { api } from '@/api'
+import { api, imgUrl } from '@/api'
 import { useAppStore } from '@/stores/app'
 import type { HistItem } from '@/types'
 import TopBar from '@/components/TopBar.vue'
@@ -157,7 +157,7 @@ function clearAll() {
         <div class="group-title">{{ g.label }} <span class="group-count">{{ g.items.length }} 条</span></div>
         <div v-for="h in g.items" :key="h.siteKey + h.vodId" class="row" @click="open(h)">
           <div class="thumb">
-            <img :src="h.pic" :alt="h.name" loading="lazy" />
+            <img :src="imgUrl(h.pic)" :alt="h.name" loading="lazy" />
           </div>
           <div class="info">
             <div class="name">{{ h.name }}</div>

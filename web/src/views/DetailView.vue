@@ -1,11 +1,12 @@
 <script setup lang="ts">
 import { ref, computed, onMounted } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
-import { api, humanizeApiError } from '@/api'
+import { api, humanizeApiError, imgUrl } from '@/api'
 import { useAppStore } from '@/stores/app'
 import { usePlayerStore } from '@/stores/player'
 import { splitLines } from '@/utils/lines'
-import type { Vod, Line } from '@/types'
+import type { Vod, Line, SubRef } from '@/types'
+import { siteInfoMap } from '@/siteInfo'
 import TopBar from '@/components/TopBar.vue'
 import ErrorState from '@/components/ErrorState.vue'
 import SkeletonList from '@/components/SkeletonList.vue'
@@ -36,6 +37,13 @@ const watchedEps = ref<Set<number>>(new Set())
 const histPos = ref(0)
 const posterFailed = ref(false)
 
+// 悬停「点播源」名字可看它的「单仓源」列表——跟 VodCard 上的徽标同一套查法
+const subs = ref<SubRef[]>([])
+const subsTitle = computed(() => {
+  if (!subs.value.length) return '单仓源：未知'
+  return '单仓源：\n' + subs.value.map((s) => s.name || s.source).join('\n')
+})
+
 async function loadDetail() {
   loading.value = true
   loadError.value = ''
@@ -43,6 +51,9 @@ async function loadDetail() {
     const detail = await api.vodDetail(siteKey, vodId)
     vod.value = detail
     lines.value = splitLines(detail.from, detail.playUrl)
+    siteInfoMap().then((map) => {
+      subs.value = map.get(siteKey)?.subs || []
+    })
     // 默认线路：优先选第一条「直链」线路（网页地址播不出，真流在后面）
     if (lines.value.length) {
       const dIdx = lines.value.findIndex((l) => l.direct)
@@ -190,7 +201,7 @@ function resumePlay() {
     <div v-else-if="vod" class="detail">
       <div class="left">
         <div class="poster">
-          <img v-if="!posterFailed && vod.pic" :src="vod.pic" :alt="vod.name" @error="posterFailed = true" />
+          <img v-if="!posterFailed && vod.pic" :src="imgUrl(vod.pic)" :alt="vod.name" @error="posterFailed = true" />
           <div v-else class="ph">
             <span class="ph-char">{{ vod.name ? vod.name[0] : '影' }}</span>
             <span class="ph-name">{{ vod.name }}</span>
@@ -199,6 +210,9 @@ function resumePlay() {
       </div>
       <div class="right">
         <h1 class="title">{{ vod.name }}</h1>
+        <div v-if="vod.siteName" class="src-line">
+          点播源：<span class="src-name" :title="subsTitle">{{ vod.siteName }}</span>
+        </div>
         <div v-if="meta" class="meta">{{ meta }}</div>
         <div v-if="vod.actor" class="meta">主演：{{ vod.actor }}</div>
         <div v-if="vod.director" class="meta">导演：{{ vod.director }}</div>
@@ -265,7 +279,8 @@ function resumePlay() {
   padding: 8px 24px;
   color: var(--sub);
   cursor: pointer;
-  font-size: 15px;
+  font-size: 19px;
+  font-weight: 600;
 }
 .detail {
   display: flex;
@@ -321,6 +336,19 @@ function resumePlay() {
   font-size: 14px;
   margin-bottom: 6px;
 }
+.src-line {
+  color: var(--sub);
+  font-size: 13px;
+  margin-bottom: 8px;
+}
+.src-name {
+  cursor: help;
+  border-bottom: 1px dashed var(--sub);
+}
+.src-name:hover {
+  color: #fff;
+  border-bottom-color: #fff;
+}
 .content {
   color: var(--sub);
   font-size: 14px;
@@ -351,8 +379,8 @@ function resumePlay() {
   margin-bottom: 14px;
 }
 .lines-label {
-  font-size: 16px;
-  font-weight: 600;
+  font-size: 20px;
+  font-weight: 700;
 }
 .lines-tabs {
   display: flex;
@@ -367,8 +395,8 @@ function resumePlay() {
   margin-bottom: 12px;
 }
 .eps-title {
-  font-size: 16px;
-  font-weight: 600;
+  font-size: 20px;
+  font-weight: 700;
 }
 .eps-count {
   font-size: 13px;

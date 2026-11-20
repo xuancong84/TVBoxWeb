@@ -1,12 +1,10 @@
 <script setup lang="ts">
-import { ref, computed, onMounted, watch, onUnmounted } from 'vue'
+import { ref, computed, onMounted, onUnmounted, onActivated, onDeactivated, watch } from 'vue'
 import { useRouter } from 'vue-router'
 import { api, humanizeApiError } from '@/api'
 import { useAppStore } from '@/stores/app'
 import { usePlayerStore } from '@/stores/player'
-import { getWSClient } from '@/ws'
-import type { LiveDir, Channel, RawLive, LiveScore, EpgResult, EpgProgram } from '@/types'
-import type { HealthUpdate } from '@/ws'
+import type { LiveDir, Channel, EpgResult, EpgProgram } from '@/types'
 import TopBar from '@/components/TopBar.vue'
 import SkeletonList from '@/components/SkeletonList.vue'
 import VirtualGrid from '@/components/VirtualGrid.vue'
@@ -16,24 +14,17 @@ const app = useAppStore()
 const player = usePlayerStore()
 
 const loading = ref(false)
+const refreshing = ref(false)
 const root = ref<LiveDir | null>(null)
-const currentUrl = ref('')
+const sourceCount = ref(0)
 const selectedPath = ref<string[]>([]) // 当前分组路径
 const deadSet = ref<Set<string>>(new Set())
 
-const sources = ref<RawLive[]>([])
 const probing = ref(false)
-const ranking = ref(false)
-const speedOpen = ref(false)
 const checkedCount = ref(0)
-const rankResults = ref<Record<string, LiveScore>>({})
-const ranked = ref<LiveScore[]>([])
 const filter = ref('')
 // 检测代次：切台/重载频道时递增，用于中断旧的异步检测循环，防止结果污染新源
 let probeGen = 0
-
-// ===== 实时健康度追踪（WebSocket） =====
-const siteHealthStatus = ref<Map<string, HealthUpdate>>(new Map())
 
 // ===== 性能优化：频道索引缓存 =====
 // 避免每次搜索都递归遍历全树，改用预构建的扁平列表 + 首字母索引
@@ -68,45 +59,89 @@ const favChannels = computed<Channel[]>(() => {
   return liveFavs.value.filter((c) => c.name.toLowerCase().includes(kw))
 })
 
+const junkFilter = ref(true)
+// 页面被 <keep-alive include="LiveView"> 缓存住了（见 App.vue）：从播放页
+// 点「返回」回到这页时组件不会重新创建，只会重新 activate，搜索关键字/
+// 分组筛选（filter/selectedPath）作为组件内部状态原样留着，不用额外存取。
+// 首次挂载时 onMounted 自己会调一次 loadChannels，紧跟着触发的第一次
+// onActivated 要跳过，不然首次打开页面会多发一次重复请求。
+let skipNextActivate = true
+
 onMounted(async () => {
-  sources.value = await api.liveSources()
-  const u = (await api.liveUrl()).url
-  if (u) {
-    currentUrl.value = u
-    await loadChannels()
-  }
+  await loadChannels()
   // 加载收藏的直播频道
   liveFavs.value = await api.liveFavs().catch(() => [])
+  const p = await api.prefs().catch(() => null)
+  if (p) junkFilter.value = p.liveJunkFilter !== false
+})
 
-  // 订阅 WebSocket 健康度更新（保存引用，卸载时才能精确移除）
-  const ws = getWSClient()
-  ws.onHealth(onHealthUpdate)
+// 从播放页返回时触发：静默刷新一次频道列表，捡起刚才那次播放写回的
+// 红/绿播放状态；不重置 filter/selectedPath，也不弹骨架屏。
+onActivated(() => {
+  if (skipNextActivate) {
+    skipNextActivate = false
+    return
+  }
+  loadChannels(false, true)
+})
+
+onDeactivated(() => {
+  if (reloadTimer) { clearTimeout(reloadTimer); reloadTimer = null }
 })
 
 onUnmounted(() => {
-  const ws = getWSClient()
-  ws.offHealth(onHealthUpdate)
+  if (reloadTimer) clearTimeout(reloadTimer)
 })
 
-// 与 onMounted/onUnmounted 共用同一个引用，避免反复进出页面导致回调累积
-const onHealthUpdate = (update: HealthUpdate) => {
-  siteHealthStatus.value.set(update.siteKey, update)
+// force=true 时让后台把没过期的源缓存也重新抓一遍（「刷新」按钮用）；
+// 不管 force 与否，接口本身永远立刻用现有缓存返回，不会等网络。
+// silent=true 用于下面的自动跟进重载：安静地刷新数据，不打开骨架屏/不弹提示，
+// 避免用户正在看列表时界面突然闪一下「加载中」。
+async function loadChannels(force = false, silent = false) {
+  if (!silent) {
+    loading.value = true
+    probeGen++ // 重载频道时中断正在进行的旧检测
+  }
+  try {
+    const r = await api.liveChannels({ force })
+    root.value = r.root
+    sourceCount.value = r.sources || 0
+    if (!silent) deadSet.value = new Set()
+    // 还有源没抓到（首次加载中/上次失败）：服务端已经在后台重新拉取，
+    // 过一会儿静默刷新一次列表，自动捡起新结果，不需要用户手动点刷新。
+    scheduleFollowUpReload(Object.keys(r.errs || {}).length > 0)
+  } catch (e: any) {
+    if (!silent) app.showTip('直播源加载失败：' + humanizeApiError(e))
+  } finally {
+    if (!silent) loading.value = false
+  }
 }
 
-async function loadChannels() {
-  if (!currentUrl.value) return
-  loading.value = true
-  probeGen++ // 重载频道时中断正在进行的旧检测
-  try {
-    const r = await api.liveChannels(currentUrl.value)
-    root.value = r.root
-    currentUrl.value = r.url
-    deadSet.value = new Set()
-  } catch (e: any) {
-    app.showTip('直播源加载失败：' + humanizeApiError(e))
-  } finally {
-    loading.value = false
+let reloadTimer: ReturnType<typeof setTimeout> | null = null
+let reloadAttempts = 0
+function scheduleFollowUpReload(pending: boolean) {
+  if (reloadTimer) { clearTimeout(reloadTimer); reloadTimer = null }
+  if (!pending || reloadAttempts >= 4) {
+    reloadAttempts = 0
+    return
   }
+  reloadAttempts++
+  reloadTimer = setTimeout(() => { loadChannels(false, true) }, reloadAttempts * 6000)
+}
+
+async function refreshChannels() {
+  refreshing.value = true
+  try {
+    await loadChannels(true)
+    app.showTip('已在后台重新拉取全部直播源，列表会陆续自动更新')
+  } finally {
+    refreshing.value = false
+  }
+}
+
+async function toggleJunkFilter(val: boolean) {
+  await api.setPrefs({ liveJunkFilter: val }).catch(() => {})
+  await loadChannels()
 }
 
 // 当前分组下的频道（选中路径下递归收集）
@@ -186,80 +221,22 @@ function playChannel(ch: Channel) {
   router.push({ name: 'play', query: { url: ch.url, title: ch.name, site: 'live', id: '', from: 'live' } })
 }
 
-async function switchSource(url: string) {
-  currentUrl.value = url
-  await api.setLiveUrl(url)
-  // 切台清理：清空上一个源的测速/检测状态，避免残留误导
-  probeGen++ // 中断正在进行的旧源频道检测
-  deadSet.value = new Set()
-  rankResults.value = {}
-  ranked.value = []
-  checkedCount.value = 0
-  probing.value = false
-  speedOpen.value = false
-  await loadChannels()
+// 真实 <a href>：中键/ctrl/cmd+点击让浏览器原生在新标签页打开，
+// 跟 playChannel 里 router.push 的目标路由保持一致。
+function channelHref(ch: Channel): string {
+  return router.resolve({
+    name: 'play',
+    query: { url: ch.url, title: ch.name, site: 'live', id: '', from: 'live' }
+  }).href
 }
 
-// 测速排行：逐个测订阅下发的源，结果进面板
-async function rankSources() {
-  if (!sources.value.length) {
-    app.showTip('暂无直播源，先去「设置 → 订阅」导入')
-    return
-  }
-  if (ranking.value) {
-    app.showTip('正在测速，请稍等')
-    return
-  }
-  ranking.value = true
-  speedOpen.value = true
-  rankResults.value = {}
-  ranked.value = []
-  const count = sources.value.length
-  app.showTip(`开始并发测速 ${count} 个源，约 5 秒`)
-  // 初始化所有状态为"测速中..."
-  for (const s of sources.value) {
-    rankResults.value[s.url] = { name: s.name, url: s.url, ok: false, ms: -1, count: 0, alive: 0, sampled: 0, score: 0, state: '测速中...' }
-  }
-  try {
-    const items = sources.value.map((s) => ({ name: s.name, url: s.url, ok: false, ms: -1, count: 0, alive: 0, sampled: 0, score: 0, state: '' }))
-    // 一次并发请求全部测速（后端 worker pool 并发）
-    const results = await api.liveRank(items)
-    for (const r of results) {
-      rankResults.value[r.url] = r
-    }
-    ranked.value = results
-      .filter((x) => x.ok)
-      .sort((a, b) => {
-        if (a.score !== b.score) return b.score - a.score
-        if (a.alive !== b.alive) return b.alive - a.alive
-        return a.ms - b.ms
-      })
-    const usable = results.filter((x) => x.ok).length
-    if (ranked.value.length) {
-      app.showTip(`测完 ${results.length} 个源，${usable} 个可用；建议用「${ranked.value[0].name}」`)
-    } else {
-      app.showTip('所有源都没测通，检查网络后重试')
-    }
-  } catch (e: any) {
-    app.showTip('测速失败：' + humanizeApiError(e))
-  } finally {
-    ranking.value = false
-  }
-}
-
-function useSource(url: string) {
-  if (ranking.value) {
-    app.showTip('正在测速，稍等一下再切换')
-    return
-  }
-  if (url === currentUrl.value) {
-    app.showTip('已经在用这个源')
-    return
-  }
-  const s = sources.value.find((x) => x.url === url)
-  switchSource(url)
-  speedOpen.value = false
-  app.showTip(`已切到「${s?.name || url}」，正在重新加载`)
+function onChannelClick(ch: Channel, e: MouseEvent) {
+  // 普通左键：拦住 <a> 的原生整页跳转，走 playChannel 里现成的 SPA 跳转
+  // （还要顺带维护 player.eps 播放列表）。中键/ctrl/cmd/shift+左键交给
+  // 浏览器原生处理（新标签页打开），这里什么都不做。
+  if (e.button !== 0 || e.metaKey || e.ctrlKey || e.shiftKey || e.altKey) return
+  e.preventDefault()
+  playChannel(ch)
 }
 
 // 检测当前分组频道可用性
@@ -313,17 +290,6 @@ async function probeChannels() {
 
 function isDead(ch: Channel): boolean {
   return deadSet.value.has(ch.name + '|' + ch.url)
-}
-
-// 获取站源实时健康度
-function getSiteHealth(name: string): HealthUpdate | null {
-  // 按 name 匹配（站源名称作为 key）
-  for (const [key, val] of siteHealthStatus.value) {
-    if (key === name || key.includes(name) || name.includes(key)) {
-      return val
-    }
-  }
-  return null
 }
 
 // ===== EPG 节目单 =====
@@ -393,26 +359,25 @@ const epgVisible = computed<EpgProgram[]>(() => {
     <TopBar />
     <div class="live-head">
       <div class="live-title">
-        {{ root ? root.count + ' 台 · ' + root.children.length + ' 组' : '直播' }}
+        {{ root ? root.count + ' 台 · ' + root.children.length + ' 组' + (sourceCount ? ' · 合并自 ' + sourceCount + ' 个源' : '') : '直播' }}
         <span v-if="pathLabel() !== '全部频道'" class="path">{{ pathLabel() }}</span>
       </div>
       <div class="live-actions">
-        <el-select
-          :model-value="currentUrl"
+        <el-switch
+          v-model="junkFilter"
           size="small"
-          placeholder="选择直播源"
-          style="width: 240px"
-          @change="switchSource"
-        >
-          <el-option v-for="s in sources" :key="s.url" :label="s.name" :value="s.url" />
-        </el-select>
+          inline-prompt
+          active-text="过滤垃圾频道"
+          inactive-text="过滤垃圾频道"
+          @change="(v: boolean | string | number) => toggleJunkFilter(v as boolean)"
+        />
         <el-button size="small" :loading="probing" @click="probeChannels">检测</el-button>
-        <el-button size="small" :loading="ranking" @click="rankSources">测速排行</el-button>
+        <el-button size="small" :loading="refreshing" @click="refreshChannels">刷新</el-button>
         <el-button size="small" @click="openEpg()">节目单</el-button>
       </div>
     </div>
 
-    <div v-if="!currentUrl" class="empty">
+    <div v-if="!root && !loading" class="empty">
       <p>暂无直播源</p>
       <p class="empty-sub">可以去「设置 → 订阅」导入订阅链接</p>
       <el-button type="primary" @click="router.push('/settings')">去设置</el-button>
@@ -480,58 +445,30 @@ const epgVisible = computed<EpgProgram[]>(() => {
           :overscan="3"
         >
           <template #default="{ item: ch }">
-            <div class="channel" :class="{ dead: isDead(ch) }" @click="playChannel(ch)">
-              <span class="ch-name">{{ ch.name }}</span>
+            <a
+              class="channel"
+              :class="{ dead: isDead(ch) }"
+              :href="channelHref(ch)"
+              @click="onChannelClick(ch, $event)"
+            >
+              <span
+                class="ch-name"
+                :class="{ 'ch-name-ok': ch.status === 'ok', 'ch-name-fail': ch.status === 'fail' }"
+                :title="ch.status === 'ok' ? '播放过，能播' : ch.status === 'fail' ? '播放过，播不通' : ''"
+              >{{ ch.name }}</span>
               <span v-if="ch.urls.length > 1" class="ch-alts">{{ ch.urls.length }} 线路</span>
-              <span class="ch-epg" title="查看节目单" @click.stop="openEpg(ch)">▤</span>
+              <span class="ch-epg" title="查看节目单" @click.stop.prevent="openEpg(ch)">▤</span>
               <span
                 class="ch-fav"
                 :class="{ on: isFav(ch) }"
                 :title="isFav(ch) ? '取消收藏' : '收藏频道'"
-                @click.stop="toggleFav(ch)"
+                @click.stop.prevent="toggleFav(ch)"
               >{{ isFav(ch) ? '★' : '☆' }}</span>
-            </div>
+            </a>
           </template>
         </VirtualGrid>
       </div>
     </div>
-
-    <!-- 测速排行面板 -->
-    <el-dialog v-model="speedOpen" title="直播源测速排行" width="620px" append-to-body :close-on-click-modal="!ranking">
-      <div class="speed-sub">{{ ranking ? '测速中…' : '可播率 70% + 响应速度 30% 综合排序' }}</div>
-      <div class="speed-list">
-        <div v-for="(s, i) in sources" :key="s.url" class="speed-row">
-          <span class="speed-rank" :class="{ top: i < 3 }">{{ i + 1 }}</span>
-          <div class="speed-info">
-            <div class="speed-name">
-              {{ s.name }}
-              <span v-if="s.url === currentUrl" class="tag">使用中</span>
-              <span v-else-if="ranked.length && ranked[0].url === s.url" class="tag rec">推荐</span>
-              <!-- 实时健康度指示器 -->
-              <span
-                v-if="getSiteHealth(s.name)"
-                class="health-dot"
-                :class="getSiteHealth(s.name)!.health"
-                :title="`健康度: ${getSiteHealth(s.name)!.health} · 错误率 ${(getSiteHealth(s.name)!.errorRate * 100).toFixed(0)}% · 平均 ${getSiteHealth(s.name)!.avgMs}ms`"
-              ></span>
-            </div>
-            <div class="speed-state" :class="{ fail: rankResults[s.url] && !rankResults[s.url].ok }">
-              {{ rankResults[s.url] ? rankResults[s.url].state : '待测' }}
-              <span v-if="rankResults[s.url] && rankResults[s.url].ok" class="score">
-                · {{ rankResults[s.url].score }} 分
-              </span>
-            </div>
-          </div>
-          <el-button size="small" :type="s.url === currentUrl ? 'primary' : 'default'" :disabled="ranking" @click="useSource(s.url)">
-            {{ s.url === currentUrl ? '当前' : '使用' }}
-          </el-button>
-        </div>
-      </div>
-      <template #footer>
-        <el-button :loading="ranking" @click="rankSources">{{ ranking ? '测速中…' : '重新测速' }}</el-button>
-        <el-button type="primary" @click="speedOpen = false">关闭</el-button>
-      </template>
-    </el-dialog>
 
     <!-- EPG 节目单 -->
     <el-dialog v-model="epgOpen" title="节目单 (EPG)" width="620px" append-to-body>
@@ -665,6 +602,8 @@ const epgVisible = computed<EpgProgram[]>(() => {
   align-items: center;
   justify-content: space-between;
   transition: all 0.14s;
+  color: inherit;
+  text-decoration: none;
 }
 .channel:hover {
   background: var(--card-hi);
@@ -672,6 +611,14 @@ const epgVisible = computed<EpgProgram[]>(() => {
 .channel.dead {
   color: var(--dim);
   text-decoration: line-through;
+}
+/* 播放状态上色：ok=真实播放成功过，fail=播放过但所有线路都失败过，
+   没有这两个 class（status 未知/没播过）保持默认的当前文字颜色。*/
+.ch-name-ok {
+  color: #4caf50;
+}
+.ch-name-fail {
+  color: #f44336;
 }
 .ch-alts {
   font-size: 11px;
@@ -706,102 +653,6 @@ const epgVisible = computed<EpgProgram[]>(() => {
   font-size: 12px;
   margin-top: 8px;
 }
-.speed-sub {
-  font-size: 13px;
-  color: var(--dim);
-  margin-bottom: 12px;
-}
-.speed-list {
-  max-height: 50vh;
-  overflow-y: auto;
-}
-.speed-row {
-  display: flex;
-  align-items: center;
-  gap: 12px;
-  padding: 10px;
-  border-radius: 6px;
-}
-.speed-row:hover {
-  background: var(--card);
-}
-.speed-rank {
-  width: 24px;
-  height: 24px;
-  border-radius: 50%;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  font-size: 13px;
-  color: var(--sub);
-  background: var(--white-15);
-  flex-shrink: 0;
-}
-.speed-rank.top {
-  color: #141218;
-  background: #ffeb3b;
-  font-weight: 600;
-}
-.speed-info {
-  flex: 1;
-  min-width: 0;
-}
-.speed-name {
-  font-size: 14px;
-  display: flex;
-  align-items: center;
-  gap: 8px;
-}
-.tag {
-  font-size: 11px;
-  padding: 1px 8px;
-  border-radius: 4px;
-  color: var(--selected);
-  border: 1px solid var(--selected);
-}
-.tag.rec {
-  color: #7ee787;
-  border-color: #7ee787;
-}
-/* 实时健康度指示器 */
-.health-dot {
-  display: inline-block;
-  width: 8px;
-  height: 8px;
-  border-radius: 50%;
-  margin-left: 4px;
-  cursor: help;
-  transition: all 0.3s;
-}
-.health-dot.healthy {
-  background: #4caf50;
-  box-shadow: 0 0 4px rgba(76, 175, 80, 0.5);
-}
-.health-dot.slow {
-  background: #ff9800;
-  box-shadow: 0 0 4px rgba(255, 152, 0, 0.5);
-}
-.health-dot.dead {
-  background: #f44336;
-  box-shadow: 0 0 4px rgba(244, 67, 54, 0.5);
-  animation: pulse-dead 1.5s ease-in-out infinite;
-}
-@keyframes pulse-dead {
-  0%, 100% { opacity: 1; }
-  50% { opacity: 0.4; }
-}
-.speed-state {
-  font-size: 12px;
-  color: var(--dim);
-  margin-top: 3px;
-}
-.speed-state.fail {
-  color: var(--warn);
-}
-.speed-state .score {
-  color: var(--selected);
-}
-
 /* ===== 移动端响应式 ===== */
 @media (max-width: 640px) {
   .top { padding: 8px 16px; gap: 8px; }

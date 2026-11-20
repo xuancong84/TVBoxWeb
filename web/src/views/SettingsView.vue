@@ -5,7 +5,8 @@ import { api, humanizeApiError, getAuthToken, setAuthToken } from '@/api'
 import { getTheme, setTheme, type ThemeMode } from '@/theme'
 import { useAppStore } from '@/stores/app'
 import { authState, logout } from '@/auth'
-import type { Site, WebdavSource } from '@/types'
+import type { Site, Subscription, WebdavSource, RawLive } from '@/types'
+import { invalidateSiteInfo } from '@/siteInfo'
 import TopBar from '@/components/TopBar.vue'
 import UpgradePanel from '@/components/UpgradePanel.vue'
 
@@ -86,14 +87,25 @@ const navItems: { key: NavKey; label: string }[] = [
 ]
 
 // ===== 播放源 =====
-const subUrl      = ref('')
-const subName     = ref('')
-const cfgText     = ref('')
-const cfgState    = ref('未配置')
-const liveInput   = ref('')
-const liveSources = ref<{ name: string; url: string }[]>([])
-const curLiveUrl  = ref('')
-const showPresets = ref(false)
+// subRootsText 是「订阅」文本框的原始内容（一行一个根地址，可以是普通订阅
+// 地址，也可以是聚合清单地址如 tvboxmuti.json）。点「保存」才会递归展开、
+// 去重后同步进 subscriptions 列表——聚合清单上游的内容会变，所以展开结果
+// 不直接当「保存」的东西，根地址本身才是，方便下次重新展开。
+const subRootsText  = ref('')
+const subSyncing    = ref(false)
+let   rootsHydrated = false
+const subName       = ref('')
+const subscriptions = ref<Subscription[]>([])
+const subBusy       = ref<Record<string, boolean>>({})
+const confirmRemoveId = ref('')
+let   crTimer = 0
+// 点播源/直播源：展开列表，内容来自订阅合并结果；可以单条启停，
+// 启停后那个站源/直播源就不再参与点播/直播合并，是「拉黑垃圾源」的开关。
+const liveSources     = ref<RawLive[]>([])
+const liveEnabledSet  = ref<Set<string>>(new Set())
+const liveBusy        = ref<Record<string, boolean>>({})
+const showVodSources  = ref(false)
+const showLiveSources = ref(false)
 
 // ===== 内容更新 =====
 const crawlSummary = ref('')
@@ -137,27 +149,25 @@ function goMetrics() {
 onMounted(load)
 
 async function load() {
-  const [st, list, wdList, liveList] = await Promise.all([
-    api.status(), api.sites(), api.webdavSources(), api.liveSources()
+  const [st, list, wdList, liveList, subs, roots] = await Promise.all([
+    api.status(), api.sites(), api.webdavSources(), api.liveSources(), api.subscriptions(), api.subscriptionRoots()
   ])
-  subName.value      = st.subName || ''
+  subName.value        = st.subName || ''
+  subscriptions.value  = subs
   totalSites.value   = st.totalSites
   crawlSummary.value = st.crawlSummary || ''
-  // configUrl 既是点播配置地址，也是订阅地址（订阅时一起保存了）
-  // 有 subName 说明是通过订阅导入的，把地址回填到 subUrl 方便用户查看/修改
-  if (st.configUrl) {
-    cfgText.value  = st.configUrl
-    cfgState.value = '已配置'
-    if (st.subName) subUrl.value = st.configUrl  // 订阅地址回填
-  } else {
-    cfgState.value = list.length > 0 ? '已导入' : '未配置'
-  }
-  curLiveUrl.value = st.liveUrl || ''
-  liveInput.value  = st.liveUrl || ''
   sites.value      = list
   enabledKeys.value = new Set(list.filter((s: Site) => s.enabled).map((s: Site) => s.key))
   wdSources.value   = wdList
   liveSources.value = liveList
+  liveEnabledSet.value = new Set(liveList.filter((s) => s.enabled).map((s) => s.url))
+  // 文本框内容只在首次加载时回填，避免用户正在编辑时被后续的 load()（比如
+  // 切换某条订阅启停）覆盖掉还没保存的修改。没保存过根地址时，退化成用
+  // 现有订阅的地址列表回填，老用户升级后文本框不会是空的。
+  if (!rootsHydrated) {
+    rootsHydrated = true
+    subRootsText.value = roots.length ? roots.join('\n') : subs.map((s) => s.source).join('\n')
+  }
 
   // 加载版本信息 + 各网盘上次识别到的数量（用于「识别影视」入口摘要）
   loadVersionInfo()
@@ -179,50 +189,119 @@ async function loadVersionInfo() {
 }
 
 // ---------- 播放源 ----------
-async function doSubscribe() {
-  const v = subUrl.value.trim()
-  if (!v) { app.showTip('先填订阅链接'); return }
+// 保存：把文本框里的根地址（一行一个，可以是普通订阅地址，也可以是聚合
+// 清单地址如 tvboxmuti.json）递归展开成叶子（单链接）地址、去重后同步进
+// 下面的订阅列表——新出现的新增（默认启用），还在的保留原有启停状态只刷新
+// 内容，不再出现的删除。聚合清单上游的内容会变，所以每次点「保存」都会
+// 重新整个展开一遍，而不是只展开一次就记死。
+async function doSyncRoots() {
+  const roots = subRootsText.value.split('\n').map((s) => s.trim()).filter(Boolean)
+  if (!roots.length) { app.showTip('先填至少一个订阅或聚合清单地址'); return }
+  subSyncing.value = true
   try {
-    const r = await api.subscribe(v)
-    app.showTip(`订阅成功：${r.name || '订阅源'} · ${r.sites} 站点 · ${r.lives} 个直播源`)
-    subName.value = r.name || ''
-    // 不清空 subUrl，保留地址让用户可查看和再次修改
+    const r = await api.syncSubscriptionRoots(roots)
+    const errCount = r.errs ? Object.keys(r.errs).length : 0
+    app.showTip(
+      `已保存：共 ${r.leaves} 个地址（新增 ${r.added}，移除 ${r.removed}）` +
+      (errCount ? `，${errCount} 个展开失败` : '')
+    )
     await load()
+    invalidateSiteInfo()
     app.notifyFeedRefresh() // 通知首页重载 Feed
-  } catch (e: any) { app.showTip('订阅失败：' + humanizeApiError(e)) }
+  } catch (e: any) {
+    app.showTip('保存失败：' + humanizeApiError(e))
+  } finally {
+    subSyncing.value = false
+  }
 }
 
-async function doImportCfg() {
-  const v = cfgText.value.trim()
-  if (!v) { app.showTip('先填配置地址或 JSON'); return }
+// 重新拉取某一条已有订阅（原地址再提交一次即可，后端按 ID 原地更新）。
+async function refreshSub(s: Subscription) {
+  subBusy.value = { ...subBusy.value, [s.id]: true }
   try {
-    const r = await api.loadConfig(v)
-    app.showTip(`导入成功：${r.count} 个站源`)
-    cfgState.value = '已导入'
+    const r = await api.subscribe(s.source)
+    app.showTip(`已刷新：共 ${r.sites} 站点 · ${r.lives} 个直播源`)
     await load()
-  } catch (e: any) { app.showTip('导入失败：' + humanizeApiError(e)) }
+    app.notifyFeedRefresh()
+  } catch (e: any) {
+    app.showTip('刷新失败：' + humanizeApiError(e))
+  } finally {
+    subBusy.value = { ...subBusy.value, [s.id]: false }
+  }
 }
 
-async function doSetLive() {
-  const v = liveInput.value.trim()
-  if (!v) { app.showTip('先填直播源地址'); return }
-  await api.setLiveUrl(v)
-  curLiveUrl.value = v
-  app.showTip('直播源已保存')
+async function toggleSub(s: Subscription, enabled: boolean) {
+  try {
+    await api.toggleSubscription(s.id, enabled)
+    await load()
+    invalidateSiteInfo()
+    app.notifyFeedRefresh()
+  } catch (e: any) { app.showTip('操作失败：' + humanizeApiError(e)) }
 }
 
-async function selectLive(url: string) {
-  await api.setLiveUrl(url)
-  curLiveUrl.value = url
-  liveInput.value  = url
-  app.showTip('已切换直播源')
+// 单仓源的全选/全部反选都走批量接口（一次请求，后端只重建一遍合并站源
+// 列表）——不能挨个调 toggleSubscription 并发几十次，那样每次调用各自
+// 触发一遍昂贵的 RebuildFromSubscriptions，互相抢占在树莓派上会导致部分
+// 请求超时、最终只有一部分订阅真的变了。
+async function selectAllSubs() {
+  const targets = subscriptions.value.filter((s) => !s.enabled)
+  if (!targets.length) return
+  const updates: Record<string, boolean> = {}
+  for (const s of targets) updates[s.id] = true
+  try {
+    await api.bulkToggleSubscriptions(updates)
+    await load()
+    invalidateSiteInfo()
+    app.notifyFeedRefresh()
+  } catch (e: any) { app.showTip('操作失败：' + humanizeApiError(e)) }
+}
+async function toggleAllSubs() {
+  if (!subscriptions.value.length) return
+  const updates: Record<string, boolean> = {}
+  for (const s of subscriptions.value) updates[s.id] = !s.enabled
+  try {
+    await api.bulkToggleSubscriptions(updates)
+    await load()
+    invalidateSiteInfo()
+    app.notifyFeedRefresh()
+  } catch (e: any) { app.showTip('操作失败：' + humanizeApiError(e)) }
+}
+
+// 删除需要点两次确认（4 秒内再点一次才真的删），和「恢复出厂设置」按钮同一套交互。
+function removeSub(s: Subscription) {
+  if (confirmRemoveId.value !== s.id) {
+    confirmRemoveId.value = s.id
+    window.clearTimeout(crTimer)
+    crTimer = window.setTimeout(() => (confirmRemoveId.value = ''), 4000)
+    return
+  }
+  confirmRemoveId.value = ''
+  doRemoveSub(s)
+}
+
+// 删掉某一条叶子订阅：如果它的根地址（或所属聚合清单）还留在上面文本框
+// 里，下次点「保存」重新展开时可能会被重新发现、再次加回来——这不是
+// bug，这条删除只在「保存」之间生效，是软删除。
+async function doRemoveSub(s: Subscription) {
+  try {
+    await api.removeSubscription(s.id)
+    app.showTip('已删除订阅')
+    await load()
+    invalidateSiteInfo()
+    app.notifyFeedRefresh()
+  } catch (e: any) { app.showTip('删除失败：' + humanizeApiError(e)) }
 }
 
 // ---------- 内容更新 ----------
 async function doCrawl() {
   crawling.value = true
-  await api.triggerCrawl()
-  app.showTip('已开始更新…')
+  const r = await api.triggerCrawl()
+  if (!r.started && !r.running) {
+    crawling.value = false
+    app.showTip('内容已是最新，不需要重新抓取')
+    return
+  }
+  app.showTip(r.running ? '已经在更新中…' : '已开始更新…')
   setTimeout(async () => {
     const st = await api.status()
     crawlSummary.value = st.crawlSummary || ''
@@ -236,13 +315,29 @@ async function toggleSite(s: Site, val: boolean | string | number) {
   const next = new Set(enabledKeys.value)
   if (on) next.add(s.key); else next.delete(s.key)
   enabledKeys.value = next
-  await api.setEnabled([...next])}
+  await api.setEnabled([...next])
+  invalidateSiteInfo()
+}
 
 function setAllEnabled() {
   const keys = sites.value.filter((s: Site) => s.usable).map((s: Site) => s.key)
   enabledKeys.value = new Set(keys)
   api.setEnabled(keys)
+  invalidateSiteInfo()
   app.showTip('已启用全部可用站源')
+}
+
+// 全部反选：每个可用站源的启停状态各自取反（跟「全选」不一样，不是统一
+// 设成同一个值）。
+function toggleAllSites() {
+  const next = new Set(enabledKeys.value)
+  for (const s of sites.value) {
+    if (!s.usable) continue
+    if (next.has(s.key)) next.delete(s.key); else next.add(s.key)
+  }
+  enabledKeys.value = next
+  api.setEnabled([...next])
+  invalidateSiteInfo()
 }
 
 async function speedTest() {
@@ -272,7 +367,44 @@ function enableFastest5() {
   if (!okList.length) { app.showTip('先测速再启用'); return }
   enabledKeys.value = new Set(okList)
   api.setEnabled(okList)
+  invalidateSiteInfo()
   app.showTip('已启用最快 ' + okList.length + ' 个站源')
+}
+
+// ---------- 直播源 ----------
+async function toggleLive(s: RawLive, val: boolean | string | number) {
+  const on = val as boolean
+  liveBusy.value = { ...liveBusy.value, [s.url]: true }
+  try {
+    // 后端「空列表 = 全部启用」，第一次关掉某一条时要先把「当前全部启用」
+    // 展开成「除了这条之外全部启用」的显式列表，不能直接传一个只有这一
+    // 条的数组——那样会把其它直播源也一起停掉。
+    const next = new Set(liveEnabledSet.value.size ? liveEnabledSet.value : liveSources.value.map((l) => l.url))
+    if (on) next.add(s.url); else next.delete(s.url)
+    liveEnabledSet.value = next
+    await api.setLiveSourcesEnabled([...next])
+    invalidateSiteInfo()
+  } catch (e: any) {
+    app.showTip('操作失败：' + humanizeApiError(e))
+  } finally {
+    liveBusy.value = { ...liveBusy.value, [s.url]: false }
+  }
+}
+
+function selectAllLives() {
+  const urls = liveSources.value.map((l) => l.url)
+  liveEnabledSet.value = new Set(urls)
+  api.setLiveSourcesEnabled(urls)
+  invalidateSiteInfo()
+}
+function toggleAllLives() {
+  const next = new Set(liveEnabledSet.value)
+  for (const l of liveSources.value) {
+    if (next.has(l.url)) next.delete(l.url); else next.add(l.url)
+  }
+  liveEnabledSet.value = next
+  api.setLiveSourcesEnabled([...next])
+  invalidateSiteInfo()
 }
 
 function enabledCount() {
@@ -477,67 +609,130 @@ async function clearHistory() {
         <template v-if="navKey === 'source'">
           <div class="section-label">播放源</div>
           <div class="card">
-            <!-- 订阅 -->
+            <!-- 订阅源：可以同时添加多个来源，站源/直播源按规则合并去重 -->
             <div class="srow srow-sub">
               <div class="srow-sub-head">
-                <span class="srow-title">订阅</span>
-                <span v-if="subName" class="srow-val sub-name">{{ subName }}</span>
+                <span class="srow-title">订阅源</span>
+                <span v-if="subscriptions.length" class="srow-val sub-name">
+                  {{ subscriptions.length }} 个来源 · 共 {{ totalSites }} 站源
+                </span>
                 <span v-else class="srow-dim">未订阅</span>
               </div>
               <div class="srow-sub-body">
                 <el-input
-                  v-model="subUrl"
-                  placeholder="订阅链接（https://…/subscribe.json）"
-                  clearable
-                  size="small"
-                  style="flex:1"
+                  v-model="subRootsText"
+                  type="textarea"
+                  :rows="4"
+                  placeholder="订阅或聚合清单地址，一行一个（聚合清单，比如 tvboxmuti.json，会在「保存」时自动递归展开成其中每一个单独地址）"
                 />
-                <el-button type="primary" size="small" @click="doSubscribe">
-                  {{ subName ? '重新订阅' : '订阅' }}
-                </el-button>
               </div>
-            </div>
-            <div class="sdiv"></div>
-            <!-- 点播配置 -->
-            <div class="srow">
-              <div class="srow-left">
-                <span class="srow-title">点播配置</span>
-                <span :class="cfgState === '未配置' ? 'srow-dim' : 'srow-val'">{{ cfgState }}</span>
+              <div class="sub-save-row">
+                <el-button type="primary" size="small" :loading="subSyncing" @click="doSyncRoots">保存</el-button>
+                <span class="srow-dim">保存会重新展开全部地址并同步下方列表</span>
               </div>
-              <div class="srow-right">
-                <el-input v-model="cfgText" placeholder="配置地址 / 整段 JSON" clearable size="small" />
-                <el-button size="small" @click="doImportCfg">导入</el-button>
-              </div>
-            </div>
-            <div class="sdiv"></div>
-            <!-- 直播源 -->
-            <div class="srow">
-              <div class="srow-left">
-                <span class="srow-title">直播源</span>
-                <span v-if="curLiveUrl" class="srow-dim srow-url">{{ curLiveUrl }}</span>
-                <span v-else class="srow-dim">未设置</span>
-              </div>
-              <div class="srow-right">
-                <el-input v-model="liveInput" placeholder="m3u / txt 直播源地址" clearable size="small" />
-                <el-button size="small" @click="doSetLive">保存</el-button>
-              </div>
-            </div>
-            <!-- 订阅直播源列表折叠 -->
-            <template v-if="liveSources.length">
-              <div class="sdiv"></div>
-              <div class="srow srow-clickable" @click="showPresets = !showPresets">
-                <div class="srow-left">
-                  <span class="srow-title">订阅直播源</span>
-                  <span class="srow-dim">{{ liveSources.length }} 个 · {{ showPresets ? '收起' : '展开' }}</span>
+              <!-- 单仓源：上面订阅源地址递归展开、去重后的叶子地址，每条
+                   都是一个独立的单一来源（相对「聚合清单」这种带菜单的
+                   多来源地址而言） -->
+              <template v-if="subscriptions.length">
+                <div class="list-title-row">
+                  <div class="list-title">单仓源 <span class="list-title-count">{{ subscriptions.length }} 个</span></div>
+                  <div class="list-actions">
+                    <el-button size="small" text @click="selectAllSubs">全选</el-button>
+                    <el-button size="small" text @click="toggleAllSubs">全部反选</el-button>
+                  </div>
                 </div>
-                <span class="arrow">›</span>
-              </div>
-              <template v-if="showPresets">
-                <div v-for="(p, i) in liveSources" :key="i" class="schild" :class="{ 'schild-hot': curLiveUrl === p.url }" @click="selectLive(p.url)">
-                  <span class="schild-name">{{ p.name }}</span>
-                  <span class="schild-val">{{ curLiveUrl === p.url ? '✓ 使用中' : '使用' }}</span>
+                <div class="sub-list">
+                  <div v-for="s in subscriptions" :key="s.id" class="sub-item" :class="{ 'sub-item-off': !s.enabled }">
+                    <div class="sub-item-main">
+                      <div class="sub-item-top">
+                        <span class="sub-item-name">{{ s.name || '（未命名订阅）' }}</span>
+                        <span class="sub-item-stat">{{ s.sites }} 站源 · {{ s.lives }} 直播源</span>
+                      </div>
+                      <span class="sub-item-url" :title="s.source">{{ s.source }}</span>
+                      <span v-if="s.err" class="sub-item-err">⚠ {{ s.err }}</span>
+                    </div>
+                    <div class="sub-item-ops">
+                      <el-switch
+                        :model-value="s.enabled"
+                        size="small"
+                        @change="(v: boolean | string | number) => toggleSub(s, v as boolean)"
+                      />
+                      <el-button size="small" text :loading="subBusy[s.id]" @click="refreshSub(s)">刷新</el-button>
+                      <el-button size="small" text type="danger" @click="removeSub(s)">
+                        {{ confirmRemoveId === s.id ? '确认？' : '删除' }}
+                      </el-button>
+                    </div>
+                  </div>
                 </div>
               </template>
+            </div>
+            <div class="sdiv"></div>
+            <!-- 点播源：内容来自上面订阅源合并后的结果，可单条启停——关掉
+                 某个点播源之后，它就不会再出现在点播页/首页里（跟「站源」
+                 标签页共用同一套启停状态） -->
+            <div class="srow srow-clickable" @click="showVodSources = !showVodSources">
+              <div class="srow-left">
+                <span class="srow-title">点播源</span>
+                <span class="srow-dim">{{ sites.length }} 个 · 已启用 {{ enabledCount() }} · {{ showVodSources ? '收起' : '展开' }}</span>
+              </div>
+              <span class="arrow">›</span>
+            </div>
+            <template v-if="showVodSources">
+              <p v-if="!sites.length" class="note" style="padding:12px 18px 16px">暂无点播源，先在上面「订阅源」里保存订阅地址。</p>
+              <div v-if="sites.length" class="list-actions list-actions-pad">
+                <el-button size="small" text @click="setAllEnabled">全选</el-button>
+                <el-button size="small" text @click="toggleAllSites">全部反选</el-button>
+              </div>
+              <div v-for="s in sites" :key="s.key" class="schild schild-src">
+                <el-switch
+                  :model-value="enabledKeys.has(s.key)"
+                  size="small"
+                  :disabled="!s.usable"
+                  @change="(v: any) => toggleSite(s, v)"
+                />
+                <div class="schild-main">
+                  <div class="schild-top">
+                    <span class="schild-name">{{ s.name }}</span>
+                    <span class="schild-val">{{ s.usable ? '可用' : '不可用' }}</span>
+                  </div>
+                  <span class="schild-subs" :title="(s.subs || []).map((r) => r.source).join('\n')">
+                    单仓源：{{ s.subs?.length ? s.subs.map((r) => r.name || r.source).join('、') : '未知' }}
+                  </span>
+                </div>
+              </div>
+            </template>
+            <div class="sdiv"></div>
+            <!-- 直播源：可单条启停——关掉某个直播源之后，直播页合并出的
+                 频道目录就不会再混进它的线路。播放时仍会自动合并全部已
+                 启用的源、按线路测速切到最好的，不需要手动选「当前使用」 -->
+            <div class="srow srow-clickable" @click="showLiveSources = !showLiveSources">
+              <div class="srow-left">
+                <span class="srow-title">直播源</span>
+                <span class="srow-dim">{{ liveSources.length }} 个 · {{ showLiveSources ? '收起' : '展开' }}</span>
+              </div>
+              <span class="arrow">›</span>
+            </div>
+            <template v-if="showLiveSources">
+              <p v-if="!liveSources.length" class="note" style="padding:12px 18px 16px">暂无直播源，先在上面「订阅源」里保存含直播源的订阅地址。</p>
+              <div v-if="liveSources.length" class="list-actions list-actions-pad">
+                <el-button size="small" text @click="selectAllLives">全选</el-button>
+                <el-button size="small" text @click="toggleAllLives">全部反选</el-button>
+              </div>
+              <div v-for="p in liveSources" :key="p.url" class="schild schild-src">
+                <el-switch
+                  :model-value="liveEnabledSet.has(p.url)"
+                  size="small"
+                  :loading="liveBusy[p.url]"
+                  @change="(v: any) => toggleLive(p, v)"
+                />
+                <div class="schild-main">
+                  <span class="schild-name">{{ p.name }}</span>
+                  <span class="schild-val schild-url" :title="p.url">{{ p.url }}</span>
+                  <span class="schild-subs" :title="(p.subs || []).map((r) => r.source).join('\n')">
+                    单仓源：{{ p.subs?.length ? p.subs.map((r) => r.name || r.source).join('、') : '未知' }}
+                  </span>
+                </div>
+              </div>
             </template>
           </div>
         </template>
@@ -558,7 +753,7 @@ async function clearHistory() {
               <span class="arrow">›</span>
             </div>
           </div>
-          <div class="note">每 6 小时自动刷新远程配置并抓取各站最新影片。</div>
+          <div class="note">每 24 小时自动刷新远程配置并抓取各站最新影片；这期间点「立即更新」内容本来就是最新的，不会重复抓取。</div>
         </template>
 
         <!-- ========== 网盘 ========== -->
@@ -646,6 +841,10 @@ async function clearHistory() {
             <template v-if="showSites">
               <div class="sdiv"></div>
               <p v-if="!sites.length" class="note" style="padding:12px 18px 16px">暂无站点配置，可以去「播放源 → 点播配置」导入。</p>
+              <div v-if="sites.length" class="list-actions list-actions-pad">
+                <el-button size="small" text @click="setAllEnabled">全选</el-button>
+                <el-button size="small" text @click="toggleAllSites">全部反选</el-button>
+              </div>
               <div v-for="s in sites" :key="s.key" class="site-row">
                 <div class="site-bar">
                   <el-switch :model-value="enabledKeys.has(s.key)" :disabled="!s.usable" @change="(v: any) => toggleSite(s, v)" />
@@ -982,21 +1181,69 @@ async function clearHistory() {
 .warn.srow-clickable:hover { background: rgba(255,100,100,0.08); }
 /* ===== 分割线 ===== */
 .sdiv { height: 1px; background: rgba(255,255,255,0.12); margin: 0 18px; }
-/* ===== 子项（直播源列表等） ===== */
+/* ===== 子项（点播源/直播源展开列表） ===== */
 .schild {
   display: flex;
   align-items: center;
-  height: 42px;
-  padding: 0 18px 0 30px;
+  min-height: 42px;
+  padding: 7px 18px 7px 30px;
+  gap: 10px;
   cursor: pointer;
   transition: background 0.14s;
 }
 .schild:hover { background: rgba(255,255,255,0.06); }
 .schild-hot { background: rgba(255,235,59,0.06); }
+/* 点播源/直播源：每条自带启停开关，不是「点一下展开/收起」的行，
+   去掉手型/悬停高亮 */
+.schild-src { cursor: default; }
+.schild-src:hover { background: none; }
+.schild-main { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 2px; }
+.schild-top { display: flex; align-items: center; gap: 8px; }
 .schild-name { font-size: 15px; color: var(--txt); flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .schild-hot .schild-name { color: var(--selected); }
 .schild-val { font-size: 13px; color: var(--dim); flex-shrink: 0; }
 .schild-hot .schild-val { color: var(--selected); }
+.schild-url { max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; display: block; }
+/* 单仓源来源：内容字号比上面的 list-title 小一截，悬停用原生 tooltip
+   展开完整地址（title 属性），不用额外写弹层 */
+.schild-subs {
+  font-size: 12px;
+  color: var(--sub);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  cursor: help;
+}
+/* 列表标题：比列表内容（schild-name 15px / sub-item-name 14px）更大更醒目 */
+.list-title {
+  font-size: 17px;
+  font-weight: 600;
+  color: #fff;
+  margin: 2px 0 6px;
+}
+.list-title-count {
+  font-size: 13px;
+  font-weight: 400;
+  color: var(--dim);
+  margin-left: 6px;
+}
+.list-title-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+.list-title-row .list-title { margin: 2px 0 6px; }
+/* 全选 / 全部反选：每个能逐条启停的列表（单仓源、点播源、直播源、站源）
+   都配这一对批量操作按钮，省得几十上百条挨个点。 */
+.list-actions {
+  display: flex;
+  gap: 4px;
+  flex-shrink: 0;
+}
+.list-actions-pad {
+  padding: 4px 18px 8px 30px;
+}
 /* ===== 站源列表 ===== */
 .site-row {
   display: flex;
@@ -1107,6 +1354,46 @@ async function clearHistory() {
   gap: 8px;
   align-items: center;
 }
+.srow-sub-body .el-textarea__inner {
+  font-family: inherit;
+  font-size: 13px;
+  line-height: 1.6;
+}
+.sub-save-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+/* ===== 订阅列表（可多条，每条一行） ===== */
+.sub-list {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  margin-top: 2px;
+}
+.sub-item {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 10px;
+  border-radius: 8px;
+  background: rgba(255,255,255,0.04);
+}
+.sub-item-off { opacity: 0.5; }
+.sub-item-main { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 2px; }
+.sub-item-top { display: flex; align-items: center; gap: 8px; }
+.sub-item-name {
+  font-size: 14px; color: var(--txt); flex: 1;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.sub-item-stat { font-size: 12px; color: var(--dim); flex-shrink: 0; }
+.sub-item-url {
+  font-size: 12px; color: var(--sub);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.sub-item-err { font-size: 12px; color: var(--warn); }
+.sub-item-ops { display: flex; align-items: center; gap: 4px; flex-shrink: 0; }
 
 /* 访问口令输入框：桌面端限宽，移动端拉满（见 media 查询） */
 .token-input { max-width: 260px; }
@@ -1253,6 +1540,10 @@ async function clearHistory() {
   .srow-sub-body .el-input { width: 100% !important; }
   .srow-sub-body .el-button { width: 100%; margin-left: 0 !important; }
   .sub-name { white-space: normal; word-break: break-word; }
+  .sub-item { flex-direction: column; align-items: stretch; gap: 6px; }
+  .sub-item-top { flex-wrap: wrap; }
+  .sub-item-url { white-space: normal; word-break: break-all; }
+  .sub-item-ops { justify-content: flex-end; }
 
   /* 站源列表在手机上紧凑 */
   .site-meta { max-width: none; word-break: break-all; }

@@ -2,7 +2,7 @@
 import { ref, computed, onMounted } from 'vue'
 import { useRouter } from 'vue-router'
 import { ElMessageBox } from 'element-plus'
-import { api, humanizeApiError } from '@/api'
+import { api, humanizeApiError, imgUrl } from '@/api'
 import { useAppStore } from '@/stores/app'
 import type { FavItem, FavGroup } from '@/types'
 import TopBar from '@/components/TopBar.vue'
@@ -352,7 +352,7 @@ async function onImportFile(e: Event) {
             @dragend="onDragEnd"
           >
             <div class="poster" @click="batchMode ? toggleSelect(f) : open(f)">
-              <img :src="f.pic" :alt="f.name" loading="lazy" />
+              <img :src="imgUrl(f.pic)" :alt="f.name" loading="lazy" />
               <!-- 批量选择勾选框 -->
               <div v-if="batchMode" class="check-box" :class="{ checked: isSelected(f) }">
                 <span v-if="isSelected(f)">✓</span>

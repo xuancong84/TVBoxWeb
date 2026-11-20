@@ -22,11 +22,20 @@ const selectedChild = ref('')
 const filters = ref<FilterGroup[]>([])
 const filterVals = ref<Record<string, string>>({})
 const loading = ref(false)
+// 分类列表单独一个 loading 标记，不能跟 loading 共用：分类和片单现在是并发
+// 拉取的，共用一个标记会出现「分类先回来就把 loading 置 false，片单其实
+// 还没回来」的竞态，画面会先闪一下「暂无内容」再变成真正的列表。
+const catLoading = ref(false)
 const loadError = ref('')
 
 const currentSite = computed(() => sites.value.find((s) => s.key === siteKey.value))
 
-// 站源健康度：healthy 绿 / slow 黄 / dead 红 / unknown 灰
+// 下拉列表里站名前的小圆点：请求级健康度，跟「这个站有没有内容」无关，
+// 是「最近调用这个站的接口（分类/列表/详情）顺不顺」——
+//   绿 healthy：最近请求基本都成功，响应也不慢
+//   黄 slow：错误率偏高（>50%）或响应偏慢（平均 >5s），接口还通但不稳
+//   红 dead：超过 24 小时没成功过一次
+//   灰 unknown：还从没在这个站发过请求（没点开看过），无数据可判断
 const healthMap = ref<Record<string, string>>({})
 const HEALTH_COLOR: Record<string, string> = {
   healthy: 'var(--live, #22c55e)',
@@ -34,15 +43,15 @@ const HEALTH_COLOR: Record<string, string> = {
   dead: 'var(--danger, #ef4444)',
   unknown: 'var(--dim)'
 }
-const HEALTH_TEXT: Record<string, string> = {
-  healthy: '正常',
-  slow: '偏慢',
-  dead: '不可用',
-  unknown: ''
-}
 function healthOf(key: string): string {
   return healthMap.value[key] || 'unknown'
 }
+// 先按最近一次内容更新时抓到的影片总数从多到少排；数量都是 0 的站（没内容）
+// 再按 severity 从小到大排——「连上了确实空」比「这次压根没连上」靠前，
+// 「这次没连上但 24 小时内成功过」又比「长期没成功过/已过期/完全失联」靠前。
+const sortedSites = computed(() =>
+  [...sites.value].sort((a, b) => b.count - a.count || a.severity - b.severity)
+)
 function refreshAll() {
   void loadHealth()
   load()
@@ -61,6 +70,10 @@ const childrenOf = (tid: string) => categories.value.filter((c) => c.pid === tid
 // 初始化期间 siteKey 的首次赋值不算「用户切换站点」，不能清空刚恢复的筛选
 let restoring = true
 
+// 记住上次选过的站，下次切到点播页默认直接用它；从没选过（或那个站没了）就退化成
+// 内容最多的站（sortedSites 已按数量降序、severity 升序排好，取第一个即可）。
+const LAST_SITE_KEY = 'yz_vod_last_site'
+
 onMounted(async () => {
   // 从 URL 恢复筛选/页码，返回列表时不会丢失状态
   curPage.value = Math.max(1, Number(route.query.page) || 1)
@@ -70,10 +83,28 @@ onMounted(async () => {
   void loadHealth()
   const list = await api.sites()
   sites.value = list.filter((s) => s.usable)
-  if (!siteKey.value && sites.value.length) siteKey.value = sites.value[0].key
+  if (!siteKey.value) {
+    let last = ''
+    try { last = localStorage.getItem(LAST_SITE_KEY) || '' } catch { /* ignore */ }
+    if (last && sites.value.some((s) => s.key === last)) {
+      siteKey.value = last
+    } else if (sortedSites.value.length) {
+      siteKey.value = sortedSites.value[0].key
+    }
+  }
   if (siteKey.value) {
-    await loadCategories()
-    applyTidFromQuery()
+    if (route.query.tid) {
+      // 带着具体分类进来（比如从详情页返回）：分类/子分类归属要靠分类列表
+      // 才能分清楚，这一种必须等分类回来才能发起正确的片单请求。
+      await loadCategories()
+      applyTidFromQuery()
+    } else {
+      // 最常见的情况——没指定分类，默认就是「全部」：片单请求不依赖分类
+      // 列表，没必要白等一轮网络请求再去拿列表，两个并发着拉，谁先回来
+      // 就先显示谁的那部分。
+      void loadCategories()
+      load()
+    }
   }
   restoring = false
 })
@@ -107,6 +138,7 @@ function applyTidFromQuery() {
 }
 
 watch(siteKey, async () => {
+  try { if (siteKey.value) localStorage.setItem(LAST_SITE_KEY, siteKey.value) } catch { /* ignore */ }
   if (restoring) return
   selectedParent.value = ''
   selectedChild.value = ''
@@ -114,18 +146,20 @@ watch(siteKey, async () => {
   filters.value = [] // 清空旧站源的筛选选项，等新站源分类加载后重建
   curPage.value = 1
   syncQuery()
-  await loadCategories()
+  // 切站：selectedParent/selectedChild 已经清空成「全部」，片单请求不依赖
+  // 分类列表，两个并发着拉，不用等分类先回来。
+  void loadCategories()
   load()
 })
 
 async function loadCategories() {
-  loading.value = true
+  catLoading.value = true
   try {
     categories.value = await api.categories(siteKey.value)
   } catch (e: any) {
     app.showTip('分类加载失败：' + humanizeApiError(e))
   } finally {
-    loading.value = false
+    catLoading.value = false
   }
 }
 
@@ -233,11 +267,11 @@ function parseFilters(ext: string, tid: string): FilterGroup[] {
         <span class="site-name">{{ currentSite?.name || '点播' }}</span>
         <span v-if="page.total > 0" class="total-hint">共 {{ page.total.toLocaleString() }} 部</span>
         <el-select v-model="siteKey" size="small" placeholder="换站" style="width: 200px">
-          <el-option v-for="s in sites" :key="s.key" :label="s.name" :value="s.key">
+          <el-option v-for="s in sortedSites" :key="s.key" :label="s.name" :value="s.key" :class="{ 'opt-dead': s.count === 0 }">
             <span class="opt-health">
               <span class="health-dot" :style="{ background: HEALTH_COLOR[healthOf(s.key)] }"></span>
               <span>{{ s.name }}</span>
-              <span v-if="HEALTH_TEXT[healthOf(s.key)]" class="health-txt">{{ HEALTH_TEXT[healthOf(s.key)] }}</span>
+              <span class="health-txt">{{ s.count }}</span>
             </span>
           </el-option>
         </el-select>
@@ -396,4 +430,5 @@ function parseFilters(ext: string, tid: string): FilterGroup[] {
   font-size: 11px;
   color: var(--dim);
 }
+.opt-dead { opacity: 0.6; }
 </style>

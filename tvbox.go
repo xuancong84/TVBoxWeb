@@ -235,6 +235,8 @@ func New(opts ...Option) (*Server, error) {
 	if err := store.Init(dataFile); err != nil {
 		return nil, fmt.Errorf("tvbox: 加载数据失败: %w", err)
 	}
+	store.InitSiteCrawlCache(o.DataDir)
+	store.InitLiveCrawlCache(o.DataDir)
 
 	// 启动时恢复缓存站点列表
 	if store.TotalSites() == 0 {

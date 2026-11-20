@@ -359,13 +359,68 @@ func looksXML(txt string) bool {
 	return strings.HasPrefix(strings.TrimLeft(txt, " \t\r\n"), "<")
 }
 
-// CleanJSON 配置 JSON 容错：去 BOM、去 // 和 # 注释行、把保留字 class 改名。
+// escapeRawControlCharsInStrings 把 JSON 字符串字面量内部未转义的控制字符
+// （最常见是裸换行/回车/制表符）改成合法的转义序列。按引号配对识别「当前
+// 是不是在字符串里面」（遇到反斜杠时下一个字符原样透传，避免把 \" 的 "
+// 误判成字符串结束），字符串外的结构性空白不受影响。
+func escapeRawControlCharsInStrings(s string) string {
+	var b strings.Builder
+	b.Grow(len(s))
+	inStr := false
+	escaped := false
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if !inStr {
+			b.WriteByte(c)
+			if c == '"' {
+				inStr = true
+			}
+			continue
+		}
+		if escaped {
+			b.WriteByte(c)
+			escaped = false
+			continue
+		}
+		switch c {
+		case '\\':
+			b.WriteByte(c)
+			escaped = true
+		case '"':
+			b.WriteByte(c)
+			inStr = false
+		case '\n':
+			b.WriteString(`\n`)
+		case '\r':
+			b.WriteString(`\r`)
+		case '\t':
+			b.WriteString(`\t`)
+		default:
+			if c < 0x20 {
+				fmt.Fprintf(&b, `\u%04x`, c)
+			} else {
+				b.WriteByte(c)
+			}
+		}
+	}
+	return b.String()
+}
+
+// CleanJSON 配置 JSON 容错：去 BOM、转义字符串内裸控制字符、去 // 和 #
+// 注释行、把保留字 class 改名。
 // 注意："class" 仅当后跟 [ 时才替换，避免误匹配 "class_name"、"className" 等字段。
 func CleanJSON(txt string) string {
 	t := txt
 	if strings.HasPrefix(t, "\uFEFF") {
 		t = t[3:] // 去 UTF-8 BOM
 	}
+	// 有些采集源的 warningText/notice 之类字段手写多行提示文字时，直接在
+	// JSON 字符串里嵌了裸换行（不满足 JSON 规范，字符串内的控制字符必须
+	// 转义），Go 的 encoding/json 会报 "invalid character '\n' in string"
+	// 直接拒绝整份配置。这里先转义掉字符串内部的裸控制字符，再做下面按行
+	// 的注释剔除——顺序很重要：转义掉之后字符串里就不会再混进真正的换行，
+	// 不会把本该连在一起的值误切成「新的一行」，影响后面的注释行判断。
+	t = escapeRawControlCharsInStrings(t)
 	lines := strings.Split(t, "\n")
 	var keep []string
 	for _, line := range lines {

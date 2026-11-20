@@ -26,7 +26,6 @@ const app = useAppStore()
 const player = usePlayerStore()
 
 const SEEK_STEP = 10000
-const LIVE_SKIP_MAX = 4
 
 const rawUrl0 = (route.query.url as string) || ''
 const siteKey = (route.query.site as string) || ''
@@ -54,11 +53,185 @@ let levelIdx = -1
 // 自动模式下它是 -1，但实际档位需要另外记。
 let liveLevelIdx = -1
 const levels = ref<QLevel[]>([])
-let liveFail = 0
+
+// ===== 直播线路质量监控：轻量测速 + 当前线路卡顿检测，自动切到更好的线路 =====
+// 只探测「没在播」的备用线路（≤16KB 的 Range 请求），不碰正在播的那条流，
+// 不会跟正片抢带宽；当前线路好不好看它自己的缓冲事件（onwaiting/onplaying），
+// 不额外发请求去测它。
+const LINE_PROBE_INTERVAL = 25000 // 每 25s 探测一轮备用线路
+const STALL_WINDOW_MS = 30000     // 卡顿统计滚动窗口
+const STALL_RATIO_BAD = 0.35      // 窗口内卡顿占比超过这个值判定为「变差」
+const AUTO_SWITCH_COOLDOWN = 20000  // 两次自动切换之间至少隔这么久，避免来回抖
+const LINE_AVOID_MS = 60000         // 刚自动切走的线路，这么久内不再切回去
+const lineQuality = ref<Record<string, { ok: boolean; ms: number; kbps: number }>>({})
+let lineProbeTimer = 0
+let bufferWindowStart = 0
+let bufferStallMs = 0
+let waitingSince = 0
+let lastAutoSwitchAt = 0
+let avoidLines: Record<string, number> = {}
+
+function resetStallWindow() {
+  bufferWindowStart = Date.now()
+  bufferStallMs = 0
+  waitingSince = 0
+}
+
+function startLineQualityWatch() {
+  stopLineQualityWatch()
+  if (!isLive) return
+  resetStallWindow()
+  void probeAltLines()
+  lineProbeTimer = window.setInterval(probeAltLines, LINE_PROBE_INTERVAL)
+}
+
+function stopLineQualityWatch() {
+  if (lineProbeTimer) {
+    clearInterval(lineProbeTimer)
+    lineProbeTimer = 0
+  }
+}
+
+async function probeAltLines() {
+  if (!isLive) return
+  const ep = player.current
+  if (!ep) return
+  const alts = ep.urls.filter((u) => u && u !== rawUrl)
+  if (!alts.length) return
+  try {
+    const results = await api.liveLinesProbe(alts)
+    const next = { ...lineQuality.value }
+    for (const r of results) next[r.url] = { ok: r.ok, ms: r.ms, kbps: r.kbps }
+    lineQuality.value = next
+  } catch {
+    /* 探测失败不影响播放，静默忽略 */
+  }
+}
+
+function onBufferingStart() {
+  if (!isLive) return
+  waitingSince = Date.now()
+}
+
+function onBufferingEnd() {
+  if (!isLive || !waitingSince) return
+  const now = Date.now()
+  accumulateStall(now - waitingSince)
+  waitingSince = 0
+  void checkDegraded()
+}
+
+function accumulateStall(ms: number) {
+  const now = Date.now()
+  // 窗口已经过期（很久没卡过）就整体重置，避免「很久以前卡过一次」一直算数
+  if (now - bufferWindowStart > STALL_WINDOW_MS) {
+    bufferWindowStart = now
+    bufferStallMs = 0
+  }
+  bufferStallMs += Math.max(0, ms)
+}
+
+async function checkDegraded() {
+  const now = Date.now()
+  const windowElapsed = now - bufferWindowStart
+  if (windowElapsed < STALL_WINDOW_MS * 0.5) return // 窗口太短，数据还不够判断
+  if (bufferStallMs / windowElapsed < STALL_RATIO_BAD) return
+  if (now - lastAutoSwitchAt < AUTO_SWITCH_COOLDOWN) return
+  await tryAutoSwitch()
+}
+
+async function tryAutoSwitch() {
+  const ep = player.current
+  if (!ep) return
+  const now = Date.now()
+  const alts = ep.urls.filter((u) => u && u !== rawUrl && (avoidLines[u] || 0) < now)
+  if (!alts.length) return
+  let candidates = alts.map((u) => ({ u, q: lineQuality.value[u] })).filter((x) => x.q?.ok)
+  if (!candidates.length) {
+    // 还没测过数据：临时测一下再决定，总比瞎切强
+    try {
+      const fresh = await api.liveLinesProbe(alts)
+      const next = { ...lineQuality.value }
+      for (const r of fresh) next[r.url] = { ok: r.ok, ms: r.ms, kbps: r.kbps }
+      lineQuality.value = next
+    } catch { /* ignore */ }
+    candidates = alts.map((u) => ({ u, q: lineQuality.value[u] })).filter((x) => x.q?.ok)
+  }
+  if (!candidates.length) return
+  candidates.sort((a, b) => a.q!.ms - b.q!.ms)
+  const best = candidates[0].u
+  lastAutoSwitchAt = now
+  avoidLines[rawUrl] = now + LINE_AVOID_MS
+  app.showTip('当前线路卡顿明显，已自动切换到更好的线路')
+  await switchLine(best, true)
+}
+
+// 当前线路反复 fatal 错误、判定为挂了之后调用：在同一个频道里挑一条还没
+// 试过的线路切过去。优先挑「探测结果确认能用」的，一条都没探测到能用的
+// 时候也别干等——矬子里拔将军，挑一条没试过的硬切一次，总比反复重试同一条
+// 已经挂了的线路、或者直接认输好。调用方已经确认存在未试过的线路。
+// 同一条坏线路的 fatal 错误往往连续炸好几次（hls.js 内部分片/manifest
+// 各自报一次），这几次都会落进这个函数——没有这个锁的话，第一次调用
+// 还在 await 探测/切换的路上，后面几次重复调用会并发再切一次，互相打架。
+let switchingLine = false
+
+async function trySwitchToUntriedLine() {
+  if (switchingLine) return
+  const ep = player.current
+  if (!ep) return
+  const alts = ep.urls.filter((u) => u && u !== rawUrl && !triedLines.has(u))
+  if (!alts.length) return
+  switchingLine = true
+  try {
+    let candidates = alts.map((u) => ({ u, q: lineQuality.value[u] })).filter((x) => x.q?.ok)
+    if (!candidates.length) {
+      try {
+        const fresh = await api.liveLinesProbe(alts)
+        const next = { ...lineQuality.value }
+        for (const r of fresh) next[r.url] = { ok: r.ok, ms: r.ms, kbps: r.kbps }
+        lineQuality.value = next
+      } catch { /* ignore */ }
+      candidates = alts.map((u) => ({ u, q: lineQuality.value[u] })).filter((x) => x.q?.ok)
+    }
+    const pick = candidates.length ? candidates.sort((a, b) => a.q!.ms - b.q!.ms)[0].u : alts[0]
+    app.showTip('当前线路播放失败，自动切换到该频道的其它线路…')
+    await switchLine(pick, true)
+  } finally {
+    switchingLine = false
+  }
+}
 
 const videoEl = ref<HTMLVideoElement>()
 let hls: any | null = null
 let hlsRecover = 0 // hls fatal 错误恢复次数，避免 seek/网络抖动直接判死
+// 同一条线路累计报过多少次 fatal 错误，不会被 onplaying 清零（见下）。
+// hlsRecover 会在每次恢复到「播了一点」（哪怕只有一两帧）时被 onplaying
+// 重置为 0——这对「只是 seek 抖了一下」是对的，但碰上那种「播一下、断，
+// 播一下、断」反复横跳的坏线路，hlsRecover 永远不会攒到 3，于是永远停在
+// 「网络抖动，正在恢复…」原地重试同一条线路，表现成「提示一直在恢复，
+// 但实际上永远不会真的恢复」。lineFatalTotal 只统计「这条线路」累计报过
+// 几次 fatal（不管中间有没有短暂恢复过），超过阈值就判定这条线不稳定，
+// 换下一条——只在真正换了线路/频道，或用户手动重试时才清零。
+let lineFatalTotal = 0
+const LINE_FATAL_LIMIT = 5
+// 当前频道这一轮已经试过（且确认播不通）的线路：同一条线路反复报 fatal
+// 错误还是不行，大概率是这条线真的挂了——「网络抖动，正在恢复…」只在
+// 原地无限重试同一条死线路，永远不会恢复。换台（switchEpisode）时清空，
+// 换线路（switchLine）时特意不清，否则刚记下的失败线路会被立即抹掉。
+let triedLines = new Set<string>()
+// 这个频道这次打开有没有上报过播放结果：成功只报一次（第一次真正播起来就够
+// 了，没必要每次缓冲恢复都报一遍），失败也只在「确认所有线路都不行」时报
+// 一次。换台/重试时清零，换线路不清——一个频道里只要有一条线播成了，
+// 这个频道就该标「能播」，不该被同频道里别的坏线路覆盖成「不行」。
+let liveStatusReported = false
+
+function reportLiveStatus(ok: boolean) {
+  if (!isLive || liveStatusReported) return
+  liveStatusReported = true
+  const name = player.current?.name || title.value
+  if (!name) return
+  api.setLiveChannelStatus(name, ok).catch(() => {})
+}
 
 const title = ref((route.query.title as string) || '')
 const epLabel = ref('')
@@ -313,6 +486,7 @@ onMounted(async () => {
   syncEpLabel()
   await safeResolve()
   initPlayer()
+  startLineQualityWatch()
   if (videoEl.value) videoEl.value.volume = volume.value
   // 监听投屏连接状态（Remote Playback API）
   const remote = remoteApi()
@@ -328,6 +502,7 @@ onMounted(async () => {
 
 onUnmounted(() => {
   leave = true
+  stopLineQualityWatch()
   // 清理所有 timers。原来只清了 4 个，漏掉 osdTimer / skipTimer /
   // flashTimer / volTimer —— 离开页面后 skipTimer 仍在跑，几秒后会调
   // doSkip()，对一个已卸载的组件调 switchEpisode，发出无意义的解析请求。
@@ -372,7 +547,7 @@ function isDirectUrl(u: string): boolean {
   return ['.m3u8', '.mp4', '.flv', '.mkv', '.ts', '.m4v'].some((e) => lu.includes(e))
 }
 
-async function resolveUrl() {
+async function resolveUrl(skipLiveProbe = false) {
   finalUrl = ''
   via.value = ''
   hint.value = ''
@@ -385,9 +560,28 @@ async function resolveUrl() {
   errMsg.value = ''
 
   if (isLive) {
+    // skipLiveProbe：switchLine() 换线路时，目标 url 已经是调用方特意挑出来
+    // 的（用户手动选的，或者 HLS 播放失败后从 ep.urls 里选的下一条没试过的）。
+    // 这种情况不能再跑一遍 pickPlayableLive() 的 /api/peek 探活——它只是个
+    // 轻量连通性检查，跟 HLS 层面「这条线到底能不能真正播出内容」是两回事：
+    // 曾经出现过某条线连通性检查能过、但 manifest 解析一直失败的情况，
+    // pickPlayableLive 探活一通过就会把它当成「可用」原样塞回来，而它其实
+    // 已经在 HLS 层面被判定成死线路（记在 triedLines 里）——两层互相不知道
+    // 对方的判断，来回把同一条已确认播不通的线路送回去，变成死循环，永远
+    // 卡在「缓冲中」又不断尝试、却怎么都播不出来。
+    if (skipLiveProbe) {
+      finalUrl = rawUrl
+      via.value = '直播直连'
+      return
+    }
     const url = await pickPlayableLive()
     if (!url) {
-      errMsg.value = '这一组频道都打不开。可以在直播页换一个分组，或去设置页换一个直播源。'
+      // 这个频道自己的线路（含备用线路）一条都连不上：不自动跳到下一个
+      // 频道（那样用户会被悄悄带到一个自己没选的频道），退回频道选择页，
+      // 用一条三秒的提示说清楚原因。
+      reportLiveStatus(false)
+      app.showTip('该频道暂时无法播放', 3000)
+      goBack()
       return
     }
     finalUrl = url
@@ -435,9 +629,9 @@ async function resolveUrl() {
  * resolving 永远停在 true，界面就卡在「正在解析播放地址…」不动，
  * 连重试按钮都出不来。
  */
-async function safeResolve() {
+async function safeResolve(skipLiveProbe = false) {
   try {
-    await resolveUrl()
+    await resolveUrl(skipLiveProbe)
   } catch (e) {
     if (!finalUrl) {
       errMsg.value = '解析播放地址失败，请点击重试或返回换一个源'
@@ -457,41 +651,22 @@ async function probeLive(u: string): Promise<boolean> {
   }
 }
 
+// 只探测「这一个频道」自己的线路（rawUrl + 它的备用线路），探完还是没有一条
+// 能用就返回空串——不再自动跳去下一个频道。频道完全播不通时，用户想知道的
+// 是「这个频道不行」，而不是被悄悄带到一个自己没选的频道上，所以这里交给
+// 调用方（resolveUrl）统一走「退回频道列表 + 提示」。
 async function pickPlayableLive(): Promise<string> {
-  let skip = 0
-  let tries = 0
-  // 直播探活最多重试 4 次（含备用线路），每次 3-4 秒，合计约 12-16 秒
-  // 超过上限后显示提示让用户手动换源，而不是无限等待
-  const MAX_TRIES = 4
-  while (skip <= LIVE_SKIP_MAX && tries < MAX_TRIES) {
-    tries++
-    if (await probeLive(rawUrl)) {
-      liveFail = 0
-      return rawUrl
-    }
-    // 同频道备用线路
-    const ep = player.current
-    if (ep) {
-      for (const alt of ep.urls) {
-        if (alt === rawUrl) continue
-        tries++
-        if (await probeLive(alt)) {
-          rawUrl = alt
-          liveFail = 0
-          app.showTip('已切到该频道的备用线路')
-          return alt
-        }
+  if (await probeLive(rawUrl)) return rawUrl
+  const ep = player.current
+  if (ep) {
+    for (const alt of ep.urls) {
+      if (alt === rawUrl) continue
+      if (await probeLive(alt)) {
+        rawUrl = alt
+        app.showTip('已切到该频道的备用线路')
+        return alt
       }
     }
-    if (skip >= LIVE_SKIP_MAX || !player.hasNext) return ''
-    const next = player.step(1)
-    if (!next) return ''
-    skip++
-    liveFail = skip
-    rawUrl = next.url
-    title.value = next.name
-    syncEpLabel()
-    app.showTip('跳过失效频道 → ' + next.name)
   }
   return ''
 }
@@ -587,7 +762,25 @@ async function initPlayer() {
       })
       h.on(HlsCls.Events.ERROR, (_e: any, data: any) => {
         if (!data.fatal) return
-        if (hlsRecover < 3) {
+        const isNetOrMedia = data.type === HlsCls.ErrorTypes.NETWORK_ERROR || data.type === HlsCls.ErrorTypes.MEDIA_ERROR
+        if (isNetOrMedia) lineFatalTotal++
+        // manifest 级别的致命错误（地址返回的根本不是 m3u8，比如重定向到了一个
+        // 普通视频文件/错误页，或者整份清单直接加载失败/超时）：h.startLoad()
+        // 对这种错误没用——它是「续」已经建立起来的加载状态用的，这条线从一
+        // 开始就没能解析出任何 level，调多少次 startLoad() 都只是原地空等，
+        // 不会产生任何新的网络请求。表现出来就是「网络抖动，正在恢复…」提示
+        // 一闪而过之后，画面永远停在「缓冲中」，什么都不会再发生。这类错误
+        // 直接跳过软重试，走下面的换线路逻辑。
+        const isManifestFailure =
+          data.details === HlsCls.ErrorDetails.MANIFEST_LOAD_ERROR ||
+          data.details === HlsCls.ErrorDetails.MANIFEST_LOAD_TIMEOUT ||
+          data.details === HlsCls.ErrorDetails.MANIFEST_PARSING_ERROR ||
+          data.details === HlsCls.ErrorDetails.MANIFEST_INCOMPATIBLE_CODECS_ERROR
+        // lineFatalTotal 没到阈值、也不是 manifest 级别错误时才走「原地软
+        // 重试」：到了阈值说明这条线反复横跳（播一下断一下，hlsRecover 被
+        // onplaying 清零好几轮了），原地重试已经没意义，直接跳去下面的换
+        // 线路逻辑。
+        if (!isManifestFailure && lineFatalTotal < LINE_FATAL_LIMIT && hlsRecover < 3) {
           hlsRecover++
           if (data.type === HlsCls.ErrorTypes.NETWORK_ERROR) {
             app.showTip('网络抖动，正在恢复…')
@@ -597,6 +790,20 @@ async function initPlayer() {
           if (data.type === HlsCls.ErrorTypes.MEDIA_ERROR) {
             app.showTip('解码异常，正在恢复…')
             h.recoverMediaError()
+            return
+          }
+        }
+        // 到这还没 return：要么是非 network/media 的 fatal 错误，要么这条
+        // 线路的 fatal 错误已经攒够阈值——原地再怎么重试也是白等，这条线
+        // 大概率真挂了。直播频道通常有好几条线路（Channel.urls，合并自多个
+        // 直播源），先试同一个频道里还没试过的其它线路，而不是直接报错
+        // 或者跳去完全不同的频道。
+        if (isLive) {
+          triedLines.add(rawUrl)
+          const ep = player.current
+          const hasUntried = !!ep && ep.urls.some((u) => u && u !== rawUrl && !triedLines.has(u))
+          if (hasUntried) {
+            void trySwitchToUntriedLine()
             return
           }
         }
@@ -677,15 +884,20 @@ function bindVideoEvents(vid: HTMLVideoElement) {
   }
   vid.onwaiting = () => {
     buffering.value = true
+    onBufferingStart()
   }
   vid.onplaying = () => {
     buffering.value = false
     playing.value = true
     hlsRecover = 0
+    reportLiveStatus(true)
+    onBufferingEnd()
   }
   vid.onpause = () => {
     playing.value = false
     buffering.value = false
+    // 用户主动暂停不算网络卡顿，清掉计时但不计入卡顿累计
+    waitingSince = 0
   }
   vid.onended = () => {
     playing.value = false
@@ -738,10 +950,14 @@ function bindVideoEvents(vid: HTMLVideoElement) {
 }
 
 function onPlayError(errKind?: string) {
-  if (isLive && liveFail < 3 && player.hasNext) {
-    liveFail++
-    app.showTip('该频道无法播放，自动换下一个')
-    switchEpisode(1)
+  if (isLive) {
+    // 走到这说明这个频道能试的线路（HLS 播放时在 trySwitchToUntriedLine
+    // 里逐条试过 ep.urls）都已经失败：不自动跳到下一个频道——那样用户会
+    // 被悄悄带到一个自己没选的频道，还以为换台是自己手滑点到的。退回
+    // 频道选择页，用一条三秒的提示说清楚原因。
+    reportLiveStatus(false)
+    app.showTip('该频道所有线路均无法播放', 3000)
+    goBack()
     return
   }
   // 转封装兜底：网盘里很多文件没有扩展名（如「异星战境 Atlas」），
@@ -1417,6 +1633,10 @@ async function switchEpisode(delta: number) {
   outroFired = false
   skipShow.value = ''
   rawUrl = ep.url
+  triedLines = new Set()
+  hlsRecover = 0
+  lineFatalTotal = 0
+  liveStatusReported = false
   if (isLive) {
     title.value = ep.name
     app.showTip('换台：' + ep.name)
@@ -1428,6 +1648,7 @@ async function switchEpisode(delta: number) {
   resolving.value = true
   await safeResolve()
   initPlayer()
+  startLineQualityWatch()
 }
 
 function goBack() {
@@ -1440,9 +1661,9 @@ function goBack() {
 }
 
 // 手动切换直播线路（同一频道的多线路）
-async function switchLine(url: string) {
+async function switchLine(url: string, auto = false) {
   if (url === rawUrl) {
-    app.showTip('已经是当前线路')
+    if (!auto) app.showTip('已经是当前线路')
     return
   }
   destroyPlayer()
@@ -1467,17 +1688,31 @@ async function switchLine(url: string) {
   introDone = false
   outroFired = false
   skipShow.value = ''
-  liveFail = 0
   rawUrl = url
-  app.showTip('切换线路中…')
+  // 换了线路：不管是手动选的还是自动失败切过来的，fatal 错误计数都要
+  // 从 0 开始——这是「新的一条线」，不该背着上一条线攒的失败次数。
+  hlsRecover = 0
+  lineFatalTotal = 0
+  // 用户手动选的线路：给它一次干净的机会，不被之前的自动失败记录卡住。
+  // 自动失败切换（auto=true）则保留 triedLines，避免在几条坏线路间来回打转。
+  if (!auto) triedLines = new Set()
+  if (!auto) app.showTip('切换线路中…')
   resolving.value = true
-  await safeResolve()
+  // url 已经是明确选定的目标线路（用户选的，或者从 ep.urls 里专门挑的未试过
+  // 的那条），跳过 pickPlayableLive() 的 /api/peek 探活，见 resolveUrl 里的
+  // 注释——否则探活可能把这条已经在 HLS 层确认播不通的线路又判成「能用」
+  // 原样放回来，和换线路逻辑来回拉扯成死循环。
+  await safeResolve(true)
   initPlayer()
+  startLineQualityWatch()
 }
 
 function retry() {
   destroyPlayer()
-  liveFail = 0
+  hlsRecover = 0
+  lineFatalTotal = 0
+  triedLines = new Set()
+  liveStatusReported = false
   // 用户主动重试 = 重新给一次机会，把兜底标记也清掉
   remuxFallbackTried = false
   prepared.value = false
@@ -1889,6 +2124,7 @@ onUnmounted(() => {
       :q-cap="qCap"
       :level-idx="levelIdx"
       :lines="player.current?.urls || []"
+      :line-quality="lineQuality"
       :raw-url="rawUrl"
       :sub-delay="subDelay"
       :sub-font-size="subFontSize"
@@ -2110,6 +2346,7 @@ onUnmounted(() => {
       :q-cap="qCap"
       :level-idx="levelIdx"
       :lines="player.current?.urls || []"
+      :line-quality="lineQuality"
       :raw-url="rawUrl"
       :sub-delay="subDelay"
       :sub-font-size="subFontSize"

@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { ref, onMounted, watch } from 'vue'
 import { useRouter } from 'vue-router'
-import { api } from '@/api'
+import { api, imgUrl } from '@/api'
 import { useAppStore } from '@/stores/app'
 import { fmtMs } from '@/utils/format'
 import type { Vod, HistItem, Category } from '@/types'
@@ -83,8 +83,16 @@ onMounted(async () => {
   hasSites.value = (app.status?.totalSites ?? 0) > 0
   await loadFeed()
   loadCats()
-  // 到期自动抓一轮（后台）
-  api.triggerCrawl().catch(() => {})
+  // 问一下后台要不要补跑一轮抓取（已经在跑 / 没到 24 小时间隔都不会真的
+  // 现抓）。只有「这次真的有活在后台跑」时才去轮询进度——撞上「配置了
+  // 站源但一条都还没抓到」的时候（比如服务刚重启，后台这轮正好在跑），
+  // 不能干等着什么都不做：之前的写法只在用户手动点「更新」时才会轮询
+  // 进度、抓完了重载 Feed，首次进首页撞上这个空窗口的话，这个页面就会
+  // 一直空着，必须手动切走再切回来（重新 mount 一次）才会再 fetch 一次。
+  // 这里补上同样的轮询，让「等一等」真的有用。
+  api.triggerCrawl().then((r) => {
+    if (r.started || r.running) pollCrawlUntilDone()
+  }).catch(() => {})
 })
 
 // 监听订阅/站源变更信号，自动重载 Feed 和状态
@@ -191,29 +199,45 @@ const updating = ref(false)
 const updatePct = ref(0)
 let updateTimer = 0
 
+// 轮询抓取进度直到跑完，再重载一次 Feed。refresh() 点「更新」和 onMounted
+// 撞上「还没抓到任何数据」的空窗口时共用这一套逻辑。
+function pollCrawlUntilDone() {
+  if (updateTimer) return
+  updating.value = true
+  updatePct.value = 0
+  updateTimer = window.setInterval(async () => {
+    try {
+      const r = await api.crawlSummary()
+      if (r.total > 0) {
+        updatePct.value = Math.min(100, Math.round((r.processed / r.total) * 100))
+      }
+      if (!r.running) {
+        clearInterval(updateTimer)
+        updateTimer = 0
+        updating.value = false
+        updatePct.value = 0
+        await loadFeed()
+        if (r.summary) app.showTip(r.summary)
+      }
+    } catch {
+      clearInterval(updateTimer)
+      updateTimer = 0
+      updating.value = false
+      updatePct.value = 0
+    }
+  }, 800)
+}
+
 function refresh() {
   if (updating.value) return
-  api.triggerCrawl().then(() => {
-    updating.value = true
-    updatePct.value = 0
-    // 轮询进度，直到抓取完成
-    updateTimer = window.setInterval(async () => {
-      try {
-        const r = await api.crawlSummary()
-        if (r.total > 0) {
-          updatePct.value = Math.min(100, Math.round((r.processed / r.total) * 100))
-        }
-        if (!r.running) {
-          clearInterval(updateTimer)
-          updating.value = false
-          updatePct.value = 0
-          await loadFeed()
-          app.showTip(r.summary || '更新完成')
-        }
-      } catch {
-        /* ignore */
-      }
-    }, 800)
+  api.triggerCrawl().then((r) => {
+    if (r.started || r.running) {
+      pollCrawlUntilDone()
+      return
+    }
+    // 没到 24 小时间隔，后台没有真的再去抓一轮——内容本来就还是最新的，
+    // 不用假装刷新了一下。
+    app.showTip('内容已是最新，不需要重新抓取')
   })
 }
 </script>
@@ -254,7 +278,7 @@ function refresh() {
           @click="openHistory(h)"
         >
           <div class="poster">
-            <img v-if="h.pic" :src="h.pic" :alt="h.name" loading="lazy" />
+            <img v-if="h.pic" :src="imgUrl(h.pic)" :alt="h.name" loading="lazy" />
             <!-- 网盘记录没有封面图，用图标占位，避免一片空白让人以为加载失败 -->
             <div v-else class="poster-ph" aria-hidden="true">
               <span>{{ h.siteKey === 'webdav' ? '☁' : '🎬' }}</span>

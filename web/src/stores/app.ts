@@ -36,14 +36,14 @@ export const useAppStore = defineStore('app', {
         /* ignore */
       }
     },
-    showTip(msg: string) {
+    showTip(msg: string, durationMs = 1800) {
       if (!msg) return
       this.tip = msg
       if (this.tipTimer) clearTimeout(this.tipTimer)
       this.tipTimer = setTimeout(() => {
         this.tip = ''
         this.tipTimer = 0
-      }, 1800)
+      }, durationMs)
     },
     // notifyFeedRefresh 通知需要刷新首页 Feed（订阅/站源变更后调用）
     notifyFeedRefresh() {

@@ -1,12 +1,46 @@
+<script lang="ts">
+// 普通 <script> 块：只在模块加载时执行一次，真正的模块级作用域。
+// 关键词 -> 搜索结果缓存必须放在这里，而不是 <script setup> 顶层——后者会被
+// 编译进每个组件实例的 setup() 闭包，每次该组件重新挂载（比如没有 keep-alive
+// 时「返回」会销毁重建组件）都会重新执行一遍，缓存就被悄悄清空重建了。
+import type { Vod } from '@/types'
+export interface CachedResult { results: Vod[]; siteInfo: string }
+export const searchCache = new Map<string, CachedResult>()
+
+// 把缓存落到 localStorage，整页刷新也不丢——只持久化「最近搜过」里仍然
+// 存在的关键词（后端那边最多留 8 个），避免越攒越大。
+const CACHE_KEY = 'yz_search_cache'
+
+try {
+  const raw = localStorage.getItem(CACHE_KEY)
+  if (raw) {
+    const obj = JSON.parse(raw) as Record<string, CachedResult>
+    for (const [k, v] of Object.entries(obj)) searchCache.set(k, v)
+  }
+} catch { /* 隐私模式/数据损坏，忽略——退化成纯内存缓存 */ }
+
+export function persistSearchCache(keywords: string[]) {
+  try {
+    const obj: Record<string, CachedResult> = {}
+    for (const k of keywords) {
+      const c = searchCache.get(k)
+      if (c) obj[k] = c
+    }
+    localStorage.setItem(CACHE_KEY, JSON.stringify(obj))
+  } catch { /* 配额超限/隐私模式，忽略 */ }
+}
+</script>
+
 <script setup lang="ts">
 import { ref, computed, onMounted } from 'vue'
 import { useRouter } from 'vue-router'
 import { api, humanizeApiError } from '@/api'
 import { useAppStore } from '@/stores/app'
-import type { Vod } from '@/types'
 import TopBar from '@/components/TopBar.vue'
 import VodGrid from '@/components/VodGrid.vue'
 import SkeletonList from '@/components/SkeletonList.vue'
+
+defineOptions({ name: 'SearchView' })
 
 const router = useRouter()
 const app = useAppStore()
@@ -20,9 +54,16 @@ const hotKeywords = ref<string[]>([])
 const siteInfo = ref('')
 const sugg = ref<string[]>([])
 const suggLoading = ref(false)
+// 边搜边出的进度：done/total 是已经返回（成功或失败）的站源数 / 本次搜索
+// 请求的站源总数，finished 之前结果随时可能继续增加。
+const searchTotal    = ref(0)
+const searchDone     = ref(0)
+const searchFinished = ref(true)
 
 onMounted(async () => {
   keywords.value = await api.keywords()
+  // 清掉 localStorage 里关键词已经不在「最近搜过」里的陈旧条目
+  persistSearchCache(keywords.value)
   // 热门词（feed 提取），失败静默
   api.hotKeywords().then(h => { hotKeywords.value = h }).catch(() => {})
 })
@@ -62,7 +103,9 @@ function rankResults(list: Vod[], word: string): Vod[] {
     .map(x => x.v)
 }
 
-async function doSearch(k?: string) {
+// force=true（点「搜索」按钮）时跳过缓存，强制重新搜索并刷新缓存；
+// 否则（回车、点关键词芯片）命中缓存就直接展示，不打网络请求。
+async function doSearch(k?: string, force = false) {
   const word = (k ?? kw.value).trim()
   if (!word) {
     app.showTip('请输入关键词')
@@ -70,51 +113,114 @@ async function doSearch(k?: string) {
   }
   kw.value = word
   sugg.value = []
-  searching.value = true
   searched.value = true
-  // 取消上一次未完成的搜索，避免旧结果覆盖新结果
-  if (searchAbort) searchAbort.abort()
-  const ctrl = new AbortController()
-  searchAbort = ctrl
-  try {
-    const r = await api.search(word, ctrl.signal)
-    // 相关性排序：最相关的排前面
-    results.value = rankResults(r.list, word)
-    siteInfo.value = `${r.sites}/${r.total} 个站源有响应`
-    keywords.value = await api.pushKeyword(word)
-  } catch (e: any) {
-    if (e?.name === 'AbortError') return
-    app.showTip('搜索失败：' + humanizeApiError(e))
-  } finally {
-    if (searchAbort === ctrl) {
-      searchAbort = null
+
+  if (!force) {
+    const cached = searchCache.get(word)
+    if (cached) {
+      // 取消上一次还没搜完的搜索，缓存命中不该被它迟到的结果覆盖
+      searchGen++
+      results.value = cached.results
+      siteInfo.value = cached.siteInfo
       searching.value = false
+      searchFinished.value = true
+      return
     }
   }
+
+  await runLiveSearch(word)
+}
+
+// 边搜边出：/search/start 立即拿到 session id，不等任何站源返回；
+// 然后轮询 /search/poll，哪个站源先响应就先展示哪个的结果，直到
+// finished=true。myGen 用来在「这次搜索还没结束、用户又开始了新搜索」时
+// 让旧的轮询自己安静退出，不会用旧搜索迟到的结果覆盖新搜索。
+let searchGen = 0
+async function runLiveSearch(word: string) {
+  const myGen = ++searchGen
+  searching.value = true
+  searchFinished.value = false
+  searchTotal.value = 0
+  searchDone.value = 0
+  results.value = []
+  siteInfo.value = ''
+
+  let id: string
+  let total: number
+  try {
+    const r = await api.searchStart(word)
+    id = r.id
+    total = r.total
+  } catch (e: any) {
+    if (myGen !== searchGen) return
+    searching.value = false
+    searchFinished.value = true
+    app.showTip('搜索失败：' + humanizeApiError(e))
+    return
+  }
+  if (myGen !== searchGen) return
+  searchTotal.value = total
+  // 关键词记录不用等搜完——哪怕中途离开，这次搜过的词也该留下来
+  keywords.value = await api.pushKeyword(word).catch(() => keywords.value)
+
+  const poll = async () => {
+    if (myGen !== searchGen) return
+    try {
+      const r = await api.searchPoll(id)
+      if (myGen !== searchGen) return
+      results.value = rankResults(r.list, word)
+      searchDone.value = r.done
+      searchTotal.value = r.total
+      searchFinished.value = r.finished
+      if (r.finished) {
+        searching.value = false
+        siteInfo.value = `${r.sites}/${r.total} 个站源有响应`
+        searchCache.set(word, { results: results.value, siteInfo: siteInfo.value })
+        persistSearchCache(keywords.value)
+        return
+      }
+    } catch (e: any) {
+      if (myGen !== searchGen) return
+      searching.value = false
+      searchFinished.value = true
+      app.showTip('搜索失败：' + humanizeApiError(e))
+      return
+    }
+    pollTimer = window.setTimeout(poll, 450)
+  }
+  void poll()
 }
 
 function clearKw() {
+  searchGen++ // 停掉还在轮询的搜索，别让它迟到的结果把清空后的空页面重新填上
+  if (pollTimer) { clearTimeout(pollTimer); pollTimer = 0 }
   kw.value = ''
   results.value = []
   searched.value = false
   sugg.value = []
+  searching.value = false
+  searchFinished.value = true
 }
 
 function clearKeywords() {
   api.clearKeywords().then(() => {
     keywords.value = []
+    searchCache.clear()
+    persistSearchCache([])
     app.showTip('已清空搜索记录')
   })
 }
 
 async function removeKeyword(k: string) {
   keywords.value = await api.removeKeyword(k)
+  searchCache.delete(k)
+  persistSearchCache(keywords.value)
 }
 
-// 实时联想 / 搜索竞态控制
+// 实时联想 / 搜索轮询控制
 let suggTimer = 0
 let suggAbort: AbortController | null = null
-let searchAbort: AbortController | null = null
+let pollTimer = 0
 
 function onInput() {
   const w = kw.value.trim()
@@ -153,7 +259,7 @@ function onInput() {
         @clear="clearKw"
       >
         <template #append>
-          <el-button :loading="searching" @click="doSearch()">搜索</el-button>
+          <el-button :loading="searching" @click="doSearch(undefined, true)">搜索</el-button>
         </template>
       </el-input>
       <!-- 拼音输入提示 -->
@@ -200,19 +306,24 @@ function onInput() {
     <div v-if="searched">
       <div class="section-title">
         搜索结果
-        <span v-if="siteInfo" class="count">{{ siteInfo }}</span>
+        <!-- 还没搜完：边搜边出的进度，站源陆续返回时这个数字会一直涨 -->
+        <span v-if="!searchFinished" class="count searching-count">
+          <span class="search-spinner"></span>
+          正在搜索…{{ searchDone }}/{{ searchTotal }} 个站源已返回
+        </span>
+        <span v-else-if="siteInfo" class="count">{{ siteInfo }}</span>
         <span v-if="results.length" class="count">共 {{ results.length }} 条</span>
       </div>
-      <!-- 加载中：骨架屏 -->
-      <SkeletonList v-if="searching" type="search" :count="10" />
-      <!-- 搜索结果 -->
+      <!-- 还没出第一批结果：骨架屏；一旦有结果就直接展示，不用等全部站源返回 -->
+      <SkeletonList v-if="searching && !results.length" type="search" :count="10" />
+      <!-- 搜索结果：边搜边出，站源陆续返回时这里会跟着一组组地增加 -->
       <div v-else-if="results.length">
         <div v-for="[site, vods] in grouped" :key="site" class="group">
           <div class="group-head">{{ site }} <span class="count">{{ vods.length }} 个结果</span></div>
           <VodGrid :vods="vods" />
         </div>
       </div>
-      <div v-else class="empty">没有搜到结果（站源可能已失效，或需要爬虫运行时）</div>
+      <div v-else-if="searchFinished" class="empty">没有搜到结果（站源可能已失效，或需要爬虫运行时）</div>
     </div>
   </div>
 </template>
@@ -284,6 +395,25 @@ function onInput() {
   font-size: 12px;
   color: var(--dim);
   font-weight: 400;
+}
+/* 边搜边出的进度指示 */
+.searching-count {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--primary, #409eff);
+}
+.search-spinner {
+  width: 11px;
+  height: 11px;
+  border-radius: 50%;
+  border: 2px solid currentColor;
+  border-top-color: transparent;
+  animation: search-spin 0.7s linear infinite;
+  flex-shrink: 0;
+}
+@keyframes search-spin {
+  to { transform: rotate(360deg); }
 }
 .empty {
   text-align: center;
