@@ -3,6 +3,8 @@ import { ref, computed, onMounted } from 'vue'
 import { useRouter } from 'vue-router'
 import { api, humanizeApiError, getAuthToken, setAuthToken } from '@/api'
 import { getTheme, setTheme, type ThemeMode } from '@/theme'
+import { gridCols, setGridCols, resetGridColsToAuto } from '@/gridPrefs'
+import { showClockDate, showClockTime, showClockDow } from '@/clockPrefs'
 import { useAppStore } from '@/stores/app'
 import { authState, logout } from '@/auth'
 import type { Site, Subscription, WebdavSource, RawLive } from '@/types'
@@ -24,6 +26,16 @@ function changeTheme(m: ThemeMode) {
 function saveAuthToken() {
   setAuthToken(authTokenInput.value.trim())
   app.showTip('访问口令已保存，刷新页面后生效')
+}
+
+// ===== 显示（纯本机偏好，存浏览器 cookie，不同浏览器/设备各自独立）=====
+const gridColsModel = computed({
+  get: () => gridCols.value,
+  set: (v: number) => setGridCols(v)
+})
+function resetGridCols() {
+  resetGridColsToAuto()
+  app.showTip(`已恢复自动列数（${gridCols.value} 列）`)
 }
 
 // ===== 整站备份 / 恢复 / 出厂重置 =====
@@ -75,7 +87,7 @@ async function resetAll() {
 }
 
 // ===== 导航 =====
-type NavKey = 'source' | 'update' | 'webdav' | 'sites' | 'data' | 'about'
+type NavKey = 'source' | 'update' | 'webdav' | 'sites' | 'data' | 'display' | 'about'
 const navKey = ref<NavKey>('source')
 const navItems: { key: NavKey; label: string }[] = [
   { key: 'source', label: '播放源' },
@@ -83,6 +95,7 @@ const navItems: { key: NavKey; label: string }[] = [
   { key: 'webdav', label: '网盘' },
   { key: 'sites',  label: '站源' },
   { key: 'data',   label: '数据' },
+  { key: 'display', label: '界面' },
   { key: 'about',  label: '关于' }
 ]
 
@@ -110,6 +123,11 @@ const showLiveSources = ref(false)
 // ===== 内容更新 =====
 const crawlSummary = ref('')
 const crawling     = ref(false)
+const liveScanEnabled = ref(true)
+async function toggleLiveScan(v: boolean) {
+  await api.setPrefs({ liveScanEnabled: v }).catch(() => {})
+  app.showTip(v ? '直播可播性后台扫描已开启' : '直播可播性后台扫描已关闭')
+}
 
 // ===== 站源 =====
 const sites        = ref<Site[]>([])
@@ -149,9 +167,10 @@ function goMetrics() {
 onMounted(load)
 
 async function load() {
-  const [st, list, wdList, liveList, subs, roots] = await Promise.all([
-    api.status(), api.sites(), api.webdavSources(), api.liveSources(), api.subscriptions(), api.subscriptionRoots()
+  const [st, list, wdList, liveList, subs, roots, p] = await Promise.all([
+    api.status(), api.sites(), api.webdavSources(), api.liveSources(), api.subscriptions(), api.subscriptionRoots(), api.prefs()
   ])
+  liveScanEnabled.value = p.liveScanEnabled !== false
   subName.value        = st.subName || ''
   subscriptions.value  = subs
   totalSites.value   = st.totalSites
@@ -578,9 +597,11 @@ async function clearHistory() {
 </script>
 
 <template>
-  <div class="page">
+  <div class="page page--fixed">
+    <div class="tab-head">
     <TopBar />
-    <div class="settings-layout">
+    </div>
+    <div class="settings-layout tab-body tab-body--split">
 
       <!-- 左侧导航 -->
       <nav class="settings-nav">
@@ -634,6 +655,11 @@ async function clearHistory() {
                    都是一个独立的单一来源（相对「聚合清单」这种带菜单的
                    多来源地址而言） -->
               <template v-if="subscriptions.length">
+                <!-- margin:0 —— 这条分割线嵌在 .srow-sub 内部，外层已经有
+                     18px 左右内边距，不用再叠加 .sdiv 自带的那份 margin，
+                     否则会比「点播源」上方那条（在 .card 顶层、靠 margin
+                     撑出 18px）缩进更深，两条线对不齐。 -->
+                <div class="sdiv" style="margin: 0"></div>
                 <div class="list-title-row">
                   <div class="list-title">单仓源 <span class="list-title-count">{{ subscriptions.length }} 个</span></div>
                   <div class="list-actions">
@@ -751,6 +777,18 @@ async function clearHistory() {
             <div class="srow srow-clickable" @click="doCrawl">
               <span class="srow-title">{{ crawling ? '正在抓取最新影片…' : '立即更新' }}</span>
               <span class="arrow">›</span>
+            </div>
+            <div class="sdiv"></div>
+            <div class="srow">
+              <div class="srow-left">
+                <span class="srow-title">直播可播性后台扫描</span>
+                <span class="srow-dim">逐个测试直播频道能不能播，喂「直播 → 可播频道」分类；低优先级运行，不抢正常请求的资源</span>
+              </div>
+              <el-switch
+                v-model="liveScanEnabled"
+                size="small"
+                @change="(v: boolean | string | number) => toggleLiveScan(v as boolean)"
+              />
             </div>
           </div>
           <div class="note">每 24 小时自动刷新远程配置并抓取各站最新影片；这期间点「立即更新」内容本来就是最新的，不会重复抓取。</div>
@@ -884,19 +922,6 @@ async function clearHistory() {
               <el-button size="small" type="primary" @click="saveAuthToken">保存</el-button>
             </div>
             <div class="sdiv"></div>
-            <div class="srow">
-              <span class="srow-title">外观</span>
-              <span class="theme-chips">
-                <span
-                  v-for="t in ([{ k: 'dark', n: '深色' }, { k: 'light', n: '浅色' }, { k: 'system', n: '跟随系统' }] as const)"
-                  :key="t.k"
-                  class="chip"
-                  :class="{ active: themeMode === t.k }"
-                  @click="changeTheme(t.k)"
-                >{{ t.n }}</span>
-              </span>
-            </div>
-            <div class="sdiv"></div>
             <div class="srow srow-clickable" @click="exportBackup">
               <span class="srow-title">导出备份</span>
               <span class="srow-val">配置 / 收藏 / 历史 / 偏好</span>
@@ -922,6 +947,55 @@ async function clearHistory() {
                 {{ confirmClear ? '再次点击确认清除播放记录' : '清除播放记录' }}
               </span>
               <span class="arrow">›</span>
+            </div>
+          </div>
+        </template>
+
+        <!-- ========== 显示 ==========
+             跟上面「数据」不同：这里全是纯客户端/浏览器本机的显示偏好
+             （外观主题走 localStorage，网格列数走 cookie），不写进
+             store.json、不跟账号数据一起导出/导入，换个浏览器或设备
+             就得各自重新设一遍，所以单独拆一个入口。 -->
+        <template v-else-if="navKey === 'display'">
+          <div class="section-label">界面</div>
+          <div class="card">
+            <div class="srow">
+              <span class="srow-title">外观</span>
+              <span class="theme-chips">
+                <span
+                  v-for="t in ([{ k: 'dark', n: '深色' }, { k: 'light', n: '浅色' }, { k: 'system', n: '跟随系统' }] as const)"
+                  :key="t.k"
+                  class="chip"
+                  :class="{ active: themeMode === t.k }"
+                  @click="changeTheme(t.k)"
+                >{{ t.n }}</span>
+              </span>
+            </div>
+            <div class="sdiv"></div>
+            <div class="srow">
+              <span class="srow-title">每行列数</span>
+              <span class="srow-val">点播/首页/搜索/收藏的卡片网格，默认按窗口宽度自动适应，可手动固定（适合电视等大屏）</span>
+            </div>
+            <div class="srow">
+              <el-input-number v-model="gridColsModel" :min="1" :max="20" size="small" />
+              <el-button size="small" text @click="resetGridCols">默认/自动</el-button>
+            </div>
+            <div class="sdiv"></div>
+            <div class="srow">
+              <span class="srow-title">顶栏时钟</span>
+              <span class="srow-val">分别控制顶栏右上角时钟显示哪些内容</span>
+            </div>
+            <div class="srow">
+              <span class="srow-left"><span class="srow-title">显示日期</span></span>
+              <el-switch v-model="showClockDate" size="small" />
+            </div>
+            <div class="srow">
+              <span class="srow-left"><span class="srow-title">显示星期</span></span>
+              <el-switch v-model="showClockDow" size="small" />
+            </div>
+            <div class="srow">
+              <span class="srow-left"><span class="srow-title">显示时间</span></span>
+              <el-switch v-model="showClockTime" size="small" />
             </div>
           </div>
         </template>
@@ -1076,8 +1150,6 @@ async function clearHistory() {
 /* ===== 双栏布局 ===== */
 .settings-layout {
   display: flex;
-  height: calc(100vh - 72px);
-  overflow: hidden;
 }
 .settings-nav {
   width: 220px;

@@ -1,10 +1,11 @@
 <script setup lang="ts">
-import { ref, computed, onMounted } from 'vue'
+import { ref, computed, onMounted, onUnmounted, nextTick } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { api, humanizeApiError, imgUrl } from '@/api'
 import { useAppStore } from '@/stores/app'
 import { usePlayerStore } from '@/stores/player'
 import { splitLines } from '@/utils/lines'
+import { getCachedVod } from '@/vodCache'
 import type { Vod, Line, SubRef } from '@/types'
 import { siteInfoMap } from '@/siteInfo'
 import TopBar from '@/components/TopBar.vue'
@@ -24,6 +25,16 @@ const vod = ref<Vod | null>(null)
 const lines = ref<Line[]>([])
 const curLine = ref(0)
 const expanded = ref(false)
+// 简介默认夹 3 行，但不少片子的简介本来就没三行长——这种时候「展开/收起」
+// 按钮点了也没任何变化，纯粹给用户一种「还有更多内容」的错觉。只有真的
+// 被 3 行截断了（scrollHeight 超过 clientHeight）才显示这个按钮。
+const contentEl = ref<HTMLElement | null>(null)
+const canExpand = ref(false)
+function checkOverflow() {
+  const el = contentEl.value
+  if (!el || expanded.value) return
+  canExpand.value = el.scrollHeight > el.clientHeight + 1
+}
 const isFav = ref(false)
 const reverse = ref(false)
 const loading = ref(true)
@@ -48,7 +59,12 @@ async function loadDetail() {
   loading.value = true
   loadError.value = ''
   try {
-    const detail = await api.vodDetail(siteKey, vodId)
+    // 从点播/搜索/首页最近更新的卡片点进来的话，那边很可能已经拿到过一份
+    // 带 playUrl 的完整 Vod 了（见 vodCache.ts）——这种情况下这份数据跟
+    // 详情接口会返回的东西是同一回事，没必要再打一次网络请求重新要一遍。
+    // 缓存没命中（比如直接刷新这个页面、从没有 playUrl 的「继续观看」
+    // 点进来、或者新标签页打开）才现查。
+    const detail = getCachedVod(siteKey, vodId) || (await api.vodDetail(siteKey, vodId))
     vod.value = detail
     lines.value = splitLines(detail.from, detail.playUrl)
     siteInfoMap().then((map) => {
@@ -64,6 +80,9 @@ async function loadDetail() {
     app.showTip('详情加载失败：' + humanizeApiError(e))
   } finally {
     loading.value = false
+    // loading 翻成 false 之后 .content 才会真正渲染出来（骨架屏切真实
+    // 内容），必须等这一轮 DOM 更新完才能量得到准确的 scrollHeight。
+    nextTick(checkOverflow)
   }
 }
 
@@ -86,6 +105,10 @@ onMounted(async () => {
   } catch {
     /* ignore */
   }
+  window.addEventListener('resize', checkOverflow)
+})
+onUnmounted(() => {
+  window.removeEventListener('resize', checkOverflow)
 })
 
 const eps = computed(() => {
@@ -217,10 +240,10 @@ function resumePlay() {
         <div v-if="vod.actor" class="meta">主演：{{ vod.actor }}</div>
         <div v-if="vod.director" class="meta">导演：{{ vod.director }}</div>
 
-        <div v-if="vod.content" class="content" :class="{ expanded }">
+        <div v-if="vod.content" ref="contentEl" class="content" :class="{ expanded }">
           {{ vod.content }}
         </div>
-        <el-button v-if="vod.content" link class="toggle" @click="expanded = !expanded">
+        <el-button v-if="canExpand" link class="toggle" @click="expanded = !expanded">
           {{ expanded ? '收起' : '展开' }}
         </el-button>
 

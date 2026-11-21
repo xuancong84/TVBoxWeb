@@ -26,15 +26,63 @@ var refreshState struct {
 	running bool
 }
 
+// mergeCache 缓存 buildFromCache 的合并结果：全部直播源加起来常常是十万量级
+// 频道（见 FilterJunk 的注释——大量同一个台换着名字出现在不同源里，没法
+// 被 normalizeChannelName 这种保守归一化合并掉），MergeGroups 每次都要整个
+// 重新跑一遍 map 归并+投票，在频繁轮询（扫描进度 5 秒一次、频道列表静默
+// 刷新）下会把 CPU 跑得老高。这份合并结果在 mergeCacheTTL 内直接复用，
+// 不等 force=true/源缓存变化（容忍最多 TTL 这么久的滞后，跟这个 app 里
+// 其他「缓存，不实时」的设计一致）。
+var mergeCache struct {
+	mu     sync.Mutex
+	groups []model.ChannelGroup
+	errs   map[string]string
+	at     time.Time
+}
+
+const mergeCacheTTL = 20 * time.Second
+
 // Channels 返回「当前已知最好」的合并频道目录：永远不等网络，直接用磁盘
 // 缓存拼出结果（哪怕某些源的缓存已经过期甚至从没抓过都没关系），缺失/
 // 过期的源交给后台异步刷新，这次调用立刻返回——用户点开直播页或点一下
 // 「刷新」都不会被几十个源逐个超时卡住；新结果抓回来后，下一次打开/轮询
-// 自然就能看到。force=true（用户手动点刷新）额外让没超龄的缓存也重新抓一遍。
+// 自然就能看到。force=true（用户手动点刷新）额外让没超龄的缓存也重新抓一遍，
+// 同时跳过 mergeCache（保证这次返回的是刚刷新过的最新合并结果）。
+//
+// 返回值永远是独立的一份拷贝（cloneGroups）：调用方（postProcessLive 等）
+// 会就地排序/打状态标记，不克隆的话多个并发请求会共享同一份底层数组，
+// 边读边写是数据竞争。
 func Channels(sources []model.RawLive, force bool) (groups []model.ChannelGroup, errs map[string]string) {
-	groups, errs = buildFromCache(sources)
+	if !force {
+		mergeCache.mu.Lock()
+		if !mergeCache.at.IsZero() && time.Since(mergeCache.at) < mergeCacheTTL {
+			groups, errs = cloneGroups(mergeCache.groups), mergeCache.errs
+			mergeCache.mu.Unlock()
+			go refreshStale(sources, force)
+			return
+		}
+		mergeCache.mu.Unlock()
+	}
+
+	fresh, errs := buildFromCache(sources)
+	mergeCache.mu.Lock()
+	mergeCache.groups, mergeCache.errs, mergeCache.at = fresh, errs, time.Now()
+	mergeCache.mu.Unlock()
 	go refreshStale(sources, force)
-	return
+	return cloneGroups(fresh), errs
+}
+
+// cloneGroups 浅拷贝到「每个 Channel 切片都是独立底层数组」的深度：Channel
+// 结构体本身的字段（含 URLs 这个 slice）合并之后不会再被修改，拷贝 slice
+// 头、共享同一份只读的 URLs 底层数组是安全的；真正需要隔离的是 Channels
+// 这一层（调用方会 sort.Slice / 原地改 Status）。
+func cloneGroups(gs []model.ChannelGroup) []model.ChannelGroup {
+	out := make([]model.ChannelGroup, len(gs))
+	for i, g := range gs {
+		out[i] = g
+		out[i].Channels = append([]model.Channel(nil), g.Channels...)
+	}
+	return out
 }
 
 func buildFromCache(sources []model.RawLive) ([]model.ChannelGroup, map[string]string) {

@@ -185,6 +185,74 @@ func RangeTimedCtx(ctx context.Context, u string, timeout time.Duration, maxByte
 	return int(time.Since(t0).Milliseconds()), nn, nil
 }
 
+// StreamCheckCtx 跟 Peek/RangeTimedCtx 只看「头几个字节像不像流」不一样：
+// 这里真的连续读满 dur 这么长的时间，要求这段时间内实际收到的字节数达到
+// minBytes 才算「确实能连续出流」。Peek 那种头部嗅探、或者「凑够字节就
+// 提前判定通过」的写法，都会把「连得上、对面服务器先吐一小段缓冲数据就
+// 不再吭声，播放器里一直转圈」误判成能播——这类服务器初期的小段 burst
+// 往往只有几 KB，远达不到真实码率在 dur 这段时间里该有的数据量，所以这里
+// 刻意不设「够了就提前返回」的快捷路径，老老实实陪它读满 dur（或者提前
+// EOF/出错），用整段时间内的真实吞吐量来判断，不会被开头的一次性 burst
+// 骗过去。
+//
+// 这个函数专门给「背景扫描可播性」这种愿意多等一两秒换正确性的场景用，
+// 不建议在要求「秒出结果」的交互式探测（检测按钮、测速排行）里用，会把
+// 它们拖慢。
+//
+// maxContentLength：响应头报了一个「确定的、很大的」Content-Length 时，
+// 直接判定不是真直播——真正的直播分片/裸流要么用 chunked 传输、压根不
+// 声明总长度（服务器自己也不知道这条流什么时候结束），要么就是正常几秒
+// 钟的 HLS 分片（几百 KB 到几 MB）。见过的实际假阳性是一个「频道」其实
+// 指向一个 400MB+ 的静态 mp4（抓单一直播源/合并时混进来的垃圾条目）：
+// 这类文件如果 moov atom 在文件末尾（非 faststart），浏览器必须先把
+// 整个文件下载到能读到 moov 的位置才能起播——哪怕连续吞吐量测出来完全
+// 正常（数据确实在稳定流动), 真实体验是播放器里永远停在"缓冲中"。这种
+// 文件只看「有没有连续吐数据」测不出来，必须在请求阶段就靠「声明了一个
+// 异常大的确定总长度」这个特征拦掉。
+func StreamCheckCtx(ctx context.Context, u string, dur time.Duration, minBytes int) bool {
+	if u == "" {
+		return false
+	}
+	if minBytes <= 0 {
+		minBytes = 4096
+	}
+	// dur 专门用来衡量「流本身」的连续传输情况，连接建立（TCP/TLS 握手、
+	// 对面服务器拖着不响应头）另外给点余量，不占用这段时间预算。
+	reqCtx, cancel := context.WithTimeout(ctx, dur+5*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(reqCtx, "GET", u, nil)
+	if err != nil {
+		return false
+	}
+	req.Header.Set("User-Agent", UA)
+	req.Header.Set("Accept", "*/*")
+	client := &http.Client{Transport: sharedTransport}
+	res, err := client.Do(req)
+	if err != nil {
+		return false
+	}
+	defer res.Body.Close()
+	if res.StatusCode >= 400 {
+		return false
+	}
+	const maxContentLength = 32 << 20 // 32MB：慷慨地覆盖单个高码率 HLS 分片，仍然远小于「整部影片」的体量
+	if res.ContentLength > maxContentLength {
+		return false
+	}
+
+	deadline := time.Now().Add(dur)
+	buf := make([]byte, 32*1024)
+	total := 0
+	for time.Now().Before(deadline) {
+		n, err := res.Body.Read(buf)
+		total += n
+		if err != nil {
+			break // EOF 或超时/连接中断：拿当前已收到的总量去跟 minBytes 比
+		}
+	}
+	return total >= minBytes
+}
+
 // Propfind 发送 WebDAV PROPFIND 请求，Depth: 1 列当前目录直接子项。
 func Propfind(u string, extra map[string]string, timeout time.Duration) (string, error) {
 	return PropfindCtx(context.Background(), u, extra, timeout)

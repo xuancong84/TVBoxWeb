@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"time"
 
 	"github.com/xxl6097/TVBoxWeb/internal/model"
 )
@@ -16,8 +17,8 @@ import (
 // LiveCacheEntry 是某个直播源最近一次拉取+解析的缓存结果：跟 SiteCrawlEntry
 // 对直播源的对应物，命中它就不用重新联网拉一遍 m3u/txt。
 type LiveCacheEntry struct {
-	At     int64               `json:"at"` // 这份结果的抓取时间（毫秒）
-	OK     bool                `json:"ok"`
+	At     int64                `json:"at"` // 这份结果的抓取时间（毫秒）
+	OK     bool                 `json:"ok"`
 	Groups []model.ChannelGroup `json:"groups"`
 }
 
@@ -25,24 +26,38 @@ type LiveCacheEntry struct {
 // 几十个直播源、每个源可能有成百上千个频道，不适合塞进 store.json。
 const liveCacheFileName = "livecrawl_cache.json.gz"
 
+// ChannelProbe 一个频道「测过一次」的快照：At 记录测试时间（毫秒），
+// 用来判断 OK=false（播不通）这个结论是不是已经过期。OK=true 没有过期
+// 这一说——频道只要被证实能播过一次（不管是用户真实播放成功，还是后台
+// 扫描探测成功），就永久留在「可播频道」里，除非用户手动移除
+// （RemoveChannelStatus）；只有「播不通」这个结论会随时间推移失去可信度，
+// 需要 ChannelFailMaxAge 之后重新验证。
+type ChannelProbe struct {
+	OK bool  `json:"ok"`
+	At int64 `json:"at"`
+}
+
+// ChannelFailMaxAge 「播不通」结论的最长可信期：超过这个岁数，后台扫描
+// 会把这个频道当成「没测过」重新探测一次。只对 OK=false 生效，OK=true
+// 永久有效。
+const ChannelFailMaxAge = 24 * time.Hour
+
 var (
 	liveCacheMu    sync.RWMutex
 	liveCache      = map[string]LiveCacheEntry{}
 	liveCachePath  string
 	liveCacheDirty bool
-	// channelStatus 记录每个直播频道「真实播放过一次」的结果：true=播过且能播，
-	// false=播过但播不出来，key 不存在="没播过/不知道"。跟直播源缓存存在
-	// 同一个文件里（见 liveCacheFile），没有过期时间——频道能不能播不会随
-	// 时间推移自动变化，只会被下一次真实播放结果覆盖，所以没必要像
-	// LiveCacheEntry 那样带时间戳判断新鲜度。
-	channelStatus = map[string]bool{}
+	// channelStatus 记录每个直播频道最近一次「测试」（真实播放 或 后台扫描
+	// 探测）的结果，key 不存在="没测过/不知道"。跟直播源缓存存在同一个
+	// 文件里（见 liveCacheFile）。
+	channelStatus = map[string]ChannelProbe{}
 )
 
 // liveCacheFile 是落盘的整体结构：直播源抓取缓存 + 频道播放状态，两者生命周期/
 // 用途不同但都挂在同一个「直播相关、可丢弃的缓存」文件下，没必要拆两个文件。
 type liveCacheFile struct {
 	Sources       map[string]LiveCacheEntry `json:"sources"`
-	ChannelStatus map[string]bool           `json:"channelStatus"`
+	ChannelStatus map[string]ChannelProbe   `json:"channelStatus"`
 }
 
 // InitLiveCrawlCache 在 store.Init 之后调用一次，加载磁盘上的直播源抓取缓存。
@@ -54,7 +69,7 @@ func InitLiveCrawlCache(dataDir string) {
 	defer liveCacheMu.Unlock()
 	liveCachePath = filepath.Join(dataDir, liveCacheFileName)
 	liveCache = map[string]LiveCacheEntry{}
-	channelStatus = map[string]bool{}
+	channelStatus = map[string]ChannelProbe{}
 	liveCacheDirty = false
 
 	f, err := os.Open(liveCachePath)
@@ -85,9 +100,23 @@ func InitLiveCrawlCache(dataDir string) {
 			liveCache = sources
 		}
 		if rawStatus, ok := probe["channelStatus"]; ok {
-			var cs map[string]bool
+			var cs map[string]ChannelProbe
 			if err := json.Unmarshal(rawStatus, &cs); err == nil {
 				channelStatus = cs
+			} else {
+				// 兼容升级前的老格式：channelStatus 当时是 map[string]bool，
+				// 没有时间戳。老的 true（能播）直接当永久有效；老的 false
+				// （播不通）当成「刚测过」处理，给它一份完整的 24 小时
+				// 宽限期重新验证，而不是直接当成从没测过。
+				var old map[string]bool
+				if err2 := json.Unmarshal(rawStatus, &old); err2 == nil {
+					now := time.Now().UnixMilli()
+					cs = make(map[string]ChannelProbe, len(old))
+					for k, v := range old {
+						cs[k] = ChannelProbe{OK: v, At: now}
+					}
+					channelStatus = cs
+				}
 			}
 		}
 		return
@@ -101,20 +130,62 @@ func InitLiveCrawlCache(dataDir string) {
 	liveCache = m
 }
 
-// GetChannelStatus 取某个直播频道上次真实播放的结果；known=false 表示从没播过。
+// GetChannelStatus 取某个直播频道最近一次测试结果；known=false 表示
+// 「从没测过」或者「测出来播不通，但已经超过 ChannelFailMaxAge，需要
+// 当作没测过重新验证」——能播的结果（OK=true）不会因为这个过期判断
+// 而失效。
 func GetChannelStatus(name string) (ok bool, known bool) {
 	liveCacheMu.RLock()
 	defer liveCacheMu.RUnlock()
-	ok, known = channelStatus[name]
-	return
+	p, exists := channelStatus[name]
+	if !exists {
+		return false, false
+	}
+	if !p.OK && time.Since(time.UnixMilli(p.At)) > ChannelFailMaxAge {
+		return false, false
+	}
+	return p.OK, true
 }
 
-// SetChannelStatus 记录一次真实播放结果，立即落盘（这类写入很稀疏——用户看了
-// 哪个台才会触发一次，不像 SetLiveCacheEntry 那样一轮抓取就是几十次，没必要
-// 攒起来等 FlushLiveCache 统一落盘）。
+// SetChannelStatus 记录一次测试结果，立即落盘——给「稀疏」写入场景用
+// （用户真实播放了一次，触发一条；不像后台批量扫描那样一轮就是几百上
+// 千条，见 SetChannelStatusBulk）。
 func SetChannelStatus(name string, ok bool) {
 	liveCacheMu.Lock()
-	channelStatus[name] = ok
+	channelStatus[name] = ChannelProbe{OK: ok, At: time.Now().UnixMilli()}
+	liveCacheMu.Unlock()
+	flushLiveCache()
+}
+
+// SetChannelStatusBulk 跟 SetChannelStatus 语义一致，但不立即落盘——后台
+// 扫描一轮动辄测几百上千个频道，每测一个就落一次盘会把 SD 卡写爆，调用方
+// （后台扫描循环）测完一整轮自己调 FlushLiveCache 统一落一次盘。
+func SetChannelStatusBulk(name string, ok bool) {
+	liveCacheMu.Lock()
+	channelStatus[name] = ChannelProbe{OK: ok, At: time.Now().UnixMilli()}
+	liveCacheDirty = true
+	liveCacheMu.Unlock()
+}
+
+// RemoveChannelStatus 清掉一个频道的测试记录——用户手动把它从「可播频道」
+// 分类里移除时调用。清掉之后它变回「没测过」，下一轮后台扫描会重新测一次，
+// 不是直接把它标记成「播不通」（标记播不通会被 24 小时过期重新“洗白”，
+// 跟用户主动移除的意图不一样）。
+func RemoveChannelStatus(name string) {
+	liveCacheMu.Lock()
+	delete(channelStatus, name)
+	liveCacheMu.Unlock()
+	flushLiveCache()
+}
+
+// ClearAllChannelStatus 清空全部频道的测试记录，强制下一轮后台扫描把每个
+// 频道都当成「没测过」重新测一遍——探测方法本身换过（比如从「看一眼响应头」
+// 换成「真的连续拉流验证」）之后，旧方法测出来的结果不再可信，permanently
+// 缓存的「能播」结论不会自己过期（只有「播不通」才有 24 小时有效期），
+// 不整体清一次的话，旧方法误判出来的假阳性会一直赖在「可播频道」里。
+func ClearAllChannelStatus() {
+	liveCacheMu.Lock()
+	channelStatus = map[string]ChannelProbe{}
 	liveCacheMu.Unlock()
 	flushLiveCache()
 }
@@ -180,7 +251,7 @@ func writeLiveCacheFile() {
 	for k, v := range liveCache {
 		sources[k] = v
 	}
-	status := make(map[string]bool, len(channelStatus))
+	status := make(map[string]ChannelProbe, len(channelStatus))
 	for k, v := range channelStatus {
 		status[k] = v
 	}

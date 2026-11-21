@@ -18,6 +18,7 @@ import type {
   Channel,
   LiveScore,
   LineQuality,
+  LiveScanStatus,
   EpgResult,
   QLevel,
   Subscription,
@@ -328,6 +329,10 @@ export const api = {
     ),
   vodDetail: (site: string, id: string) =>
     get<Vod>(`/vod/detail?site=${encodeURIComponent(site)}&id=${encodeURIComponent(id)}`),
+  // 点播 tab「筛选片名」：站内搜索（走该站自己的搜索接口），不是只在已
+  // 加载的这一页本地过滤——站源片单动辄几万条，本地过滤基本搜不到。
+  vodSiteSearch: (site: string, kw: string, signal?: AbortSignal) =>
+    get<Vod[]>(`/vod/search?site=${encodeURIComponent(site)}&kw=${encodeURIComponent(kw)}`, signal),
   search: (kw: string, signal?: AbortSignal) => get<{ list: Vod[]; sites: number; total: number }>(`/search?kw=${encodeURIComponent(kw)}`, signal),
   // 搜索改成边搜边出：start 立即拿到 session id（不等任何站源返回），
   // poll 取目前为止的结果快照 + 进度，直到 finished=true。
@@ -370,16 +375,28 @@ export const api = {
   liveSources: () => get<RawLive[]>('/live/sources'),
   setLiveSources: (lives: RawLive[]) => post('/live/sources', { lives }),
   setLiveSourcesEnabled: (urls: string[]) => post('/live/sources/enabled', { urls }),
-  // 上报一次直播频道「真实播放」的结果，服务端持久化、不过期，
-  // 用于直播页频道列表按「播过能播/播过不行/没播过」上色。
+  // 上报一次直播频道「真实播放」的结果，服务端持久化——能播永久有效，
+  // 播不通 24 小时后过期重测，用于直播页频道列表按「能播/播不通/没测过」
+  // 上色，也是「可播频道」分类的数据来源之一（另一来源是后台扫描）。
   setLiveChannelStatus: (name: string, ok: boolean) => post('/live/channel-status', { name, ok }),
+  // 把一个频道从「可播频道」分类里移除：清掉它的测试记录（变回「没测过」），
+  // 不是标记成播不通——下一轮后台扫描会重新测一次。
+  removeLiveChannelStatus: (name: string) => post('/live/channel-status/remove', { name }),
+  // 「可播频道」分类的后台扫描进度：total 当前已知全部频道数，scanned 其中
+  // 已有测试结果（且没过期）的数量，playable 其中确认能播的数量，scanning
+  // 表示后台扫描这会儿是不是正在跑。
+  liveScanStatus: () => get<LiveScanStatus>('/live/scan/status'),
+  // 「可播频道」分类专用的轻量频道列表：只有确认能播的那几千条，不像
+  // liveChannels() 那样要把全部直播源合并后的十几万条频道目录整个下发——
+  // 可播频道视图只需要这一小撮数据，没必要为了它拉全量目录。
+  livePlayable: () => get<{ channels: Channel[] }>('/live/playable'),
   // 不传 url：返回所有已启用直播源合并后的统一频道目录（同一频道的全部线路
   // 都在 Channel.urls 里）；force 跳过服务端缓存强制重新拉取全部源。
   liveChannels: (opts?: { url?: string; force?: boolean }) => {
     const params: string[] = []
     if (opts?.url) params.push(`url=${encodeURIComponent(opts.url)}`)
     if (opts?.force) params.push('refresh=1')
-    return get<{ root: LiveDir; groups: ChannelGroup[]; sources?: number; errs?: Record<string, string> }>(
+    return get<{ root: LiveDir; groups?: ChannelGroup[]; sources?: number; errs?: Record<string, string> }>(
       `/live/channels${params.length ? '?' + params.join('&') : ''}`
     )
   },
@@ -418,6 +435,7 @@ export const api = {
       skipCfgCount: number
       tapSound: number; tapVibrate: number
       liveJunkFilter: boolean
+      liveScanEnabled: boolean
     }>(
       '/prefs' +
         (skipA && skipB

@@ -4,6 +4,7 @@ import { useRouter } from 'vue-router'
 import type { Vod, SubRef } from '@/types'
 import { siteInfoMap } from '@/siteInfo'
 import { imgUrl } from '@/api'
+import { splitLines } from '@/utils/lines'
 
 const props = defineProps<{
   vod: Vod
@@ -40,6 +41,26 @@ function onErr() {
 }
 
 const firstChar = computed(() => (props.vod.name ? props.vod.name.trim()[0] || '影' : '影'))
+
+// 总集数：不少站源的片单接口其实也带着播放地址（不是只有详情页才有），
+// 几条线路里取集数最多的那条当作「总集数」——线路之间偶尔有抓取失败、
+// 集数对不齐的情况，取最全的那条更接近真实总集数。单集（电影/数据缺失）
+// 不显示，不然一堆电影卡片上全是「(共1集)」没意义。
+const epCount = computed(() => {
+  if (props.vod.playUrl) {
+    const lines = splitLines(props.vod.from, props.vod.playUrl)
+    return lines.reduce((max, l) => Math.max(max, l.eps.length), 0)
+  }
+  // 首页「最近更新」这类卡片没有 playUrl（落盘前被砍掉了），退回用
+  // 后端存的总集数快照。
+  return props.vod.epCount || 0
+})
+const metaText = computed(() => {
+  const parts: string[] = []
+  if (props.vod.year) parts.push(props.vod.year)
+  if (epCount.value > 1) parts.push(`(共${epCount.value}集)`)
+  return parts.join(' ')
+})
 
 // 鼠标悬停卡片时顺带标出「点播源 / 单仓源」——方便挑出要拉黑的垃圾/色情
 // 源头，不用点进详情页再去查。subs 现查现填，拿不到也不影响卡片本身。
@@ -78,7 +99,7 @@ const subsTitle = computed(() => {
       </div>
     </div>
     <div class="name">{{ vod.name }}</div>
-    <div v-if="vod.year" class="meta">{{ vod.year }}</div>
+    <div v-if="metaText" class="meta">{{ metaText }}</div>
   </a>
 </template>
 

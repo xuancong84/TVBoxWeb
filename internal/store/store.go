@@ -37,13 +37,18 @@ type Data struct {
 	// 按剧集的片头片尾跳过设置，key 见 skipKey()。
 	// 全局 IntroSkip/OutroSkip 退化成「没有单独设置过的剧」的默认值 ——
 	// 不同剧的片头长度差很多，一套全局值套所有剧必然错位。
-	SkipCfgs      map[string]SkipCfg           `json:"skipCfgs"`
-	TapSound      int                          `json:"tapSound"`
-	TapVibrate    int                          `json:"tapVibrate"`
+	SkipCfgs   map[string]SkipCfg `json:"skipCfgs"`
+	TapSound   int                `json:"tapSound"`
+	TapVibrate int                `json:"tapVibrate"`
 	// LiveJunkFilterOff 关闭「直播频道列表过滤」：部分直播源会把更新时间戳、
 	// DJ 音乐合集歌曲名之类的脏数据解析成「频道」，默认过滤掉；置 true 时
 	// 原样展示未过滤的全部频道（给想自己核对源内容的用户用）。
 	LiveJunkFilterOff bool `json:"liveJunkFilterOff"`
+	// LiveScanOff 关闭「直播频道可播性」后台扫描（见 api.StartLiveScan）：
+	// 默认开启，置 true 时后台扫描循环直接跳过，不联网测任何频道——给不
+	// 想要这个常驻后台任务占用带宽/连接数的用户关掉用，已经测出来的结果
+	// 不受影响，重新打开立刻从断点接着扫。
+	LiveScanOff   bool                         `json:"liveScanOff"`
 	Feed          []model.Vod                  `json:"feed"`
 	CrawlAt       int64                        `json:"crawlAt"`
 	CrawlSummary  string                       `json:"crawlSummary"`
@@ -54,8 +59,8 @@ type Data struct {
 	WebdavList    []model.WebdavSource         `json:"webdavList"`
 	WebdavScan    map[string][]model.WebdavVod `json:"webdavScan"`
 	WdHist        []model.WdHistory            `json:"wdHist"`
-	SiteHealth    map[string]SiteHealthStat    `json:"siteHealth"` // 站源健康度统计
-	FavGroups     []FavGroup                   `json:"favGroups"`  // 收藏分组列表
+	SiteHealth    map[string]SiteHealthStat    `json:"siteHealth"`    // 站源健康度统计
+	FavGroups     []FavGroup                   `json:"favGroups"`     // 收藏分组列表
 	Subscriptions []Subscription               `json:"subscriptions"` // 多订阅源列表
 	// SubscriptionRoots 是用户在「订阅」文本框里填的原始根地址列表（一行一个），
 	// 可以是普通订阅地址，也可以是聚合清单地址（如 tvboxmuti.json）。
@@ -111,13 +116,17 @@ type SiteHealthStat struct {
 }
 
 type HistItem struct {
-	SiteKey    string `json:"siteKey"`
-	SiteName   string `json:"siteName"`
-	VodID      string `json:"vodId"`
-	Name       string `json:"name"`
-	Pic        string `json:"pic"`
-	EpName     string `json:"epName"`
-	EpIndex    int    `json:"epIndex"`
+	SiteKey  string `json:"siteKey"`
+	SiteName string `json:"siteName"`
+	VodID    string `json:"vodId"`
+	Name     string `json:"name"`
+	Pic      string `json:"pic"`
+	EpName   string `json:"epName"`
+	EpIndex  int    `json:"epIndex"`
+	// EpCount 这部剧总集数：播放页现查现填（player.eps.length），首页
+	// 「继续观看」卡片右下角用它代替重复展示当前第几集（下面那行灰字已经
+	// 有「第 01 集」了）。0 = 未知/单集，不显示。
+	EpCount    int    `json:"epCount"`
 	From       string `json:"from"`
 	Pos        int64  `json:"pos"`
 	Dur        int64  `json:"dur"`
@@ -581,7 +590,7 @@ func UpdateHistoryPos(h HistItem) {
 	i, found := histIdx[histKey(h.SiteKey, h.VodID)]
 	if found && i >= 0 && i < len(data.Hist) {
 		it := &data.Hist[i]
-		it.Pos, it.Dur, it.EpName, it.EpIndex, it.From, it.Time = h.Pos, h.Dur, h.EpName, h.EpIndex, h.From, time.Now().UnixMilli()
+		it.Pos, it.Dur, it.EpName, it.EpIndex, it.EpCount, it.From, it.Time = h.Pos, h.Dur, h.EpName, h.EpIndex, h.EpCount, h.From, time.Now().UnixMilli()
 		// 补更新影片名/封面（早期记录可能为空）
 		if h.Name != "" {
 			it.Name = h.Name
@@ -942,6 +951,15 @@ func LiveJunkFilterOn() bool { mu.RLock(); defer mu.RUnlock(); return !data.Live
 func SetLiveJunkFilterOn(on bool) {
 	mu.Lock()
 	data.LiveJunkFilterOff = !on
+	mu.Unlock()
+	flush()
+}
+
+// LiveScanEnabled 直播频道可播性后台扫描默认开启。
+func LiveScanEnabled() bool { mu.RLock(); defer mu.RUnlock(); return !data.LiveScanOff }
+func SetLiveScanEnabled(on bool) {
+	mu.Lock()
+	data.LiveScanOff = !on
 	mu.Unlock()
 	flush()
 }

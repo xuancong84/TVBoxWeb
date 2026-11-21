@@ -1,16 +1,48 @@
 <script setup lang="ts">
 import { ref, onMounted, onUnmounted } from 'vue'
 import { useRouter, useRoute } from 'vue-router'
+import { showClockDate, showClockTime, showClockDow } from '@/clockPrefs'
 
 const router = useRouter()
 const route = useRoute()
 
 // 拆成 时/分/秒 三段渲染：秒用等宽字形，避免每秒跳动时整行数字左右晃
 const clockParts = ref({ h: '00', m: '00', s: '00' })
-// 屏幕阅读器用的完整时间串（模板里显示的是上面三段）
+const clockDate = ref('')
+const clockDow = ref('')
+// 屏幕阅读器用的完整时间串（模板里显示的是上面几段，按设置里的开关取舍）
 const clockText = ref('00:00:00')
 const menuOpen = ref(false)
 let timer = 0
+
+const DOW_NAMES = ['周日', '周一', '周二', '周三', '周四', '周五', '周六']
+
+// 全屏切换：播放页之外（首页/点播/直播等任意 tab）也要能一键全屏——
+// 主要给电视端用，遥控器/鼠标只能点按钮，没有键盘按不了 F11。
+// 这里全屏的是 <html> 整个文档，跟 PlayerView 自己对 .player 元素请求
+// 全屏是两套独立的 Fullscreen API 调用，互不影响。
+const isFullscreen = ref(false)
+
+function onFullscreenChange() {
+  const doc = document as any
+  isFullscreen.value = !!(
+    doc.fullscreenElement ||
+    doc.webkitFullscreenElement ||
+    doc.mozFullScreenElement ||
+    doc.msFullscreenElement
+  )
+}
+
+function toggleFullscreen() {
+  const doc = document as any
+  if (doc.fullscreenElement || doc.webkitFullscreenElement || doc.mozFullScreenElement || doc.msFullscreenElement) {
+    ;(doc.exitFullscreen || doc.webkitExitFullscreen || doc.mozCancelFullScreen || doc.msExitFullscreen)?.call(doc)
+    return
+  }
+  const el = document.documentElement as any
+  const req = el.requestFullscreen || el.webkitRequestFullscreen || el.mozRequestFullScreen || el.msRequestFullscreen
+  req?.call(el)
+}
 
 const navs = [
   { name: 'home', label: '首页', path: '/' },
@@ -31,7 +63,9 @@ function tick() {
   const m = pad(d.getMinutes())
   const s = pad(d.getSeconds())
   clockParts.value = { h, m, s }
-  clockText.value = `${h}:${m}:${s}`
+  clockDate.value = `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`
+  clockDow.value = DOW_NAMES[d.getDay()]
+  clockText.value = `${clockDate.value} ${clockDow.value} ${h}:${m}:${s}`
 }
 
 onMounted(() => {
@@ -46,8 +80,19 @@ onMounted(() => {
     tick()
     startAligned()
   }, 1000 - now.getMilliseconds())
+
+  document.addEventListener('fullscreenchange', onFullscreenChange)
+  document.addEventListener('webkitfullscreenchange', onFullscreenChange)
+  document.addEventListener('mozfullscreenchange', onFullscreenChange)
+  document.addEventListener('MSFullscreenChange', onFullscreenChange)
 })
-onUnmounted(() => clearInterval(timer))
+onUnmounted(() => {
+  clearInterval(timer)
+  document.removeEventListener('fullscreenchange', onFullscreenChange)
+  document.removeEventListener('webkitfullscreenchange', onFullscreenChange)
+  document.removeEventListener('mozfullscreenchange', onFullscreenChange)
+  document.removeEventListener('MSFullscreenChange', onFullscreenChange)
+})
 
 function active(path: string) {
   if (path === '/') return route.name === 'home'
@@ -57,6 +102,19 @@ function active(path: string) {
 function navigate(path: string) {
   menuOpen.value = false
   router.push(path)
+}
+
+// 真实 <a href>：中键/ctrl/cmd+点击让浏览器原生在新标签页打开导航目标，
+// 跟 VodCard.href/channelHref 同样的理由——纯 <span>+click 的话中键点击
+// 什么都不会发生。
+function navHref(path: string): string {
+  return router.resolve(path).href
+}
+
+function onNavClick(path: string, e: MouseEvent) {
+  if (e.button !== 0 || e.metaKey || e.ctrlKey || e.shiftKey || e.altKey) return
+  e.preventDefault()
+  navigate(path)
 }
 </script>
 
@@ -69,25 +127,35 @@ function navigate(path: string) {
 
     <!-- 桌面导航 -->
     <nav class="navs desktop-only">
-      <span
+      <a
         v-for="n in navs"
         :key="n.name"
         class="nav-item"
         :class="{ active: active(n.path) }"
-        role="button"
-        tabindex="0"
+        :href="navHref(n.path)"
         :aria-label="`前往${n.label}`"
         :aria-current="active(n.path) ? 'page' : undefined"
-        @click="navigate(n.path)"
+        @click="onNavClick(n.path, $event)"
         @keydown.enter="navigate(n.path)"
         @keydown.space.prevent="navigate(n.path)"
       >
         {{ n.label }}
-      </span>
+      </a>
     </nav>
-    <span class="clock desktop-only" :aria-label="`当前时间 ${clockText}`">
-      <span class="c-hm">{{ clockParts.h }}:{{ clockParts.m }}</span><span class="c-s">:{{ clockParts.s }}</span>
+    <span v-if="showClockDate || showClockTime || showClockDow" class="clock desktop-only" :aria-label="`当前时间 ${clockText}`">
+      <span v-if="showClockDate" class="c-date">{{ clockDate }}</span>
+      <span v-if="showClockDow" class="c-dow">{{ clockDow }}</span>
+      <span v-if="showClockTime" class="c-time"><span class="c-hm">{{ clockParts.h }}:{{ clockParts.m }}</span><span class="c-s">:{{ clockParts.s }}</span></span>
     </span>
+
+    <!-- 全屏切换：所有 tab 页通用，不分桌面/移动，电视端点按钮即可全屏 -->
+    <button
+      class="fs-toggle"
+      type="button"
+      :title="isFullscreen ? '退出全屏' : '全屏'"
+      :aria-label="isFullscreen ? '退出全屏' : '全屏'"
+      @click="toggleFullscreen"
+    >{{ isFullscreen ? '⤓' : '⛶' }}</button>
 
     <!-- 移动端汉堡按钮 -->
     <button class="hamburger mobile-only" :class="{ open: menuOpen }" @click="menuOpen = !menuOpen" aria-label="菜单">
@@ -98,20 +166,19 @@ function navigate(path: string) {
   <!-- 移动端下拉菜单 -->
   <div v-if="menuOpen" class="mobile-menu mobile-only" @click="menuOpen = false">
     <div class="mobile-menu-inner" @click.stop>
-      <span
+      <a
         v-for="n in navs"
         :key="n.name"
         class="mobile-nav-item"
         :class="{ active: active(n.path) }"
-        role="button"
-        tabindex="0"
+        :href="navHref(n.path)"
         :aria-label="`前往${n.label}`"
-        @click="navigate(n.path)"
+        @click="onNavClick(n.path, $event)"
         @keydown.enter="navigate(n.path)"
         @keydown.space.prevent="navigate(n.path)"
       >
         {{ n.label }}
-      </span>
+      </a>
     </div>
   </div>
 </template>
@@ -167,6 +234,7 @@ function navigate(path: string) {
   cursor: pointer;
   transition: all 0.14s;
   white-space: nowrap;
+  text-decoration: none;
 }
 .nav-item:hover {
   color: #fff;
@@ -176,10 +244,11 @@ function navigate(path: string) {
   background: var(--card-hi);
 }
 .clock {
+  display: flex;
+  align-items: center;
+  gap: 10px;
   font-size: 30px;
   color: var(--dim);
-  /* 固定宽 + 等宽数字：秒数每秒变化时不会推挤后面的元素，也不会左右抖动 */
-  min-width: 150px;
   flex-shrink: 0;
   text-align: right;
   font-variant-numeric: tabular-nums;
@@ -188,8 +257,31 @@ function navigate(path: string) {
   white-space: nowrap;
   user-select: none;
 }
+/* 日期/星期本来就不常变，不需要跟时间一样防抖动；时间段自己用等宽数字
+   固定住，秒位每秒跳动时不会推挤前面的日期/星期。 */
+.clock .c-time { min-width: 108px; }
 /* 秒比时分淡一档，视觉主体仍是时分 */
 .clock .c-s { opacity: 0.65; }
+
+.fs-toggle {
+  flex-shrink: 0;
+  width: 40px;
+  height: 40px;
+  border-radius: 50%;
+  border: none;
+  background: var(--card-hi);
+  color: var(--sub);
+  font-size: 22px;
+  line-height: 1;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: all 0.14s;
+}
+.fs-toggle:hover {
+  color: #fff;
+}
 
 /* 汉堡菜单 */
 .hamburger {
@@ -242,6 +334,7 @@ function navigate(path: string) {
   cursor: pointer;
   border-left: 3px solid transparent;
   transition: all 0.14s;
+  text-decoration: none;
 }
 .mobile-nav-item:active {
   background: var(--card);

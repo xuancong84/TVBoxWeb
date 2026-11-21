@@ -75,24 +75,33 @@ function onScroll() {
 
 onMounted(() => {
   measure()
+  // 保险措施：有些场景（比如这个分支刚从 v-if 切换出来、字体/滚动条还没
+  // 最终落位）首次 measure() 读到的 clientWidth 不是最终布局宽度，
+  // ResizeObserver 之后也不一定会再触发（容器尺寸其实没真的变化）。
+  // 下一帧再量一次兜底，代价很小。
+  requestAnimationFrame(measure)
   if (typeof ResizeObserver !== 'undefined' && viewport.value) {
     ro = new ResizeObserver(measure)
     ro.observe(viewport.value)
   }
+  window.addEventListener('resize', measure)
   viewport.value?.addEventListener('scroll', onScroll, { passive: true })
 })
 
 onUnmounted(() => {
   ro?.disconnect()
+  window.removeEventListener('resize', measure)
   viewport.value?.removeEventListener('scroll', onScroll)
 })
 
-// 列表切换（搜索/分组）时回到顶部，避免停在新列表的中间位置
+// 列表切换（搜索/分组）时回到顶部，避免停在新列表的中间位置；同时重新量
+// 一次尺寸——切换列表常常伴随着滚动条的出现/消失，列宽会跟着变。
 watch(
   () => props.items,
   () => {
     if (viewport.value) viewport.value.scrollTop = 0
     scrollTop.value = 0
+    measure()
   }
 )
 </script>

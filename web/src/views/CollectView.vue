@@ -5,6 +5,7 @@ import { ElMessageBox } from 'element-plus'
 import { api, humanizeApiError, imgUrl } from '@/api'
 import { useAppStore } from '@/stores/app'
 import type { FavItem, FavGroup } from '@/types'
+import { gridCols } from '@/gridPrefs'
 import TopBar from '@/components/TopBar.vue'
 
 const router = useRouter()
@@ -263,9 +264,11 @@ async function onImportFile(e: Event) {
 </script>
 
 <template>
-  <div class="page" @click="moveMenuFav = null">
+  <div class="page page--fixed" @click="moveMenuFav = null">
+    <div class="tab-head">
     <TopBar />
-    <div class="collect-layout">
+    </div>
+    <div class="collect-layout tab-body tab-body--split">
       <!-- 左侧分组导航 -->
       <div class="sidebar">
         <div class="sidebar-title">收藏分组</div>
@@ -315,6 +318,7 @@ async function onImportFile(e: Event) {
 
       <!-- 右侧收藏内容 -->
       <div class="collect-main">
+        <div class="collect-sticky">
         <div class="collect-header">
           <span class="collect-title">{{ currentGroupName() }}</span>
           <span class="count">{{ filteredFavs.length }} 部</span>
@@ -342,8 +346,9 @@ async function onImportFile(e: Event) {
           </el-dropdown>
           <el-button size="small" type="danger" :disabled="!selectedCount" @click="batchRemove">批量删除</el-button>
         </div>
+        </div>
 
-        <div v-if="filteredFavs.length" class="grid">
+        <div v-if="filteredFavs.length" class="grid" :style="{ gridTemplateColumns: `repeat(${gridCols}, 1fr)` }">
           <div
             v-for="f in filteredFavs" :key="f.siteKey + f.vodId" class="item"
             :class="{ selected: isSelected(f) }"
@@ -397,13 +402,14 @@ async function onImportFile(e: Event) {
 <style scoped>
 .collect-layout {
   display: flex;
-  min-height: calc(100vh - 56px);
+  height: 100%;
 }
 
-/* 左侧 */
+/* 左侧：分组一长，自己滚，不跟着右边内容区一起滚没影 */
 .sidebar {
   width: 200px;
   flex-shrink: 0;
+  height: 100%;
   border-right: 1px solid var(--border);
   padding: 16px 0;
   overflow-y: auto;
@@ -495,9 +501,16 @@ async function onImportFile(e: Event) {
   box-shadow: inset 0 0 0 1px var(--primary, #409eff);
 }
 
-/* 右侧 */
-.collect-main { flex: 1; min-width: 0; padding: 16px 0 0; }
+/* 右侧：标题/批量操作栏钉住，只有下面的网格滚动 */
+.collect-main { flex: 1; min-width: 0; height: 100%; overflow-y: auto; padding: 16px 0 0; }
 
+/* 标题行 + 批量操作栏钉在右侧内容区顶部，只有下面的网格滚动 */
+.collect-sticky {
+  position: sticky;
+  top: 0;
+  background: var(--bg);
+  z-index: 2;
+}
 .collect-header {
   display: flex;
   align-items: baseline;

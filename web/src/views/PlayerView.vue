@@ -20,6 +20,22 @@ async function loadHls(): Promise<any> {
   return Hls
 }
 
+// mpegts.js 动态加载：给直播频道里「不是 m3u8」的那条线路用——这类地址
+// 合并/抓取阶段看着没有扩展名（常常是跳转到真实 CDN 地址之前的中间层，
+// 比如虎牙转播镜像），但实际落地大多是 FLV 或裸 MPEG-TS 容器，<video>
+// 原生不认这两种容器（哪怕里面的 H.264/AAC 浏览器本来能解），之前这类
+// 频道一律塞进 hls.js（hls.js 只认 m3u8，拿到的其实是一段二进制 FLV/TS
+// 数据，解析 manifest 必然失败），表现为背景探活判它「能播」（真的有
+// 数据在传），但播放页永远卡在「缓冲中」——用 mpegts.js 转封装成 fMP4
+// 喂给 MSE 才能真正放出来。
+let MpegtsJS: any = null
+async function loadMpegts(): Promise<any> {
+  if (MpegtsJS) return MpegtsJS
+  const mod = await import('mpegts.js')
+  MpegtsJS = mod.default || mod
+  return MpegtsJS
+}
+
 const route = useRoute()
 const router = useRouter()
 const app = useAppStore()
@@ -203,6 +219,11 @@ async function trySwitchToUntriedLine() {
 
 const videoEl = ref<HTMLVideoElement>()
 let hls: any | null = null
+let mpegtsPlayer: any | null = null
+// 同一条线路先试 flv 再试 mpegts（或反过来）只翻一次类型：猜错容器格式
+// 时给一次改猜的机会，但两种都不对的坏线路不能在这两个类型之间无限
+// 来回切换。见 initMpegtsPlayer/switchEpisode/switchLine/retry。
+let mpegtsTypeFallbackTried = false
 let hlsRecover = 0 // hls fatal 错误恢复次数，避免 seek/网络抖动直接判死
 // 同一条线路累计报过多少次 fatal 错误，不会被 onplaying 清零（见下）。
 // hlsRecover 会在每次恢复到「播了一点」（哪怕只有一两帧）时被 onplaying
@@ -722,7 +743,12 @@ async function initPlayer() {
   }
   // 兜底状态下（无扩展名文件靠强制转封装在播）重新 init 也要保持强制
   const src = proxiedFinal(remuxFallbackTried)
-  if (src.includes('.m3u8') || via.value === '直播直连' || via.value === '补全 m3u8') {
+  // 直播频道不等于一定是 m3u8：之前这里拿 via.value === '直播直连' 把所有
+  // 直播播放统统塞进 hls.js，碰到实际是 FLV/裸 TS 容器的直播线路（URL 里
+  // 看不出扩展名，常见于虎牙/斗鱼这类转播镜像）时，hls.js 会把这段二进制
+  // 数据硬当成 m3u8 manifest 解析，必然失败——现在把「是不是直播」和
+  // 「是不是 m3u8」拆成两个独立判断，直播但不是 m3u8 的交给 initMpegtsPlayer。
+  if (src.includes('.m3u8') || via.value === '补全 m3u8') {
     const HlsCls = await loadHls()
     if (HlsCls.isSupported()) {
       // 缓冲策略：直播追求低延迟用小缓冲 + 限制最大缓冲防内存膨胀；
@@ -812,6 +838,9 @@ async function initPlayer() {
     } else if (vid.canPlayType('application/vnd.apple.mpegurl')) {
       vid.src = src
     }
+  } else if (isLive) {
+    mpegtsTypeFallbackTried = false
+    await initMpegtsPlayer(src, vid)
   } else {
     vid.src = src
   }
@@ -826,6 +855,68 @@ async function initPlayer() {
     if (hls) hls.config.playbackRate = playbackRate.value
   }
   vid.play().catch(() => {})
+}
+
+// URL 字符串里能看出 .ts/.m2ts 后缀的走 mpegts(TS) 解封装，其余（包括完全
+// 没有后缀的——真实容器要等实际连上才知道，常见于经过跳转的直播间地址）
+// 先试 flv：国内直播转播最常见的封装格式（虎牙/斗鱼之类基本都是 flv），
+// 猜错了会在下面 ERROR 回调里翻一次类型重试，不会直接判死整条线路。
+function guessMpegtsType(u: string): 'flv' | 'mpegts' {
+  const clean = u.split('?')[0].split('#')[0].toLowerCase()
+  return clean.endsWith('.ts') || clean.endsWith('.m2ts') ? 'mpegts' : 'flv'
+}
+
+async function initMpegtsPlayer(src: string, vid: HTMLVideoElement, type?: 'flv' | 'mpegts') {
+  const MpegtsCls = await loadMpegts()
+  if (!MpegtsCls.isSupported()) {
+    // 当前浏览器不支持 MSE：没有更好的兜底了，走跟 hls.js fatal 错误一样的
+    // 「换这个频道的下一条线路，都没有就交给 onPlayError 收尾」流程。
+    onMpegtsFatal()
+    return
+  }
+  const t = type || guessMpegtsType(src)
+  const p = MpegtsCls.createPlayer(
+    { type: t, isLive: true, url: src },
+    // 直播追求低延迟：关掉 IO 暂存缓冲，开启「追帧」避免 HTMLMediaElement
+    // 内部缓冲越攒越多导致画面逐渐滞后（同样的低延迟取向见上面 hls 的
+    // maxBufferLength 配置）。
+    { enableStashBuffer: false, liveBufferLatencyChasing: true }
+  )
+  mpegtsPlayer = p
+  p.attachMediaElement(vid)
+  p.on(MpegtsCls.Events.ERROR, (errType: string) => {
+    const isMediaErr = errType === MpegtsCls.ErrorTypes.MEDIA_ERROR
+    // 容器/编码猜错了：翻一次类型重试（flv⇄mpegts），只翻一次——两种都
+    // 播不了的坏线路不能在这两个类型之间来回切换变成死循环。
+    if (isMediaErr && !mpegtsTypeFallbackTried) {
+      mpegtsTypeFallbackTried = true
+      const altType = t === 'flv' ? 'mpegts' : 'flv'
+      app.showTip('尝试切换解封装格式…')
+      p.destroy()
+      if (mpegtsPlayer === p) mpegtsPlayer = null
+      void initMpegtsPlayer(src, vid, altType)
+      return
+    }
+    onMpegtsFatal()
+  })
+  p.load()
+}
+
+// mpegts 播放彻底失败（含当前浏览器不支持 MSE、翻过类型还是不行）：跟
+// hls.js 的 fatal 错误走同一套「这个频道还有没试过的线路就换一条，没有
+// 就交给 onPlayError 收尾」逻辑，两条解封装路径的收尾行为保持一致。
+function onMpegtsFatal() {
+  if (isLive) {
+    lineFatalTotal++
+    triedLines.add(rawUrl)
+    const ep = player.current
+    const hasUntried = !!ep && ep.urls.some((u) => u && u !== rawUrl && !triedLines.has(u))
+    if (hasUntried) {
+      void trySwitchToUntriedLine()
+      return
+    }
+  }
+  onPlayError('mediaError')
 }
 
 function bindVideoEvents(vid: HTMLVideoElement) {
@@ -1636,6 +1727,7 @@ async function switchEpisode(delta: number) {
   triedLines = new Set()
   hlsRecover = 0
   lineFatalTotal = 0
+  mpegtsTypeFallbackTried = false
   liveStatusReported = false
   if (isLive) {
     title.value = ep.name
@@ -1729,6 +1821,10 @@ function destroyPlayer() {
     hls.destroy()
     hls = null
   }
+  if (mpegtsPlayer) {
+    mpegtsPlayer.destroy()
+    mpegtsPlayer = null
+  }
   if (videoEl.value) {
     videoEl.value.pause()
     videoEl.value.removeAttribute('src')
@@ -1795,6 +1891,7 @@ function savePos() {
       pic: vodPic,
       epName: player.current?.name || '',
       epIndex: player.idx,
+      epCount: player.count,
       from: '',
       pos: Math.floor(pos),
       dur: durMs.value > 0 ? Math.floor(durMs.value) : 0,
@@ -1844,6 +1941,7 @@ function savePosBeacon() {
       pic: vodPic,
       epName: player.current?.name || '',
       epIndex: player.idx,
+      epCount: player.count,
       from: '',
       pos: Math.floor(pos),
       dur,
@@ -2024,6 +2122,16 @@ onUnmounted(() => {
   <div v-if="!isMobile" ref="playerEl" class="player" @mousemove="onMouseMove" @click="onSurfaceClick" @dblclick="toggleFullscreen">
     <video ref="videoEl" class="video" :style="{ objectFit: scaleFit }"></video>
 
+    <!-- 兜底返回：OSD 要等 prepared（真正起播）才会出现，解析/缓冲期间
+         （挨个试线路可能很久，甚至一直试不出来也不一定马上报错）在那之前
+         整个画面只有一行文字提示，没有任何能点的东西，只能靠浏览器物理
+         返回键——这里常驻一个返回按钮兜底，prepared 之后 OSD 自己的返回
+         按钮就够用了，这个会跟着隐藏。 -->
+    <button v-if="!prepared" class="back-btn fallback-back" @click.stop="goBack" aria-label="返回">
+      <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M15 18l-6-6 6-6" /></svg>
+      <span>返回</span>
+    </button>
+
     <!-- 中央播放/暂停图标 -->
     <transition name="flash">
       <div v-if="playFlash" class="play-flash">{{ playFlash === 'play' ? '▶' : '❚❚' }}</div>
@@ -2180,6 +2288,14 @@ onUnmounted(() => {
 
       <!-- 模拟亮度遮罩（左滑调节，覆盖在视频上方） -->
       <div class="brightness-mask" :style="{ opacity: brightness }"></div>
+
+      <!-- 全屏下的兜底返回：非全屏时下面常驻的 .m-panel 自带返回按钮，
+           但全屏（双击视频区随时能进全屏，不需要等 prepared）下只有
+           prepared 之后才会出现 .m-osd-fullscreen 自己的返回——解析/
+           缓冲慢的时候会卡在黑屏里出不去，这里补一个。 -->
+      <button v-if="isFullscreen && !prepared" class="m-fallback-back" @click.stop="goBack" aria-label="返回">
+        <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M15 18l-6-6 6-6" /></svg>
+      </button>
 
       <!-- 手势提示 -->
       <div v-if="gestureHint" class="m-gesture-hint">{{ gestureHint }}</div>
@@ -2503,6 +2619,12 @@ onUnmounted(() => {
   background: rgba(255, 255, 255, 0.24);
   border-color: #fff;
 }
+.fallback-back {
+  position: absolute;
+  left: 24px;
+  top: 24px;
+  z-index: 20;
+}
 .osd-title { font-size: 18px; font-weight: 600; }
 .osd-meta { font-size: 13px; color: var(--sub); }
 
@@ -2658,6 +2780,22 @@ onUnmounted(() => {
 .m-player.m-fullscreen .m-video-wrap {
   flex: 1;
   height: 100%;
+}
+.m-fallback-back {
+  position: absolute;
+  left: 12px;
+  top: 12px;
+  z-index: 20;
+  width: 36px;
+  height: 36px;
+  border-radius: 8px;
+  background: rgba(0, 0, 0, 0.5);
+  border: none;
+  color: #fff;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
 }
 
 .m-center-tip {

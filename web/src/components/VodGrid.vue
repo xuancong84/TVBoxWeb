@@ -2,6 +2,8 @@
 import { ref, computed, watch, onMounted, onUnmounted, nextTick } from 'vue'
 import { useRouter } from 'vue-router'
 import type { Vod } from '@/types'
+import { gridCols } from '@/gridPrefs'
+import { cacheVod } from '@/vodCache'
 import VodCard from './VodCard.vue'
 import SkeletonList from './SkeletonList.vue'
 
@@ -66,6 +68,28 @@ let ro: ResizeObserver | null = null
 let raf = 0
 let lastVods: Vod[] | null = null
 let lastWidth = 0
+// 这一屏现在不一定是 window 在滚——点播/首页/搜索这几个 Tab 改成了
+// 自己的 .tab-body 内部滚动（见 App.vue 的 .page--fixed 布局），window
+// 本身压根不会触发 scroll 事件。之前写死监听 window 的 scroll，滚的是
+// .tab-body 的话这个虚拟滚动窗口永远不会跟着更新，滚过初始渲染的那几
+// 行后面就是一片空白——这里改成往上找最近「自己会出滚动条」的祖先，
+// 找不到（比如这个组件以后用在别的、仍然是整页滚动的页面里）才退回
+// window，不写死任何一种。
+let scrollParent: HTMLElement | Window = window
+
+function findScrollParent(el: HTMLElement | null): HTMLElement | Window {
+  let node = el?.parentElement || null
+  while (node && node !== document.body && node !== document.documentElement) {
+    const cs = getComputedStyle(node)
+    if (/(auto|scroll)/.test(cs.overflowY)) return node
+    node = node.parentElement
+  }
+  return window
+}
+
+function curScrollTop(): number {
+  return scrollParent === window ? window.scrollY : (scrollParent as HTMLElement).scrollTop
+}
 
 function measureLayout() {
   const el = gridEl.value
@@ -110,7 +134,20 @@ function onScroll() {
   })
 }
 
+// 骨架屏阶段 wrapEl/gridEl 还没渲染出来（v-else-if="vods.length"），
+// onMounted 那一刻往上找祖先只能落到 window 兜底；真正的网格 DOM 挂出来
+// 后（vods 从空变有内容，触发下面那个 watch → relayout）这里会重新找一遍，
+// 找到真正会出滚动条的那个祖先（.tab-body）就把监听换过去。
+function rebindScrollParent() {
+  const target = findScrollParent(wrapEl.value || gridEl.value)
+  if (target === scrollParent) return
+  scrollParent.removeEventListener('scroll', onScroll)
+  scrollParent = target
+  scrollParent.addEventListener('scroll', onScroll, { passive: true })
+}
+
 async function relayout() {
+  rebindScrollParent()
   measureLayout()
   await nextTick()
   // 测量到真实卡片高度后，行高会变，需要重算窗口
@@ -118,6 +155,10 @@ async function relayout() {
 }
 
 function open(v: Vod) {
+  // 这张卡片当下这份 Vod 数据存一下：如果已经带着 playUrl（点播/搜索
+  // 这类列表接口，不少站源本来就把播放地址一起吐出来了），详情页就不用
+  // 为了同一部片子再打一次网络请求。
+  cacheVod(v)
   router.push({
     name: 'detail',
     query: { site: v.siteKey, siteName: v.siteName, id: v.id }
@@ -132,8 +173,9 @@ watch(
     // 列表整体换掉（切分类/换关键词）时回到顶部
     if (scrolled.value) {
       const el = wrapEl.value || gridEl.value
-      const y = el ? el.getBoundingClientRect().top + window.scrollY : 0
-      if (el && y < window.scrollY) window.scrollTo({ top: y })
+      const top = curScrollTop()
+      const y = el ? el.getBoundingClientRect().top + top : 0
+      if (el && y < top) scrollParent.scrollTo({ top: y })
     }
     scrolled.value = false
     startRow.value = 0
@@ -144,8 +186,15 @@ watch(
 
 watch(cols, () => updateWindow())
 
+// 用户在「设置 → 显示」里手动改列数：gridTemplateColumns 的 inline style
+// 变了，但 gridEl 自身的宽度不变，ResizeObserver 不会被触发，这里单独
+// 盯一下，手动重新测量布局。
+watch(gridCols, () => relayout())
+
 onMounted(async () => {
-  window.addEventListener('scroll', onScroll, { passive: true })
+  // 骨架屏阶段大概率还没有真实网格 DOM，这里先按 window 兜底订阅一次，
+  // 等 relayout() 里的 rebindScrollParent() 找到真正的滚动祖先再切换过去。
+  scrollParent.addEventListener('scroll', onScroll, { passive: true })
   window.addEventListener('resize', onScroll, { passive: true })
   if (typeof ResizeObserver !== 'undefined' && gridEl.value) {
     // 只关心宽度变化：行数变化同样会触发 RO，不加宽度判定会形成
@@ -163,7 +212,7 @@ onMounted(async () => {
 })
 
 onUnmounted(() => {
-  window.removeEventListener('scroll', onScroll)
+  scrollParent.removeEventListener('scroll', onScroll)
   window.removeEventListener('resize', onScroll)
   ro?.disconnect()
   if (raf) cancelAnimationFrame(raf)
@@ -179,7 +228,10 @@ onUnmounted(() => {
     <div
       ref="gridEl"
       class="vod-grid"
-      :style="{ transform: useVirtual ? `translateY(${offsetY}px)` : undefined }"
+      :style="{
+        transform: useVirtual ? `translateY(${offsetY}px)` : undefined,
+        gridTemplateColumns: `repeat(${gridCols}, 1fr)`
+      }"
     >
       <VodCard
         v-for="v in windowVods"
@@ -202,6 +254,8 @@ onUnmounted(() => {
 }
 .vod-grid {
   display: grid;
+  /* 实际列数由 gridPrefs.ts 的 gridCols 通过 inline style 决定（见上面模板），
+     这里的 auto-fill 只是兜底（inline style 还没挂上之前的一帧）。 */
   grid-template-columns: repeat(auto-fill, minmax(160px, 1fr));
   gap: 16px;
   padding: 0 24px;

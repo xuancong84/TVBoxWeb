@@ -1,7 +1,8 @@
 <script setup lang="ts">
-import { ref, computed, onMounted, onUnmounted, onActivated, onDeactivated, watch } from 'vue'
+import { ref, shallowRef, computed, onMounted, onUnmounted, onActivated, onDeactivated, watch } from 'vue'
 import { useRouter } from 'vue-router'
 import { api, humanizeApiError } from '@/api'
+import type { LiveScanStatus } from '@/types'
 import { useAppStore } from '@/stores/app'
 import { usePlayerStore } from '@/stores/player'
 import type { LiveDir, Channel, EpgResult, EpgProgram } from '@/types'
@@ -15,7 +16,12 @@ const player = usePlayerStore()
 
 const loading = ref(false)
 const refreshing = ref(false)
-const root = ref<LiveDir | null>(null)
+// root/flatChannels 挂的是全部直播源合并后的频道目录，大的时候有十几万个
+// 频道节点；用 shallowRef 只在整体替换时触发响应，不让 Vue 递归把每个
+// 频道对象、每个 urls 数组都转成响应式 Proxy——这一步转换本身就是「停在
+// 直播页 CPU 一直很高」的主因之一，而这里从没依赖过「改某个频道对象的
+// 某个字段后界面自动更新」这种深层响应式（永远是整份替换）。
+const root = shallowRef<LiveDir | null>(null)
 const sourceCount = ref(0)
 const selectedPath = ref<string[]>([]) // 当前分组路径
 const deadSet = ref<Set<string>>(new Set())
@@ -28,8 +34,79 @@ let probeGen = 0
 
 // ===== 性能优化：频道索引缓存 =====
 // 避免每次搜索都递归遍历全树，改用预构建的扁平列表 + 首字母索引
-const flatChannels = ref<Channel[]>([])
-const channelIndex = ref<Map<string, Channel[]>>(new Map())
+const flatChannels = shallowRef<Channel[]>([])
+const channelIndex = shallowRef<Map<string, Channel[]>>(new Map())
+
+// ===== 可播频道（后台扫描 + 真实播放共同喂数据，见 store.ChannelProbe）=====
+// 默认就显示这个分类：打开直播页第一眼看到的是「已经确认能播」的频道，
+// 不是未经筛选的全量频道目录。
+//
+// 数据来源是专门的轻量接口 /api/live/playable（只有几千条），而不是从
+// 全量合并目录（root，十几万条）里筛——后者体积太大，之前就是靠它筛出
+// 「可播频道」的，筛选本身很快，但光是把十几万条频道整个下载+反序列化+
+// 转响应式对象就已经把浏览器 CPU 占满了。
+const showPlayable = ref(true)
+const playableRaw = shallowRef<Channel[]>([])
+const scanStatus = ref<LiveScanStatus>({ total: 0, scanned: 0, playable: 0, scanning: false })
+let scanPollTimer: ReturnType<typeof setInterval> | null = null
+let scanPollTicks = 0
+
+async function loadPlayable() {
+  try {
+    const r = await api.livePlayable()
+    playableRaw.value = r.channels
+  } catch {
+    /* ignore：拉不到就留着上一次的列表，下一轮轮询再试 */
+  }
+}
+
+async function pollScanStatus() {
+  try {
+    scanStatus.value = await api.liveScanStatus()
+  } catch {
+    /* ignore：纯展示用的进度条，拉不到就留着上一次的数字 */
+  }
+  // 扫描进度数字每 5 秒刷一次就够跟手；可播频道的具体列表（谁新变成了
+  // ok）不用跟这么勤，放慢到四倍（20 秒），而且只在正看着这个分类时才
+  // 刷——不是这个视图就没必要在背后悄悄拉。
+  if (++scanPollTicks % 4 === 0 && showPlayable.value) loadPlayable()
+}
+
+function startScanPolling() {
+  if (scanPollTimer) return
+  scanPollTicks = 0
+  pollScanStatus()
+  scanPollTimer = setInterval(pollScanStatus, 5000)
+}
+function stopScanPolling() {
+  if (scanPollTimer) { clearInterval(scanPollTimer); scanPollTimer = null }
+}
+
+const playableChannels = computed<Channel[]>(() => {
+  const kw = filter.value.trim().toLowerCase()
+  return kw ? playableRaw.value.filter((c) => c.name.toLowerCase().includes(kw)) : playableRaw.value
+})
+
+function showPlayableView() {
+  showPlayable.value = true
+  showFavs.value = false
+  filter.value = ''
+  selectedPath.value = []
+  loadPlayable()
+}
+
+// 从「可播频道」里移除：清掉测试记录（变回「没测过」），不是标成播不通。
+async function removeFromPlayable(ch: Channel) {
+  try {
+    await api.removeLiveChannelStatus(ch.name)
+    // 本地直接从列表里摘掉，不用等下一轮轮询才消失
+    playableRaw.value = playableRaw.value.filter((c) => c.name !== ch.name)
+    app.showTip(`已从「可播频道」移除「${ch.name}」`)
+    pollScanStatus()
+  } catch (e: any) {
+    app.showTip('移除失败：' + humanizeApiError(e))
+  }
+}
 
 // ===== 直播频道收藏 =====
 const liveFavs = ref<Channel[]>([])
@@ -48,6 +125,7 @@ async function toggleFav(ch: Channel) {
 
 function showMyFavs() {
   showFavs.value = true
+  showPlayable.value = false
   filter.value = ''
   selectedPath.value = []
 }
@@ -73,24 +151,34 @@ onMounted(async () => {
   liveFavs.value = await api.liveFavs().catch(() => [])
   const p = await api.prefs().catch(() => null)
   if (p) junkFilter.value = p.liveJunkFilter !== false
+  // 默认视图就是「可播频道」，先主动拉一次，不等第一个 20 秒轮询节拍
+  if (showPlayable.value) loadPlayable()
+  startScanPolling()
 })
 
 // 从播放页返回时触发：静默刷新一次频道列表，捡起刚才那次播放写回的
 // 红/绿播放状态；不重置 filter/selectedPath，也不弹骨架屏。
 onActivated(() => {
+  startScanPolling()
   if (skipNextActivate) {
     skipNextActivate = false
     return
   }
-  loadChannels(false, true)
+  if (showPlayable.value) {
+    loadPlayable()
+  } else {
+    loadChannels(false, true)
+  }
 })
 
 onDeactivated(() => {
   if (reloadTimer) { clearTimeout(reloadTimer); reloadTimer = null }
+  stopScanPolling()
 })
 
 onUnmounted(() => {
   if (reloadTimer) clearTimeout(reloadTimer)
+  stopScanPolling()
 })
 
 // force=true 时让后台把没过期的源缓存也重新抓一遍（「刷新」按钮用）；
@@ -201,6 +289,7 @@ function collect(n: LiveDir, out: Channel[]) {
 function selectGroup(path: string[]) {
   selectedPath.value = path
   showFavs.value = false
+  showPlayable.value = false
 }
 
 function pathLabel(): string {
@@ -208,8 +297,16 @@ function pathLabel(): string {
   return selectedPath.value.join(' › ')
 }
 
+// 当前视图实际展示的频道列表：三个互斥视图（可播频道 / 我的频道 / 分组）
+// 共用的唯一入口，播放列表、换台上一曲/下一曲都从这份列表取。
+const displayChannels = computed<Channel[]>(() => {
+  if (showPlayable.value) return playableChannels.value
+  if (showFavs.value) return favChannels.value
+  return channels.value
+})
+
 function playChannel(ch: Channel) {
-  const list = showFavs.value ? favChannels.value : channels.value
+  const list = displayChannels.value
   const idx = list.findIndex((c) => c.name === ch.name && c.url === ch.url)
   player.set(
     list.map((c) => ({ name: c.name, url: c.url, urls: c.urls })),
@@ -355,7 +452,8 @@ const epgVisible = computed<EpgProgram[]>(() => {
 </script>
 
 <template>
-  <div class="page">
+  <div class="page page--fixed">
+    <div class="tab-head">
     <TopBar />
     <div class="live-head">
       <div class="live-title">
@@ -376,7 +474,9 @@ const epgVisible = computed<EpgProgram[]>(() => {
         <el-button size="small" @click="openEpg()">节目单</el-button>
       </div>
     </div>
+    </div>
 
+    <div class="tab-body tab-body--split">
     <div v-if="!root && !loading" class="empty">
       <p>暂无直播源</p>
       <p class="empty-sub">可以去「设置 → 订阅」导入订阅链接</p>
@@ -386,7 +486,11 @@ const epgVisible = computed<EpgProgram[]>(() => {
     <div v-else class="live-body" v-loading="loading">
       <!-- 左分组 -->
       <div class="groups">
-        <div class="group" :class="{ active: !showFavs && !selectedPath.length }" @click="selectGroup([])">
+        <div class="group playable-group" :class="{ active: showPlayable }" @click="showPlayableView">
+          <span class="playable-dot">●</span> 可播频道
+          <span class="cnt">{{ scanStatus.playable }}</span>
+        </div>
+        <div class="group" :class="{ active: !showFavs && !showPlayable && !selectedPath.length }" @click="selectGroup([])">
           全部频道
         </div>
         <div class="group fav-group" :class="{ active: showFavs }" @click="showMyFavs">
@@ -417,15 +521,33 @@ const epgVisible = computed<EpgProgram[]>(() => {
 
       <!-- 右频道 -->
       <div class="channels">
-        <div class="ch-search">
-          <el-input
-            v-model="filter"
-            size="small"
-            clearable
-            placeholder="搜索频道（如 CCTV / 卫视）"
-            style="width: 260px"
-          />
-          <span v-if="filter" class="ch-search-count">{{ (showFavs ? favChannels : channels).length }} 台</span>
+        <!-- ch-head 把「扫描进度条（可选）+ 搜索框」包成一个整体占第一个
+             grid 行：scan-bar 是否渲染全凭 v-if，不会影响 ch-virtual 在
+             grid-template-rows 里该落在哪一行。 -->
+        <div class="ch-head">
+          <!-- 可播频道分类：显示后台扫描进度 -->
+          <div v-if="showPlayable" class="scan-bar">
+            <span class="scan-text">
+              {{ scanStatus.playable }} 可播 / {{ scanStatus.scanned }} 已测 / {{ scanStatus.total }} 总数
+              <span v-if="scanStatus.scanning" class="scan-live">扫描中…</span>
+            </span>
+            <div class="scan-track">
+              <div
+                class="scan-fill"
+                :style="{ width: (scanStatus.total ? (scanStatus.scanned / scanStatus.total * 100) : 0) + '%' }"
+              ></div>
+            </div>
+          </div>
+          <div class="ch-search">
+            <el-input
+              v-model="filter"
+              size="small"
+              clearable
+              placeholder="搜索频道（如 CCTV / 卫视）"
+              style="width: 260px"
+            />
+            <span v-if="filter" class="ch-search-count">{{ displayChannels.length }} 台</span>
+          </div>
         </div>
         <!-- 加载中：骨架屏 -->
         <SkeletonList v-if="loading" type="channel" :count="30" />
@@ -434,11 +556,17 @@ const epgVisible = computed<EpgProgram[]>(() => {
           <p>暂无收藏的频道</p>
           <p class="empty-sub">可以点频道右侧的 ⭐ 收藏常用频道</p>
         </div>
+        <!-- 可播频道空态 -->
+        <div v-else-if="showPlayable && !playableChannels.length" class="empty">
+          <p>{{ scanStatus.scanning || scanStatus.scanned < scanStatus.total ? '后台正在扫描频道可播性，稍后自动出现…' : '暂无确认可播的频道' }}</p>
+          <p class="empty-sub">播放成功过的频道，或后台扫描测出能播的频道，都会出现在这里</p>
+        </div>
         <!-- 频道列表（虚拟滚动：上千频道只渲染可视区） -->
         <VirtualGrid
           v-else
           class="ch-virtual"
-          :items="showFavs ? favChannels : channels"
+          max-height="100%"
+          :items="displayChannels"
           :item-height="46"
           :item-min-width="150"
           :gap="8"
@@ -454,9 +582,10 @@ const epgVisible = computed<EpgProgram[]>(() => {
               <span
                 class="ch-name"
                 :class="{ 'ch-name-ok': ch.status === 'ok', 'ch-name-fail': ch.status === 'fail' }"
-                :title="ch.status === 'ok' ? '播放过，能播' : ch.status === 'fail' ? '播放过，播不通' : ''"
+                :title="ch.status === 'ok' ? '能播' : ch.status === 'fail' ? '播不通（24 小时后会自动重新测试）' : ''"
               >{{ ch.name }}</span>
               <span v-if="ch.urls.length > 1" class="ch-alts">{{ ch.urls.length }} 线路</span>
+              <span v-if="showPlayable" class="ch-remove" title="从可播频道移除" @click.stop.prevent="removeFromPlayable(ch)">✕</span>
               <span class="ch-epg" title="查看节目单" @click.stop.prevent="openEpg(ch)">▤</span>
               <span
                 class="ch-fav"
@@ -468,6 +597,7 @@ const epgVisible = computed<EpgProgram[]>(() => {
           </template>
         </VirtualGrid>
       </div>
+    </div>
     </div>
 
     <!-- EPG 节目单 -->
@@ -533,13 +663,14 @@ const epgVisible = computed<EpgProgram[]>(() => {
 }
 .live-body {
   display: flex;
+  height: 100%;
   padding: 0 24px;
   gap: 16px;
 }
 .groups {
   width: 220px;
   flex-shrink: 0;
-  max-height: calc(100vh - 160px);
+  height: 100%;
   overflow-y: auto;
 }
 .group {
@@ -570,28 +701,72 @@ const epgVisible = computed<EpgProgram[]>(() => {
   flex: 1;
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
+  /* 第一行给搜索框按内容高度，剩下全部给频道区——频道区自己内部
+     （VirtualGrid 的 .vg-viewport）滚动，这一层本身不再滚，避免跟
+     里面的虚拟滚动区套出两层滚动条。 */
+  grid-template-rows: auto 1fr;
   gap: 8px;
   align-content: start;
-  max-height: calc(100vh - 160px);
-  overflow-y: auto;
+  height: 100%;
+  overflow: hidden;
 }
-.ch-virtual { grid-column: 1 / -1; }
-.ch-search {
+.ch-virtual { grid-column: 1 / -1; height: 100%; }
+.ch-head {
   grid-column: 1 / -1;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.ch-search {
   display: flex;
   align-items: center;
   gap: 10px;
   padding-bottom: 4px;
-  position: sticky;
-  top: 0;
-  background: var(--bg);
-  z-index: 1;
 }
 .ch-search-count {
   font-size: 12px;
   color: var(--dim);
   white-space: nowrap;
 }
+/* ===== 可播频道：侧栏入口 + 扫描进度条 ===== */
+.playable-group .playable-dot {
+  font-size: 10px;
+  color: #4caf50;
+}
+.playable-group.active {
+  color: #4caf50;
+}
+.scan-bar {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.scan-text {
+  font-size: 12px;
+  color: var(--dim);
+}
+.scan-live {
+  color: var(--selected);
+  margin-left: 6px;
+}
+.scan-track {
+  height: 4px;
+  border-radius: 2px;
+  background: var(--white-15);
+  overflow: hidden;
+}
+.scan-fill {
+  height: 100%;
+  background: #4caf50;
+  transition: width 0.3s ease;
+}
+.ch-remove {
+  color: var(--dim);
+  cursor: pointer;
+  font-size: 13px;
+  padding: 0 4px;
+}
+.ch-remove:hover { color: #f44336; }
 .channel {
   padding: 12px;
   border-radius: 6px;

@@ -9,7 +9,7 @@
  * 5. WebSocket（/ws）：不拦截
  */
 
-const VERSION = 'yzz-v25'
+const VERSION = 'yzz-v43'
 
 const CACHE_SHELL = `${VERSION}-shell`
 const CACHE_STATIC = `${VERSION}-static`

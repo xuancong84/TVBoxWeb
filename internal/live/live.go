@@ -4,6 +4,7 @@ package live
 import (
 	"context"
 	"fmt"
+	"net/url"
 	"strings"
 	"sync"
 	"time"
@@ -37,6 +38,151 @@ func ProbeCtx(ctx context.Context, url string, ms time.Duration) bool {
 		return false
 	}
 	return true
+}
+
+// minStreamBytes 判定「真的连续播出过」所需的最少字节数：按 dur（见
+// internal/api/livescan.go 的 liveScanStreamDur，目前 1.2 秒）配合这个
+// 下限一起算，相当于要求平均吞吐至少 ~40KB/s（≈320kbps）——实况 TV 频道
+// 哪怕压得很狠也很少低于这个码率，但「连得上、对面服务器先吐几 KB 缓冲
+// 占位数据就不再吭声」这种假阳性（StreamCheckCtx 不设「凑够就提前返回」
+// 的快捷路径，老实读满 dur 整段时间，这个假阳性只会卡在远低于这个值的
+// 总量上）会被正确拦下来。
+const minStreamBytes = 48 * 1024
+
+// ProbeAnyStream 依次测一批线路（通常是同一个频道合并来的全部备用地址），
+// 只要有一条线路通过 ProbeStreamCtx 就立刻返回 true，不等剩下的线路测
+// 完——这跟真实播放器的行为一致：一条线播不出来会自动切下一条，只要有
+// 一条真能播，频道整体就该算「能播」，不该因为排在前面的某条线挂了就把
+// 整个频道打成「播不通」。
+func ProbeAnyStream(urls []string, dur time.Duration, maxLines int) bool {
+	return ProbeAnyStreamCtx(context.Background(), urls, dur, maxLines)
+}
+
+// ProbeAnyStreamCtx 与 ProbeAnyStream 相同，ctx 可取消。maxLines<=0 时不限制
+// 测试的线路数；合并之后个别频道线路数能到几十条，调用方可以传个上限
+// 防止极端情况下单个频道测试时间失控。
+func ProbeAnyStreamCtx(ctx context.Context, urls []string, dur time.Duration, maxLines int) bool {
+	n := len(urls)
+	if maxLines > 0 && n > maxLines {
+		n = maxLines
+	}
+	for i := 0; i < n; i++ {
+		if urls[i] == "" {
+			continue
+		}
+		if ProbeStreamCtx(ctx, urls[i], dur) {
+			return true
+		}
+	}
+	return false
+}
+
+// ProbeStream 跟轻量的 Probe 不一样：Probe 只看第一包的几 KB 像不像一个
+// 正常的流响应（给「检测」按钮、测速排行这类要求「秒出结果」的交互式场景
+// 用，详见 Probe 的注释），会把「manifest 能连上、但实际分片早就取不到、
+// 播放器里一直转圈」误判成能播。这个函数给背景扫描「可播频道」这种愿意
+// 多等一两秒换正确性的场景用：真的要求连续拉到至少一段时间（dur）的数据
+// 才算过关。
+//
+// 对 HLS（m3u8）特殊处理：manifest 本身通常只有几百字节到几 KB，直接拿
+// manifest 的 URL 去「连续读 dur」只会立刻 EOF、永远凑不够字节——必须先
+// 顺着它找到真正的媒体分片（master 播放列表再多跟一层子播放列表），实际
+// 验证的是分片 URL 的连续传输情况，而不是 manifest 本身传了多少字节。
+func ProbeStream(u string, dur time.Duration) bool {
+	return ProbeStreamCtx(context.Background(), u, dur)
+}
+
+// ProbeStreamCtx 与 ProbeStream 相同，ctx 可取消。
+func ProbeStreamCtx(ctx context.Context, u string, dur time.Duration) bool {
+	target, ok := resolveMediaTarget(ctx, u, 0)
+	if !ok {
+		return false
+	}
+	return httpc.StreamCheckCtx(ctx, target, dur, minStreamBytes)
+}
+
+// resolveMediaTarget 把一个直播地址解析成「真正要连续读的那个 URL」：不是
+// 播放列表就是它自己；是播放列表就顺着找到第一个媒体分片（最多跟 3 层，
+// master -> media -> 分片，防止格式异常的播放列表互相指来指去时无限递归）。
+func resolveMediaTarget(ctx context.Context, u string, hop int) (string, bool) {
+	if u == "" || hop > 3 {
+		return "", false
+	}
+	head, err := httpc.PeekCtx(ctx, u, 6*time.Second)
+	if err != nil || head == "" {
+		return "", false
+	}
+	if head == "#BIN" {
+		// 不是文本播放列表，直接当成媒体流本身。
+		return u, true
+	}
+	t := strings.ToLower(strings.TrimSpace(head))
+	if strings.HasPrefix(t, "<!doctype") || strings.HasPrefix(t, "<html") || strings.Contains(t, "<body") {
+		return "", false
+	}
+	if !strings.Contains(head, "#EXTM3U") {
+		// 不认识的文本响应，没法当播放列表解析；保守起见直接拿它自己当
+		// 媒体流试一次连续读——少数非标准直播源确实是裸流，只是响应头
+		// 报的 content-type 不规范，被 PeekCtx 判成了文本。
+		return u, true
+	}
+
+	// 是 m3u8：拿完整内容（不只是 4KB 头）才能找到第一条分片/子播放列表
+	// 地址——这类文件本来就很小（几百字节到几 KB 量级），整份拉下来代价
+	// 很低，不会拖慢多少。
+	full, err := httpc.TextCtx(ctx, u, nil, 8*time.Second)
+	if err != nil || full == "" {
+		return "", false
+	}
+	next := firstM3U8Ref(full)
+	if next == "" {
+		return "", false
+	}
+	abs := resolveURLRef(u, next)
+	if abs == "" {
+		return "", false
+	}
+	return resolveMediaTarget(ctx, abs, hop+1)
+}
+
+// firstM3U8Ref 找 m3u8 文本里第一条「要跟下去」的地址：master 播放列表
+// （带 #EXT-X-STREAM-INF）取紧跟其后的第一个子播放列表地址；媒体播放列表
+// （没有 #EXT-X-STREAM-INF）取第一条分片地址（第一行不以 # 开头的非空行）。
+func firstM3U8Ref(text string) string {
+	lines := strings.Split(strings.ReplaceAll(text, "\r\n", "\n"), "\n")
+	for i := 0; i < len(lines); i++ {
+		if !strings.HasPrefix(strings.TrimSpace(lines[i]), "#EXT-X-STREAM-INF") {
+			continue
+		}
+		for j := i + 1; j < len(lines); j++ {
+			next := strings.TrimSpace(lines[j])
+			if next == "" || strings.HasPrefix(next, "#") {
+				continue
+			}
+			return next
+		}
+	}
+	// 没有 STREAM-INF：当媒体播放列表处理，找第一条分片地址。
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		return line
+	}
+	return ""
+}
+
+func resolveURLRef(base, ref string) string {
+	b, err := url.Parse(base)
+	if err != nil {
+		return ""
+	}
+	r, err := url.Parse(ref)
+	if err != nil {
+		return ""
+	}
+	return b.ResolveReference(r).String()
 }
 
 // LineQuality 单条播放线路的轻量测速结果：只取开头 16KB，不下载真正的视频

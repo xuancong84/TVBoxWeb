@@ -1,9 +1,9 @@
 <script setup lang="ts">
-import { ref, computed, onMounted, watch } from 'vue'
+import { ref, computed, onMounted, onActivated, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { api, humanizeApiError } from '@/api'
 import { useAppStore } from '@/stores/app'
-import type { Site, Category, VodPage, FilterGroup } from '@/types'
+import type { Site, Category, VodPage, FilterGroup, Vod } from '@/types'
 import TopBar from '@/components/TopBar.vue'
 import VodGrid from '@/components/VodGrid.vue'
 import ErrorState from '@/components/ErrorState.vue'
@@ -21,6 +21,53 @@ const selectedParent = ref('')
 const selectedChild = ref('')
 const filters = ref<FilterGroup[]>([])
 const filterVals = ref<Record<string, string>>({})
+// 片名关键词筛选：站源片单动辄几万条，只在本地已加载的这一页（二三十
+// 条）里做字符串包含匹配基本搜不到东西，所以这其实是调用该站自己的搜索
+// 接口（跟首页多站搜索共用同一个后端 SearchCtx），只是把范围收窄到当前
+// 选中的这一个站。防抖 400ms 发请求，用 AbortController 让「还没回来的
+// 上一次搜索」不会在「这一次」之后才回来把结果覆盖掉。
+const keyword = ref('')
+const searchResults = ref<Vod[] | null>(null) // null = 没在搜；[] = 搜了但没结果
+const searching = ref(false)
+const searchErr = ref('')
+let searchTimer: ReturnType<typeof setTimeout> | undefined
+let searchAbort: AbortController | undefined
+
+const isSearching = computed(() => keyword.value.trim() !== '')
+const displayItems = computed(() => (isSearching.value ? searchResults.value || [] : page.value.items))
+
+function scheduleSiteSearch() {
+  clearTimeout(searchTimer)
+  searchAbort?.abort()
+  const kw = keyword.value.trim()
+  if (!kw) {
+    searchResults.value = null
+    searching.value = false
+    searchErr.value = ''
+    return
+  }
+  searchTimer = setTimeout(() => runSiteSearch(kw), 400)
+}
+
+async function runSiteSearch(kw: string) {
+  if (!siteKey.value) return
+  searchAbort = new AbortController()
+  searching.value = true
+  searchErr.value = ''
+  try {
+    searchResults.value = await api.vodSiteSearch(siteKey.value, kw, searchAbort.signal)
+  } catch (e: any) {
+    if (e?.name !== 'AbortError') {
+      searchErr.value = humanizeApiError(e)
+      searchResults.value = []
+    }
+  } finally {
+    searching.value = false
+  }
+}
+
+watch(keyword, scheduleSiteSearch)
+
 const loading = ref(false)
 // 分类列表单独一个 loading 标记，不能跟 loading 共用：分类和片单现在是并发
 // 拉取的，共用一个标记会出现「分类先回来就把 loading 置 false，片单其实
@@ -74,7 +121,20 @@ let restoring = true
 // 内容最多的站（sortedSites 已按数量降序、severity 升序排好，取第一个即可）。
 const LAST_SITE_KEY = 'yz_vod_last_site'
 
-onMounted(async () => {
+// 页面被 <keep-alive include="VodView"> 缓存住了（见 App.vue）：从详情页
+// 点「返回」回到这页时组件不会重新创建，只会重新 activate。这个函数在
+// 首次 onMounted、以及 onActivated 判定「不是单纯返回，而是带着新的
+// 站/分类从别处（比如首页分类入口）跳进来」时都会被调用一遍，所以每次
+// 进来都先清空筛选关键词/分类选中状态，再按本次 route.query 重新套一遍。
+async function init() {
+  selectedParent.value = ''
+  selectedChild.value = ''
+  filters.value = []
+  filterVals.value = {}
+  keyword.value = ''
+  searchResults.value = null
+  searching.value = false
+  searchErr.value = ''
   // 从 URL 恢复筛选/页码，返回列表时不会丢失状态
   curPage.value = Math.max(1, Number(route.query.page) || 1)
   if (route.query.f) {
@@ -83,7 +143,10 @@ onMounted(async () => {
   void loadHealth()
   const list = await api.sites()
   sites.value = list.filter((s) => s.usable)
-  if (!siteKey.value) {
+  const qSite = (route.query.site as string) || ''
+  if (qSite) {
+    siteKey.value = qSite
+  } else if (!siteKey.value) {
     let last = ''
     try { last = localStorage.getItem(LAST_SITE_KEY) || '' } catch { /* ignore */ }
     if (last && sites.value.some((s) => s.key === last)) {
@@ -94,8 +157,8 @@ onMounted(async () => {
   }
   if (siteKey.value) {
     if (route.query.tid) {
-      // 带着具体分类进来（比如从详情页返回）：分类/子分类归属要靠分类列表
-      // 才能分清楚，这一种必须等分类回来才能发起正确的片单请求。
+      // 带着具体分类进来：分类/子分类归属要靠分类列表才能分清楚，这一种
+      // 必须等分类回来才能发起正确的片单请求。
       await loadCategories()
       applyTidFromQuery()
     } else {
@@ -106,6 +169,31 @@ onMounted(async () => {
       load()
     }
   }
+}
+
+onMounted(async () => {
+  await init()
+  restoring = false
+})
+
+// 首次挂载时 onMounted 自己会调一次 init，紧跟着触发的第一次 onActivated
+// 要跳过，不然首次打开页面会多发一次重复请求（同 LiveView 的套路）。
+let skipNextActivate = true
+
+onActivated(async () => {
+  if (skipNextActivate) {
+    skipNextActivate = false
+    return
+  }
+  const qSite = (route.query.site as string) || ''
+  const qTid = (route.query.tid as string) || ''
+  // route.query 跟当前状态完全一致：就是从详情页点「返回」回到刚才浏览
+  // 的这同一个站/分类，筛选关键词和搜索结果原样留着，什么都不用做。
+  if (qSite === siteKey.value && qTid === currentTid()) return
+  // 否则是带着新的站/分类从别处（比如首页分类入口）跳进来，不是「返回」，
+  // 要整页重新初始化。
+  restoring = true
+  await init()
   restoring = false
 })
 
@@ -150,6 +238,9 @@ watch(siteKey, async () => {
   // 分类列表，两个并发着拉，不用等分类先回来。
   void loadCategories()
   load()
+  // 切到另一个站，筛选词还在的话要跟着换到新站重新搜，不然界面上明明
+  // 显示着关键词，结果却还是刚才那个站的。
+  if (isSearching.value) scheduleSiteSearch()
 })
 
 async function loadCategories() {
@@ -259,14 +350,18 @@ function parseFilters(ext: string, tid: string): FilterGroup[] {
 </script>
 
 <template>
-  <div class="page">
+  <div class="page page--fixed">
+    <div class="tab-head">
     <TopBar />
 
     <div class="vod-head">
       <div class="site-row">
         <span class="site-name">{{ currentSite?.name || '点播' }}</span>
-        <span v-if="page.total > 0" class="total-hint">共 {{ page.total.toLocaleString() }} 部</span>
-        <el-select v-model="siteKey" size="small" placeholder="换站" style="width: 200px">
+        <span v-if="isSearching" class="total-hint">
+          {{ searching ? '搜索中…' : `搜到 ${(searchResults || []).length} 部` }}
+        </span>
+        <span v-else-if="page.total > 0" class="total-hint">共 {{ page.total.toLocaleString() }} 部</span>
+        <el-select v-model="siteKey" placeholder="换站" style="width: 200px">
           <el-option v-for="s in sortedSites" :key="s.key" :label="s.name" :value="s.key" :class="{ 'opt-dead': s.count === 0 }">
             <span class="opt-health">
               <span class="health-dot" :style="{ background: HEALTH_COLOR[healthOf(s.key)] }"></span>
@@ -275,7 +370,8 @@ function parseFilters(ext: string, tid: string): FilterGroup[] {
             </span>
           </el-option>
         </el-select>
-        <el-button size="small" @click="refreshAll">刷新</el-button>
+        <el-button @click="refreshAll">刷新</el-button>
+        <el-input v-model="keyword" clearable placeholder="筛选片名" class="vod-filter" />
       </div>
 
       <!-- 父分类 -->
@@ -325,16 +421,20 @@ function parseFilters(ext: string, tid: string): FilterGroup[] {
         </span>
       </div>
     </div>
+    </div>
 
-    <div>
-      <ErrorState v-if="loadError" :message="loadError" @retry="load" />
-      <VodGrid v-else :vods="page.items" :loading="loading" />
-      <div v-if="!loading && !loadError && !page.items.length" class="vod-empty">
-        <p>暂无内容</p>
-        <p class="hint">可以切换分类或站源，或到「设置 → 订阅」重新导入</p>
+    <div class="tab-body">
+      <ErrorState v-if="isSearching ? searchErr : loadError" :message="isSearching ? searchErr : loadError" @retry="isSearching ? scheduleSiteSearch() : load()" />
+      <VodGrid v-else :vods="displayItems" :loading="isSearching ? searching : loading" />
+      <div v-if="!(isSearching ? searching : loading) && !(isSearching ? searchErr : loadError) && !displayItems.length" class="vod-empty">
+        <p v-if="isSearching">在「{{ currentSite?.name }}」没搜到片名含“{{ keyword }}”的内容</p>
+        <p v-else>暂无内容</p>
+        <p class="hint">
+          {{ isSearching ? '可以换个关键词，或切换站源再搜' : '可以切换分类或站源，或到「设置 → 订阅」重新导入' }}
+        </p>
       </div>
 
-      <div v-if="page.pageCount > 1" class="pager">
+      <div v-if="!isSearching && page.pageCount > 1" class="pager">
         <el-button size="small" :disabled="page.page <= 1" @click="goto(page.page - 1)">上一页</el-button>
         <span class="pager-info">{{ page.page }} / {{ page.pageCount }}</span>
         <el-button size="small" :disabled="page.page >= page.pageCount" @click="goto(page.page + 1)">下一页</el-button>
@@ -413,6 +513,8 @@ function parseFilters(ext: string, tid: string): FilterGroup[] {
   .cats .chip, .cats.sub .chip { flex-shrink: 0; }
   .pager { padding: 16px; gap: 12px; }
   .vod-total { font-size: 13px; }
+  /* 窄屏换行后不用 auto 外边距硬顶右边，否则换行后前面会空出一大截 */
+  .vod-filter { margin-left: 0; width: 100%; }
 }
 .opt-health {
   display: flex;
@@ -431,4 +533,26 @@ function parseFilters(ext: string, tid: string): FilterGroup[] {
   color: var(--dim);
 }
 .opt-dead { opacity: 0.6; }
+
+/* 筛选片名输入框去掉 size="small" 后用的是默认尺寸——字号跟随项目
+   整体放大过的 --el-font-size-base，高度跟 --el-component-size(38px)
+   走，是三者里最高的那个。换站下拉框和刷新按钮的高度在 Element Plus
+   编译后的 CSS 里是写死的像素值（不吃 --el-component-size 这个变量），
+   字号也不是按 size 走 var(--el-font-size-base)，所以即使同样去掉
+   size="small" 也凑不齐——这里直接显式把它们的字号/高度焊死成跟筛选框
+   一致，不依赖 size 属性本身的默认值。 */
+.site-row :deep(.el-select .el-select__wrapper) {
+  font-size: var(--el-font-size-base);
+  min-height: 38px;
+}
+.site-row .el-button {
+  font-size: var(--el-font-size-base);
+  height: 38px;
+}
+/* 筛选框挪到最右：其余控件仍按原顺序从左排起，筛选框自己用 auto
+   外边距顶到这一行的最右端，跟它们之间空出间隔而不是紧挨着。 */
+.vod-filter {
+  width: 180px;
+  margin-left: auto;
+}
 </style>

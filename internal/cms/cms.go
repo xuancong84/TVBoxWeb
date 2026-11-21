@@ -3,10 +3,16 @@
 package cms
 
 import (
+	"bytes"
+	"compress/gzip"
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
+	"log"
 	"net/url"
+	"os"
+	"path/filepath"
 	"regexp"
 	"sort"
 	"strconv"
@@ -20,34 +26,57 @@ import (
 
 // ---------- 响应缓存 ----------
 
+// cmHit 字段导出（而非原来的小写私有字段）是为了能被 json.Marshal 落盘——
+// 见下面「磁盘持久化」一节。
 type cmHit struct {
-	key  string
-	body string
-	at   time.Time
+	Key  string    `json:"key"`
+	Body string    `json:"body"`
+	At   time.Time `json:"at"`
 }
 
 const (
-	hitMax    = 30
-	hitChars  = 3000000
-	ttlCat    = 300 * time.Second
-	ttlList   = 90 * time.Second
-	ttlDetail = 600 * time.Second
+	// hitMax/hitChars：缓存条数/总字节上限。以前只按「最近几分钟」的量
+	// 留了 30 条、3MB，够用；现在默认缓存一整天，同一天里会被真正摸到
+	// 的站源/分类/分页/搜索关键词组合远不止 30 个，上限太小的话缓存刚
+	// 存进去就被挤掉，等于形同虚设——按一天的使用量放宽到 5000 条、
+	// 80MB（对树莓派这种设备也完全不算事）。
+	hitMax   = 5000
+	hitChars = 80 * 1000 * 1000
+	// ttlDefault 点播源/单仓源的分类、片单、搜索这三类「拉全量列表」的
+	// 请求默认缓存一天——这几类是最容易被频繁触发的（翻页、切分类、
+	// 敲关键词搜索），之前只缓存几十秒到几分钟，相当于没怎么缓存，
+	// 站源那边看到的是「同一个 IP 短时间内一直在高频扫全站」，正是最
+	// 容易被封的访问模式。
+	ttlDefault = 24 * time.Hour
+	ttlCat     = ttlDefault
+	ttlList    = ttlDefault
+	// ttlDetail 详情接口单独给一个短得多的缓存期：它是唯一一个响应里带
+	// 的播放地址（PlayURL）真的会被拿去播放的接口（片单/搜索里附带的
+	// playUrl 只用来在卡片上数集数，从不会被直接播放——点播放一定会重新
+	// 走一次详情接口），不少站源的播放地址又是带签名/时效的，缓存太久
+	// 会把已经失效的播放地址发给用户，表现成「点了播不出来」。详情接口
+	// 本身也是「点开这一部才会拉一次」，不是翻页那种高频扫描，被封的风险
+	// 小得多，所以这里没有跟着默认值走到一天，留一小时做个折中。
+	ttlDetail = time.Hour
 )
 
 var (
-	cacheMu sync.Mutex
-	hits    []cmHit
+	cacheMu    sync.Mutex
+	hits       []cmHit
+	cacheDirty bool
+	cachePath  string
 )
 
 func hit(url string, ttl time.Duration) string {
 	cacheMu.Lock()
 	defer cacheMu.Unlock()
 	for i := range hits {
-		if hits[i].key == url {
-			if time.Since(hits[i].at) <= ttl {
-				return hits[i].body
+		if hits[i].Key == url {
+			if time.Since(hits[i].At) <= ttl {
+				return hits[i].Body
 			}
 			hits = append(hits[:i], hits[i+1:]...)
+			cacheDirty = true
 			return ""
 		}
 	}
@@ -60,9 +89,10 @@ func keep(url, body string) {
 	}
 	cacheMu.Lock()
 	defer cacheMu.Unlock()
-	e := cmHit{key: url, body: body, at: time.Now()}
+	e := cmHit{Key: url, Body: body, At: time.Now()}
+	cacheDirty = true
 	for i := range hits {
-		if hits[i].key == url {
+		if hits[i].Key == url {
 			hits[i] = e
 			return
 		}
@@ -73,19 +103,124 @@ func keep(url, body string) {
 	}
 	total := 0
 	for _, h := range hits {
-		total += len(h.body)
+		total += len(h.Body)
 	}
 	for total > hitChars && len(hits) > 1 {
-		total -= len(hits[0].body)
+		total -= len(hits[0].Body)
 		hits = hits[1:]
 	}
 }
 
-// ClearCache 用户换了配置/站源后主动清空。
+// ClearCache 用户换了配置/站源后主动清空。立即落盘（而不是等下一次定时
+// flush），避免「清空后进程还没来得及 flush 就被杀掉」时，磁盘上那份
+// 清空前的旧缓存在下次启动时被重新加载回来，等于白清。
 func ClearCache() {
 	cacheMu.Lock()
 	hits = nil
+	cacheDirty = true
 	cacheMu.Unlock()
+	FlushDiskCache()
+}
+
+// ---------- 磁盘持久化 ----------
+//
+// hits 原来只存在内存里：进程一重启（哪怕只是换个小版本重新部署），当天
+// 已经攒下来的分类/片单/搜索缓存就全部清零，对每个站源，重启后第一次被
+// 用户摸到都要重新联网拉一次——分类列表这种几乎不会变的数据尤其可惜。
+// 这里把它落盘一份，跟站源抓取缓存（sitecrawl_cache）放在同一个 data
+// 目录、同样用 gzip 压缩（JSON 高度重复，压缩比很高）。是否过期完全
+// 复用 hit() 里已有的 ttl 比较，不需要在落盘结构里额外记一份 ttl。
+const cacheFileName = "cms_cache.json.gz"
+
+// InitDiskCache 在 store.Init 之后调用一次，加载磁盘上的响应缓存。
+// 文件不存在/损坏都当成「空缓存」处理，不影响正常启动。
+func InitDiskCache(dataDir string) {
+	cacheMu.Lock()
+	cachePath = filepath.Join(dataDir, cacheFileName)
+	cacheMu.Unlock()
+
+	f, err := os.Open(cachePath)
+	if err != nil {
+		return
+	}
+	defer f.Close()
+	gr, err := gzip.NewReader(f)
+	if err != nil {
+		log.Printf("[cms] 响应缓存损坏，忽略（将重新抓取）: %v", err)
+		return
+	}
+	defer gr.Close()
+	b, err := io.ReadAll(gr)
+	if err != nil {
+		log.Printf("[cms] 读取响应缓存失败: %v", err)
+		return
+	}
+	var loaded []cmHit
+	if err := json.Unmarshal(b, &loaded); err != nil {
+		log.Printf("[cms] 解析响应缓存失败: %v", err)
+		return
+	}
+	cacheMu.Lock()
+	hits = loaded
+	cacheMu.Unlock()
+}
+
+// FlushDiskCache 把响应缓存压缩落盘；没有脏数据/尚未初始化路径时直接跳过。
+// 由定时器周期调用（见 tvbox.go），不等到进程退出才存——树莓派这类设备
+// 随时可能断电，不是每次都能走到优雅关闭。
+func FlushDiskCache() {
+	cacheMu.Lock()
+	if !cacheDirty || cachePath == "" {
+		cacheMu.Unlock()
+		return
+	}
+	snapshot := make([]cmHit, len(hits))
+	copy(snapshot, hits)
+	cacheDirty = false
+	path := cachePath
+	cacheMu.Unlock()
+
+	b, err := json.Marshal(snapshot)
+	if err != nil {
+		log.Printf("[cms] 响应缓存序列化失败: %v", err)
+		return
+	}
+	var buf bytes.Buffer
+	gw := gzip.NewWriter(&buf)
+	if _, err := gw.Write(b); err != nil {
+		log.Printf("[cms] 响应缓存压缩失败: %v", err)
+		return
+	}
+	if err := gw.Close(); err != nil {
+		log.Printf("[cms] 响应缓存压缩失败: %v", err)
+		return
+	}
+	if err := atomicWriteCache(path, buf.Bytes()); err != nil {
+		log.Printf("[cms] 响应缓存落盘失败: %v", err)
+	}
+}
+
+// atomicWriteCache 写临时文件后原子 rename；缓存本身可丢弃（丢了大不了
+// 重新抓一遍），不需要 store 包那份 atomicWrite 额外维护的 .bak 备份。
+func atomicWriteCache(dst string, b []byte) error {
+	dir := filepath.Dir(dst)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return err
+	}
+	tmp, err := os.CreateTemp(dir, ".cms-cache-*.tmp")
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+	defer os.Remove(tmpName)
+	if _, err := tmp.Write(b); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	return os.Rename(tmpName, dst)
 }
 
 // ---------- CMS 客户端 ----------
@@ -162,7 +297,7 @@ func (c *Cms) CategoriesCtx(ctx context.Context) ([]model.Category, error) {
 	for _, cl := range root.CatList {
 		cat := model.Category{
 			ID:   strconv.Itoa(int(cl.TypeID)),
-			Name: s(cl.TypeName),
+			Name: unescapeEntities(s(cl.TypeName)),
 		}
 		if cl.TypePid > 0 {
 			cat.PID = strconv.Itoa(int(cl.TypePid))
@@ -175,7 +310,7 @@ func (c *Cms) CategoriesCtx(ctx context.Context) ([]model.Category, error) {
 		seen := map[string]bool{}
 		for _, it := range root.List {
 			tid := strconv.Itoa(int(it.Tid))
-			tn := s(it.TypeName)
+			tn := unescapeEntities(s(it.TypeName))
 			if tid != "" && tn != "" && !seen[tid] {
 				seen[tid] = true
 				out = append(out, model.Category{ID: tid, Name: tn})
@@ -295,16 +430,20 @@ func (c *Cms) Search(kw string) []model.Vod {
 
 // SearchCtx 与 Search 相同，ctx 可取消（第一级被取消后不再发起第二级请求）。
 func (c *Cms) SearchCtx(ctx context.Context, kw string) []model.Vod {
+	// 搜索本质上也是在拉 ac=videolist（只是多个 wd= 关键词过滤），跟片单
+	// 翻页是同一类「全量列表」请求，一样要缓存，不能因为它走的是另一个
+	// 方法就被漏掉——首页多站搜索一敲关键词就是几十个站并发打一轮，不缓存
+	// 的话是这里面风险最大的一类。
 	e := urlEncode(kw)
 	var items []model.Vod
-	if txt, err := httpc.TextCtx(ctx, c.u("ac=videolist&wd="+e), nil, 12*time.Second); err == nil {
+	if txt, err := fetchCtx(ctx, c.u("ac=videolist&wd="+e), ttlList, 12*time.Second); err == nil {
 		items = c.pickList(txt)
 	}
 	if len(items) == 0 {
 		if ctx.Err() != nil {
 			return items
 		}
-		if txt2, err := httpc.TextCtx(ctx, c.u("wd="+e), nil, 12*time.Second); err == nil {
+		if txt2, err := fetchCtx(ctx, c.u("wd="+e), ttlList, 12*time.Second); err == nil {
 			items = c.pickList(txt2)
 		}
 	}
@@ -328,18 +467,23 @@ func (c *Cms) pickList(txt string) []model.Vod {
 }
 
 func (c *Cms) toVod(j model.JVod) model.Vod {
+	// JSON 站源的这些文本字段很多直接是 CMS 后台里存的 HTML 转义文本（跟
+	// XML 协议共用同一份库），不像标签那样需要清理，但 & 等实体要解码，
+	// 不然标题里带 & 的片子会在界面上显示成「WELSH &amp; SHEDAR」这种
+	// 没解码的样子。XML 协议那边 node()/text() 走的 plain() 已经做了这步，
+	// 这里补齐到 JSON 协议上。
 	v := model.Vod{
 		ID:       strconv.Itoa(int(j.VodID)),
-		Name:     s(j.VodName),
-		Pic:      s(j.VodPic),
-		Remark:   s(j.VodRemarks),
+		Name:     unescapeEntities(s(j.VodName)),
+		Pic:      unescapeEntities(s(j.VodPic)),
+		Remark:   unescapeEntities(s(j.VodRemarks)),
 		Year:     s(j.VodYear),
-		Area:     s(j.VodArea),
-		Actor:    s(j.VodActor),
-		Director: s(j.VodDirector),
-		TypeName: s(j.TypeName),
-		From:     s(j.VodPlayFrom),
-		PlayURL:  s(j.VodPlayURL),
+		Area:     unescapeEntities(s(j.VodArea)),
+		Actor:    unescapeEntities(s(j.VodActor)),
+		Director: unescapeEntities(s(j.VodDirector)),
+		TypeName: unescapeEntities(s(j.TypeName)),
+		From:     unescapeEntities(s(j.VodPlayFrom)),
+		PlayURL:  unescapeEntities(s(j.VodPlayURL)),
 		SiteKey:  c.site.Key,
 		SiteName: c.site.Name,
 	}
@@ -464,12 +608,13 @@ var (
 	reNewline = regexp.MustCompile(`\n{3,}`)
 )
 
-// plain HTML 实体 + 标签清理，用于简介。
-func plain(s0 string) string {
-	r := reBr.ReplaceAllString(s0, "\n")
-	r = reP.ReplaceAllString(r, "\n")
-	r = reTag.ReplaceAllString(r, "")
-	r = reEntity.ReplaceAllStringFunc(r, func(m string) string {
+// unescapeEntities 只做 HTML/XML 实体解码，不碰标签——用于不需要去标签的
+// 字段（片名、演员、分类名等）。plain() 在这基础上再加标签清理，给简介用。
+func unescapeEntities(s string) string {
+	if !strings.ContainsRune(s, '&') {
+		return s
+	}
+	return reEntity.ReplaceAllStringFunc(s, func(m string) string {
 		switch m {
 		case "&lt;":
 			return "<"
@@ -486,6 +631,14 @@ func plain(s0 string) string {
 		}
 		return m
 	})
+}
+
+// plain HTML 实体 + 标签清理，用于简介。
+func plain(s0 string) string {
+	r := reBr.ReplaceAllString(s0, "\n")
+	r = reP.ReplaceAllString(r, "\n")
+	r = reTag.ReplaceAllString(r, "")
+	r = unescapeEntities(r)
 	r = reNewline.ReplaceAllString(r, "\n\n")
 	return strings.TrimSpace(r)
 }
@@ -538,6 +691,29 @@ func catFromXML(xml string) []model.Category {
 	return out
 }
 
+// parseDD 从一个 <video> 块里取出所有 <dd flag="...">线路内容</dd>，拼成
+// SplitLines 认的 From/PlayURL 格式。detail 和 list 两个接口的 <video>
+// 块结构是一样的，很多站的 list 接口其实也会把播放地址带出来（不是只有
+// detail 才有），之前 listFromXML 没取，片单卡片上就一直算不出总集数。
+func parseDD(b string) (from, playURL string) {
+	var flags, urls []string
+	ddRe := regexp.MustCompile(`(?is)<dd\b[^>]*\bflag="([^"]*)"[^>]*>(.*?)</dd>`)
+	for _, m := range ddRe.FindAllStringSubmatch(b, -1) {
+		flags = append(flags, m[1])
+		urls = append(urls, text(m[2]))
+	}
+	if len(flags) == 0 {
+		ddRe2 := regexp.MustCompile(`(?is)<dd\b[^>]*>(.*?)</dd>`)
+		n := 1
+		for _, m := range ddRe2.FindAllStringSubmatch(b, -1) {
+			flags = append(flags, "线路"+strconv.Itoa(n))
+			urls = append(urls, text(m[1]))
+			n++
+		}
+	}
+	return strings.Join(flags, "$$$"), strings.Join(urls, "$$$")
+}
+
 func listFromXML(xml string, page int, site model.Site) model.VodPage {
 	pg := model.VodPage{Page: page}
 	if head := regexp.MustCompile(`(?i)<list\b[^>]*>`).FindString(xml); head != "" {
@@ -558,6 +734,7 @@ func listFromXML(xml string, page int, site model.Site) model.VodPage {
 			Name:     node(b, "name"),
 			Pic:      node(b, "pic"),
 			TypeName: node(b, "type"),
+			Year:     node(b, "year"),
 			SiteKey:  site.Key,
 			SiteName: site.Name,
 		}
@@ -566,6 +743,7 @@ func listFromXML(xml string, page int, site model.Site) model.VodPage {
 		} else {
 			v.Remark = node(b, "dt")
 		}
+		v.From, v.PlayURL = parseDD(b)
 		if v.Name != "" {
 			pg.Items = append(pg.Items, v)
 		}
@@ -597,23 +775,7 @@ func detailFromXML(xml string, site model.Site, id string) (model.Vod, error) {
 	if v.ID == "" {
 		v.ID = id
 	}
-	var flags, urls []string
-	ddRe := regexp.MustCompile(`(?is)<dd\b[^>]*\bflag="([^"]*)"[^>]*>(.*?)</dd>`)
-	for _, m := range ddRe.FindAllStringSubmatch(b, -1) {
-		flags = append(flags, m[1])
-		urls = append(urls, text(m[2]))
-	}
-	if len(flags) == 0 {
-		ddRe2 := regexp.MustCompile(`(?is)<dd\b[^>]*>(.*?)</dd>`)
-		n := 1
-		for _, m := range ddRe2.FindAllStringSubmatch(b, -1) {
-			flags = append(flags, "线路"+strconv.Itoa(n))
-			urls = append(urls, text(m[1]))
-			n++
-		}
-	}
-	v.From = strings.Join(flags, "$$$")
-	v.PlayURL = strings.Join(urls, "$$$")
+	v.From, v.PlayURL = parseDD(b)
 	return v, nil
 }
 
@@ -659,6 +821,19 @@ func SplitLines(from, playURL string) []model.Line {
 		}
 	}
 	return out
+}
+
+// EpCount 总集数：取各线路里集数最多的那条（线路之间偶尔有抓取失败、
+// 集数对不齐的情况，取最全的那条更接近真实总集数）。给首页卡片这类
+// 只想存一个数、不想存整份 From/PlayURL 的场景用。
+func EpCount(from, playURL string) int {
+	max := 0
+	for _, ln := range SplitLines(from, playURL) {
+		if n := len(ln.Eps); n > max {
+			max = n
+		}
+	}
+	return max
 }
 
 func IsDirect(u string) bool {

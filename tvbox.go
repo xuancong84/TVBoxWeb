@@ -33,6 +33,7 @@ import (
 	"time"
 
 	"github.com/xxl6097/TVBoxWeb/internal/api"
+	"github.com/xxl6097/TVBoxWeb/internal/cms"
 	"github.com/xxl6097/TVBoxWeb/internal/crawler"
 	"github.com/xxl6097/TVBoxWeb/internal/store"
 	"github.com/xxl6097/TVBoxWeb/internal/upgrade"
@@ -237,6 +238,7 @@ func New(opts ...Option) (*Server, error) {
 	}
 	store.InitSiteCrawlCache(o.DataDir)
 	store.InitLiveCrawlCache(o.DataDir)
+	cms.InitDiskCache(o.DataDir)
 
 	// 启动时恢复缓存站点列表
 	if store.TotalSites() == 0 {
@@ -262,12 +264,30 @@ func New(opts ...Option) (*Server, error) {
 }
 
 // mountStatic 挂载内嵌前端静态资源到根路径。
+//
+// go:embed 出来的文件 mtime 是编译时刻（同一个二进制里全部文件都一样），
+// 跟真实的"这份内容多久没变过"毫无关系；http.FileServer 默认只靠
+// Last-Modified 做启发式缓存，浏览器可能照着这个编译时间久不久直接把
+// index.html 这类"每次发布都要换新内容"的文件缓存很久，导致发完新版本、
+// 用户点普通刷新（非强制刷新）却还停在旧页面/旧资源上——每次发版都要
+// 手动改 sw.js 里的版本号正是为了绕开这一点。这里显式按路径分两类：
+// index.html/根路径/sw.js 这些"内容会变但 URL 不变"的必须每次都回源校验
+// （no-cache：允许缓存但强制带条件请求去问服务器"你这份新不新"），带
+// hash 文件名的 /assets/* 内容不变 URL 就不变，可以放心长期强缓存。
 func (s *Server) mountStatic() error {
 	sub, err := fs.Sub(distFS, "dist")
 	if err != nil {
 		return fmt.Errorf("tvbox: 内嵌前端资源不可用: %w", err)
 	}
-	s.mux.Handle("/", http.FileServer(http.FS(sub)))
+	fileServer := http.FileServer(http.FS(sub))
+	s.mux.Handle("/", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasPrefix(r.URL.Path, "/assets/") {
+			w.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
+		} else {
+			w.Header().Set("Cache-Control", "no-cache")
+		}
+		fileServer.ServeHTTP(w, r)
+	}))
 	return nil
 }
 
@@ -333,6 +353,29 @@ func (s *Server) startScheduler() {
 			}
 		}
 	}()
+	s.startCacheFlusher()
+	api.StartLiveScan()
+}
+
+// startCacheFlusher 定期把 cms 的分类/片单/搜索响应缓存落盘，不等到进程
+// 优雅退出才存——树莓派这类设备随时可能直接断电。10 分钟一次：既能让
+// 一天里绝大部分已经抓到的缓存扛得住中途重启，又不会把 SD 卡写得太勤。
+// 退出时的最后一次 flush 不靠这里的 goroutine 去抢时间点——main() 一看到
+// ListenAndServe 返回就直接退出，不会等任何后台 goroutine 把 s.stop 关闭
+// 的事件处理完，那样会竞态漏掉最后一批缓存——而是放在 Close() 里同步做。
+func (s *Server) startCacheFlusher() {
+	go func() {
+		t := time.NewTicker(10 * time.Minute)
+		defer t.Stop()
+		for {
+			select {
+			case <-t.C:
+				cms.FlushDiskCache()
+			case <-s.stop:
+				return
+			}
+		}
+	}()
 }
 
 // Close 释放资源（停止调度器、关闭 WebSocket Hub）。幂等，可重复调用。
@@ -342,6 +385,9 @@ func (s *Server) Close() error {
 			close(s.stop)
 		}
 		ws.Shutdown()
+		// 同步落盘最后一批响应缓存：main() 看到 ListenAndServe 返回就
+		// 直接退出，不会等后台 goroutine 把 s.stop 关闭事件处理完。
+		cms.FlushDiskCache()
 	})
 	return nil
 }

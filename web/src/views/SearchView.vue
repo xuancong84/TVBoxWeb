@@ -246,7 +246,8 @@ function onInput() {
 </script>
 
 <template>
-  <div class="page">
+  <div class="page page--fixed">
+    <div class="tab-head">
     <TopBar />
     <div class="search-box">
       <el-input
@@ -267,7 +268,9 @@ function onInput() {
         检测到字母输入，将按「拼音首字母」匹配，如 sgyy → 三国演义
       </div>
     </div>
+    </div>
 
+    <div class="tab-body">
     <!-- 猜你想搜 -->
     <div v-if="sugg.length && !searched" class="sugg-box">
       <div class="kw-head">猜你想搜</div>
@@ -324,6 +327,7 @@ function onInput() {
         </div>
       </div>
       <div v-else-if="searchFinished" class="empty">没有搜到结果（站源可能已失效，或需要爬虫运行时）</div>
+    </div>
     </div>
   </div>
 </template>

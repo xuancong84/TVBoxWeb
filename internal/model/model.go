@@ -176,6 +176,12 @@ type Vod struct {
 	PlayURL  string `json:"playUrl"`
 	SiteKey  string `json:"siteKey"`
 	SiteName string `json:"siteName"`
+	// EpCount 总集数：首页「最近更新」这类卡片为了省存储，落盘时把
+	// From/PlayURL 这两个大字段扔掉了（见 crawler.go），但总集数这个
+	// 小整数留着，卡片上「(共N集)」就算没有 playUrl 也能显示。真正带
+	// 了 From/PlayURL 的场景（点播/搜索）前端会直接现算，比这个快照
+	// 更准，不依赖这个字段。
+	EpCount int `json:"epCount,omitempty"`
 }
 
 type Episode struct {
@@ -223,9 +229,11 @@ type Channel struct {
 	Logo  string   `json:"logo"`
 	Group string   `json:"group"`
 	URLs  []string `json:"urls"`
-	// Status 这个频道「真实播放过」的结果：ok=播过且能播，fail=播过但播不出来，
-	// 空="没播过/不知道"。服务端持久化，不随时间过期，只会被下一次真实播放
-	// 结果覆盖。只在 /api/live/channels 响应里现查现填，不参与站源合并/去重。
+	// Status 这个频道最近一次「测试」（真实播放 或 后台可播性扫描）的结果：
+	// ok=能播，fail=播不出来，空="没测过/不知道"。服务端持久化；ok 永久
+	// 有效，fail 超过 store.ChannelFailMaxAge（24 小时）会被当成「没测过」
+	// 重新验证（见 store.GetChannelStatus）。只在 /api/live/channels 响应里
+	// 现查现填，不参与站源合并/去重。
 	Status string `json:"status,omitempty"`
 }
 

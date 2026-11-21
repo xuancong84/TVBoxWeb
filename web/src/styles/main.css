@@ -191,6 +191,37 @@ html.dark {
   padding-bottom: 28px;
 }
 
+/* ===== 固定头部 + 内容区自行滚动（8 个导航 Tab 共用）=====
+   以前每个 Tab 都是整个文档一起滚——顶部横幅、筛选/分类/侧栏这些「操作
+   面板」滚两下就被滚没影了，想换分类/搜别的还得先滚回顶部。现在把每个
+   Tab 拆成 .tab-head（顶部横幅 + 这个 Tab 自己该固定的那部分，比如点播
+   的站源/分类/筛选行、直播的标题栏、设置/收藏的左侧导航等——具体留哪
+   些由各 Tab 自己判断）+ .tab-body（真正会变长的内容：网格/列表/频道），
+   只有 .tab-body 可以滚，.tab-head 永远留在原地。
+   用 .page--fixed 做开关（加在原来的 .page 上），没加这个修饰类的页面
+   （详情页、播放页等）还是走原来整页滚动的样子，不受影响。 */
+.page.page--fixed {
+  height: 100vh;
+  height: 100dvh; /* 移动端地址栏收起/展开时，视口高度用动态值更准确 */
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+  padding-bottom: 0;
+}
+.tab-head {
+  flex-shrink: 0;
+}
+.tab-body {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+}
+/* 左右分栏类 Tab（收藏/设置/直播）：这一层本身不滚，交给里面各自的
+   侧栏/主内容区自己滚——那两列可以滚得不一样快，不能当一个整体滚。 */
+.tab-body.tab-body--split {
+  overflow: hidden;
+}
+
 /* 海报卡片网格 */
 .vod-grid {
   display: grid;

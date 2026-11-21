@@ -57,6 +57,10 @@ export interface Vod {
   playUrl: string
   siteKey: string
   siteName: string
+  // 总集数快照：首页「最近更新」这类卡片没有 from/playUrl（落盘前就被
+  // 砍掉了，省存储），后端会顺手存一个总集数算好的整数；有 playUrl 的
+  // 地方（点播/搜索）不用这个字段，前端直接现算更准。
+  epCount?: number
 }
 
 export interface Episode {
@@ -95,8 +99,17 @@ export interface Channel {
   logo: string
   group: string
   urls: string[]
-  /** 这个频道真实播放过的结果：'ok'=播过且能播，'fail'=播过但播不出来，不带=没播过 */
+  /** 最近一次测试结果（真实播放 或 后台可播性扫描）：'ok'=能播，'fail'=播不通
+   *（24 小时后过期需重测），不带=没测过/已过期 */
   status?: 'ok' | 'fail'
+}
+
+/** 「可播频道」分类的后台扫描进度（GET /api/live/scan/status） */
+export interface LiveScanStatus {
+  total: number
+  scanned: number
+  playable: number
+  scanning: boolean
 }
 
 export interface ChannelGroup {
@@ -139,6 +152,8 @@ export interface HistItem {
   pic: string
   epName: string
   epIndex: number
+  // 这部剧总集数：播放页现查现填（player.eps.length）；0/未知时不显示。
+  epCount?: number
   from: string
   pos: number
   dur: number

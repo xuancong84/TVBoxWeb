@@ -113,6 +113,7 @@ func Handler() *http.ServeMux {
 	mux.HandleFunc("/api/categories", hCategories)
 	mux.HandleFunc("/api/vod", hVod)
 	mux.HandleFunc("/api/vod/detail", hVodDetail)
+	mux.HandleFunc("/api/vod/search", hVodSiteSearch)
 	mux.HandleFunc("/api/search", hSearch)
 	mux.HandleFunc("/api/search/start", hSearchStart)
 	mux.HandleFunc("/api/search/poll", hSearchPoll)
@@ -142,6 +143,10 @@ func Handler() *http.ServeMux {
 	mux.HandleFunc("/api/live/sources", hLiveSources)
 	mux.HandleFunc("/api/live/sources/enabled", hLiveSourcesEnabled)
 	mux.HandleFunc("/api/live/channel-status", hLiveChannelStatus)
+	mux.HandleFunc("/api/live/channel-status/remove", hLiveChannelStatusRemove)
+	mux.HandleFunc("/api/live/scan/reset", hLiveScanReset)
+	mux.HandleFunc("/api/live/scan/status", hLiveScanStatus)
+	mux.HandleFunc("/api/live/playable", hLivePlayable)
 	mux.HandleFunc("/api/live/channels", hLiveChannels)
 	mux.HandleFunc("/api/live/favs", hLiveFavs)
 	mux.HandleFunc("/api/live/epg", hLiveEpg)
@@ -944,6 +949,30 @@ func hVodDetail(w http.ResponseWriter, r *http.Request) {
 	ok(w, v)
 }
 
+// hVodSiteSearch 点播 tab 的「筛选片名」：只在当前选中的这一个站源内搜，
+// 走站源自己的搜索接口（跟多站搜索共用同一个 SearchCtx），不是只在已经
+// 加载到本地的这一页里做字符串包含匹配——站源的片单通常有成千上万条，
+// 只在当前这一页（二三十条）里过滤基本搜不到东西。
+func hVodSiteSearch(w http.ResponseWriter, r *http.Request) {
+	siteKey := q(r, "site")
+	site := store.Site(siteKey)
+	if site == nil {
+		fail(w, 400, "站源不存在")
+		return
+	}
+	kw := strings.TrimSpace(q(r, "kw"))
+	if kw == "" {
+		ok(w, []model.Vod{})
+		return
+	}
+	c := cms.New(*site)
+	t0 := time.Now()
+	list := c.SearchCtx(r.Context(), kw)
+	ms := int(time.Since(t0).Milliseconds())
+	store.RecordSiteRequest(siteKey, true, ms)
+	ok(w, list)
+}
+
 // hSearch 多站并发搜索（每批 6，最多 18 站，单站失败不影响整体）。
 func hSearch(w http.ResponseWriter, r *http.Request) {
 	kw := q(r, "kw")
@@ -1453,7 +1482,20 @@ func hLiveChannels(w http.ResponseWriter, r *http.Request) {
 	groups, errs := live.Channels(sources, force)
 	groups = postProcessLive(groups)
 	root := live.BuildTree(groups)
-	ok(w, map[string]any{"root": root, "groups": groups, "sources": len(sources), "errs": errs})
+	resp := map[string]any{"root": root, "sources": len(sources), "errs": errs}
+	// 不再在响应里重复带一份「groups」：root 树里已经包含了全部频道
+	// （分组目录的叶子节点），前端也从来没用过这份多出来的拍平列表——
+	// 这个接口本来就要把十几万条频道序列化下发，不必再平白无故翻倍。
+	//
+	// 短 max-age：这份结果本来就已经是 live.Channels 内部 mergeCacheTTL
+	// 缓存过的「不保证是这一秒最新」的快照，浏览器在这几秒内重复请求
+	// （比如切回直播页触发的静默刷新）直接吃 HTTP 缓存，不用再传一遍
+	// 几十 MB。force=refresh 时不设缓存头，保证「刷新」按钮永远拿到新结果。
+	if force {
+		ok(w, resp)
+		return
+	}
+	writeJSONWithCache(w, 200, resp, 15, "")
 }
 
 // postProcessLive 统一排序 + （按用户设置）过滤脏数据，merge 后的原始缓存
@@ -1665,14 +1707,15 @@ func hPrefs(w http.ResponseWriter, r *http.Request) {
 			"introSkip": store.IntroSkipSec(),
 			"outroSkip": store.OutroSkipSec(),
 			// 当前这部剧实际生效的值，以及它是否有单独设置
-			"curIntroSkip": curSkip.Intro,
-			"curOutroSkip": curSkip.Outro,
-			"skipOwn":      ownSkip,
-			"skipScoped":   hasSkipScope,
-			"tapSound":       store.TapSound(),
-			"tapVibrate":     store.TapVibrate(),
-			"skipCfgCount":   store.SkipCfgCount(),
-			"liveJunkFilter": store.LiveJunkFilterOn(),
+			"curIntroSkip":    curSkip.Intro,
+			"curOutroSkip":    curSkip.Outro,
+			"skipOwn":         ownSkip,
+			"skipScoped":      hasSkipScope,
+			"tapSound":        store.TapSound(),
+			"tapVibrate":      store.TapVibrate(),
+			"skipCfgCount":    store.SkipCfgCount(),
+			"liveJunkFilter":  store.LiveJunkFilterOn(),
+			"liveScanEnabled": store.LiveScanEnabled(),
 		})
 	case http.MethodPost:
 		var req map[string]any
@@ -1732,6 +1775,11 @@ func hPrefs(w http.ResponseWriter, r *http.Request) {
 		if v, ok := req["liveJunkFilter"]; ok {
 			if b, ok2 := v.(bool); ok2 {
 				store.SetLiveJunkFilterOn(b)
+			}
+		}
+		if v, ok := req["liveScanEnabled"]; ok {
+			if b, ok2 := v.(bool); ok2 {
+				store.SetLiveScanEnabled(b)
 			}
 		}
 		// EPG 地址可能指向内网 NAS，变了就刷新可信域名

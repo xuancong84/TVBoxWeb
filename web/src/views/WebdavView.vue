@@ -519,7 +519,8 @@ function back() {
 </script>
 
 <template>
-  <div class="page">
+  <div class="page page--fixed">
+    <div class="tab-head">
     <TopBar />
     <div class="wd-head">
       <span class="back" @click="back">‹ 返回</span>
@@ -529,7 +530,9 @@ function back() {
       <span v-if="view === 'browse'" class="wd-sub">{{ cur.name }} · {{ pathLabel() }}</span>
       <span v-else-if="view === 'scan'" class="wd-sub">{{ cur.name }}</span>
     </div>
+    </div>
 
+    <div class="tab-body">
     <!-- 源列表视图 -->
     <div v-if="view === 'sources'" class="wd-body">
       <template v-if="wdHist.length">
@@ -638,6 +641,7 @@ function back() {
           </div>
         </template>
       </div>
+    </div>
     </div>
 
     <!-- 选集弹窗 -->

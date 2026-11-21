@@ -143,7 +143,8 @@ function clearAll() {
 </script>
 
 <template>
-  <div class="page">
+  <div class="page page--fixed">
+    <div class="tab-head">
     <TopBar />
     <div class="section-title">
       观看历史 <span class="count">{{ hist.length }} 条</span>
@@ -151,7 +152,9 @@ function clearAll() {
         {{ confirming ? '确认清空？' : '清空历史' }}
       </el-button>
     </div>
+    </div>
 
+    <div class="tab-body">
     <div v-if="hist.length" class="list">
       <template v-for="g in groups" :key="g.label">
         <div class="group-title">{{ g.label }} <span class="group-count">{{ g.items.length }} 条</span></div>
@@ -184,6 +187,7 @@ function clearAll() {
       <p>暂无播放记录</p>
       <p class="empty-sub">可以去「首页」挑一部开始观看</p>
       <el-button type="primary" @click="router.push('/')">去首页</el-button>
+    </div>
     </div>
   </div>
 </template>

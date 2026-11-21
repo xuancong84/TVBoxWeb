@@ -160,6 +160,21 @@ function openHistory(h: HistItem) {
   router.push({ name: 'detail', query: { site: h.siteKey, siteName: h.siteName, id: h.vodId } })
 }
 
+// 真实 <a href>：中键/ctrl/cmd+点击让浏览器原生在新标签页打开，跟
+// openHistory 的目标路由保持一致（VodCard.href 同样的理由）。
+function historyHref(h: HistItem): string {
+  if (h.siteKey === 'webdav') {
+    return router.resolve({ name: 'webdav', query: { continue: h.vodId } }).href
+  }
+  return router.resolve({ name: 'detail', query: { site: h.siteKey, siteName: h.siteName, id: h.vodId } }).href
+}
+
+function onContinueClick(h: HistItem, e: MouseEvent) {
+  if (e.button !== 0 || e.metaKey || e.ctrlKey || e.shiftKey || e.altKey) return
+  e.preventDefault()
+  openHistory(h)
+}
+
 async function removeHist(h: HistItem) {
   if (h.siteKey === 'webdav') {
     const [srcId, ...rest] = h.vodId.split(':')
@@ -243,19 +258,21 @@ function refresh() {
 </script>
 
 <template>
-  <div class="page">
-    <TopBar />
-
-    <!-- 分类导航 -->
-    <div v-if="cats.length" class="cat-nav">
-      <span
-        v-for="c in cats"
-        :key="c.id"
-        class="cat-chip"
-        @click="goCat(c.id)"
-      >{{ c.name }}</span>
+  <div class="page page--fixed">
+    <div class="tab-head">
+      <TopBar />
+      <!-- 分类导航 -->
+      <div v-if="cats.length" class="cat-nav">
+        <span
+          v-for="c in cats"
+          :key="c.id"
+          class="cat-chip"
+          @click="goCat(c.id)"
+        >{{ c.name }}</span>
+      </div>
     </div>
 
+    <div class="tab-body">
     <!-- 继续观看 -->
     <template v-if="loading">
       <div class="section-title">继续观看</div>
@@ -271,11 +288,12 @@ function refresh() {
         </div>
       </div>
       <div class="continue-row">
-        <div
+        <a
           v-for="h in history.slice(0, 20)"
           :key="h.siteKey + h.vodId"
           class="continue-item"
-          @click="openHistory(h)"
+          :href="historyHref(h)"
+          @click="onContinueClick(h, $event)"
         >
           <div class="poster">
             <img v-if="h.pic" :src="imgUrl(h.pic)" :alt="h.name" loading="lazy" />
@@ -284,8 +302,11 @@ function refresh() {
               <span>{{ h.siteKey === 'webdav' ? '☁' : '🎬' }}</span>
             </div>
             <div v-if="histRatio(h) > 0" class="progress"><div class="bar" :style="{ width: histRatio(h) * 100 + '%' }"></div></div>
-            <div class="ep">{{ h.epName || '继续观看' }}</div>
-            <div class="del" @click.stop="removeHist(h)">✕</div>
+            <!-- 下面 c-meta 那行灰字已经有「第 01 集」了，这里不重复显示当前
+                 第几集，改成总集数，两处信息互补而不是重叠。单集/未知
+                 （epCount <= 1）不显示，跟 VodCard 的「(共N集)」同样处理。 -->
+            <div v-if="h.epCount && h.epCount > 1" class="ep">共{{ h.epCount }}集</div>
+            <div class="del" @click.stop.prevent="removeHist(h)">✕</div>
           </div>
           <div class="name">{{ h.name }}</div>
           <div class="c-meta">
@@ -293,7 +314,7 @@ function refresh() {
             <span v-if="histRatio(h) > 0">已看 {{ Math.round(histRatio(h) * 100) }}%</span>
             <span v-if="ago(h.time)"> · {{ ago(h.time) }}</span>
           </div>
-        </div>
+        </a>
       </div>
     </template>
 
@@ -315,6 +336,7 @@ function refresh() {
         <p class="hint">可以进「设置」点「订阅」，一个链接同时导入点播 + 直播源</p>
         <el-button type="primary" @click="router.push('/settings')">去订阅</el-button>
       </template>
+    </div>
     </div>
   </div>
 </template>
@@ -353,6 +375,8 @@ function refresh() {
 }
 .continue-item {
   cursor: pointer;
+  color: inherit;
+  text-decoration: none;
 }
 .continue-item .poster {
   position: relative;

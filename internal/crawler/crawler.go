@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -83,18 +84,20 @@ const (
 	// 重启触发的那一轮，绝大多数没过期的站源都是缓存秒出，只有真正过期
 	// （或从没抓过）的那一小撮才会被放进这一轮要联网的子集。
 	SiteCacheMaxAge = 24 * time.Hour
-	// PerSite 每个站源最终能挤进首页「最近更新」的最多条数（去重之后）。
-	// 去重是按片名+年份全局去的，热门片名几十个站都有，如果只看每站原始
-	// 前 N 条做去重，排前面的站会把热门片名占完，后面的站全被去重吃掉，
-	// 对它贡献几条都剩不下——所以每站实际抓取/缓存的候选池要比这个数大
-	// （见 SitePool），去重时某一条撞车了就换该站池子里的下一条候选继续凑，
-	// 而不是直接放弃这个名额。
-	PerSite = 8
-	// SitePool 每个站源实际抓取/缓存的候选条数，必须大于 PerSite 才有「撞
-	// 车了换下一条」的余地。
-	SitePool = 24
-	FeedMax  = 640
-	Conc     = 4
+	// SitePool 每个站源实际抓取/缓存的候选条数——组装首页时按站源分组，
+	// 组内保留这个候选池原始顺序（即该站自己返回的新旧/热度顺序），轮转
+	// 组装时去重撞车了就换这个池子里的下一条候选继续凑。站源自己一页
+	// 通常也就返回二三十条，这个数再大也没有更多候选可留，纯粹是上限。
+	SitePool = 32
+	// FeedMax 首页「最近更新」最终的总条数上限（即需求里的 totalN），
+	// 默认 720 = 6!。组装方式见 Run() 里的「按站源热度排序后轮转取样」：
+	// 不再是「站源 A 一次拿够 8 条再换站源 B」，而是把所有贡献了候选的
+	// 站源按最近一次抓到的影片总数从多到少排一遍，一圈圈
+	// 轮着从每个站源的候选池里各取一条最新/最热门且还没出现过的，直到
+	// 凑满这个数或者所有站源的候选池都被轮空为止——这样热门大站不会一次
+	// 性占满配额，中小站源也能在轮转中占到位置，首页观感更均匀。
+	FeedMax = 720
+	Conc    = 4
 )
 
 type CrawlResult struct {
@@ -260,6 +263,9 @@ func Run(force bool) CrawlResult {
 						ID: v.ID, Name: v.Name, Pic: v.Pic, Remark: v.Remark,
 						Year: v.Year, Area: v.Area, TypeName: v.TypeName,
 						SiteKey: s.Key, SiteName: s.Name,
+						// From/PlayURL 整份不留（太占地方），总集数这个小
+						// 整数在落盘前先从这次抓到的完整数据里算出来存着。
+						EpCount: cms.EpCount(v.From, v.PlayURL),
 					})
 				}
 				if total <= 0 {
@@ -292,11 +298,7 @@ func Run(force bool) CrawlResult {
 	// 每抓完一个站源就落盘一次——几千个站源逐条落盘太费 IO。
 	store.FlushSiteCrawlCache()
 
-	// 3) 按片名去重，同时保证每个站源去重之后依然能凑够 PerSite 条——按站源
-	// 分组、组内保留原始候选顺序（见 SitePool），逐条「应征」：片名+年份已经
-	// 被别的站源占过就跳过，换该站候选池里的下一条继续试，直到凑够 PerSite
-	// 条或者把这个站的候选池耗尽为止。不然热门片名几十个站都有，按整体顺序
-	// 扁平去重会让排前面的站占完名额，后面的站贡献的内容全被去重吃光。
+	// 3) 按片名去重 + 按站源热度轮转组装，凑够 FeedMax（totalN）条为止。
 	// 同一部片子不同镜像站经常给出相同片名但年份一个有一个空（有的站根本没解析
 	// 出年份字段），按「片名+年份」严格匹配会把它们误判成两部不同的片子，
 	// 漏掉重复。把空年份当「通配」处理：某个片名只要已经出现过（不管那次
@@ -312,32 +314,59 @@ func Run(force bool) CrawlResult {
 		}
 		bySite[v.SiteKey] = append(bySite[v.SiteKey], v)
 	}
+	// 按站源最近一次统计到的影片总数从多到少排——「已经按片量从多到少
+	// 排好的站源列表」。siteOrder 原来是谁先抓完就排谁，跟热度无关；这里
+	// 换成热度序，轮转组装时大站不会抢跑占满名额，小站也能在一圈圈轮转
+	// 里占到位置。注意片量不是 model.Site.Count（那个字段在 siteList 原
+	// 始副本上一直是零值，只有 hSites 这个 HTTP handler 会在响应里临时拿
+	// SiteHealthMap 的 LastTotal 现填进去，store.Sites() 这里拿到的是没填
+	// 过的原始值）——真正的片量在 store.SiteHealthMap()[key].LastTotal。
+	health := store.SiteHealthMap()
+	siteCount := map[string]int{}
+	for _, s := range store.Sites() {
+		siteCount[s.Key] = health[s.Key].LastTotal
+	}
+	sort.SliceStable(siteOrder, func(i, j int) bool {
+		return siteCount[siteOrder[i]] > siteCount[siteOrder[j]]
+	})
+	// 轮转组装：一圈圈按热度序扫过所有站源，每个站源每一圈最多出一条——
+	// 该站候选池里排在 poolIdx 之后、且去重没撞车的第一条（即该站自己给的
+	// 顺序里最新/最热门的下一条）。一圈下来哪个站源一条都没能新增，说明
+	// 所有站源的候选池都已经耗尽或剩下的全是重复，直接收工，不再空转。
+	poolIdx := map[string]int{}
 	var feed []model.Vod
-outer:
-	for _, key := range siteOrder {
-		picked := 0
-		for _, v := range bySite[key] {
-			if picked >= PerSite {
+	for len(feed) < FeedMax {
+		progressed := false
+		for _, key := range siteOrder {
+			list := bySite[key]
+			i := poolIdx[key]
+			for i < len(list) {
+				v := list[i]
+				i++
+				k := v.Name + "|" + v.Year
+				dup := seen[k]
+				if !dup && v.Year == "" && seenAnyYear[v.Name] {
+					dup = true
+				}
+				if !dup && v.Year != "" && seen[v.Name+"|"] {
+					dup = true
+				}
+				if dup {
+					continue
+				}
+				seen[k] = true
+				seenAnyYear[v.Name] = true
+				feed = append(feed, v)
+				progressed = true
 				break
 			}
-			k := v.Name + "|" + v.Year
-			dup := seen[k]
-			if !dup && v.Year == "" && seenAnyYear[v.Name] {
-				dup = true
-			}
-			if !dup && v.Year != "" && seen[v.Name+"|"] {
-				dup = true
-			}
-			if dup {
-				continue
-			}
-			seen[k] = true
-			seenAnyYear[v.Name] = true
-			feed = append(feed, v)
-			picked++
+			poolIdx[key] = i
 			if len(feed) >= FeedMax {
-				break outer
+				break
 			}
+		}
+		if !progressed {
+			break
 		}
 	}
 

@@ -24,7 +24,7 @@ type SiteCrawlEntry struct {
 }
 
 // siteCacheFileName 跟 store.json 分开存的原因：条目数跟站源总数（几千）
-// 同量级，每条还带最多 PerSite 条影片，塞进 store.json 会让它体积暴涨、
+// 同量级，每条还带最多 SitePool 条影片，塞进 store.json 会让它体积暴涨、
 // 任何一个小改动（比如切个开关）都要整份重新序列化落盘；这份数据本质上
 // 是可丢弃的缓存（丢了大不了重新抓一遍），拆成单独文件、用 gzip 压缩
 //（JSON 高度重复，压缩比很高）更合适。
