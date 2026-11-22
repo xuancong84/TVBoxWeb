@@ -9,6 +9,7 @@ import { authState, ensureSession } from '@/auth'
 import { routeLoading } from '@/router'
 import TipToast from '@/components/TipToast.vue'
 import PrivacyPanel from '@/components/PrivacyPanel.vue'
+import { PIP_HOST_ID } from '@/playerGhost'
 
 const app = useAppStore()
 const router = useRouter()
@@ -165,6 +166,11 @@ function disagree() {
     </router-view>
 
     <TipToast />
+    <!-- 画中画跨路由续播的常驻挂载点：离开播放页时，如果正处于系统画中画，
+         PlayerView 会把 <video> 搬到这里继续播放（见 src/playerGhost.ts），
+         而不是被 Vue 卸载组件时一并销毁。故意不用 display:none——部分浏览器
+         对隐藏的视频元素会暂停渲染/画中画。 -->
+    <div :id="PIP_HOST_ID" class="pip-video-host" aria-hidden="true"></div>
     <!-- 离线提示横幅 -->
     <transition name="offline-fade">
       <div v-if="isOffline" class="offline-banner">
@@ -266,6 +272,15 @@ function disagree() {
 .route-fade-enter-from, .route-fade-leave-to { opacity: 0; }
 @media (prefers-reduced-motion: reduce) {
   .route-bar i { animation: none; width: 100%; }
+}
+
+.pip-video-host {
+  position: fixed;
+  left: -9999px;
+  top: 0;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
 }
 
 /* 离线提示横幅 */

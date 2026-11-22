@@ -36,12 +36,15 @@ const filtered = computed(() => {
 </script>
 
 <template>
+  <!-- 故意不用 append-to-body：这个组件总是嵌在 PlayerView 的 .player/
+       .m-player 里渲染，桌面端原生全屏时只有 .player 这棵子树还会显示在
+       屏幕上——传送到 document.body 的话，弹窗会被挡在全屏背后点了没反应。 -->
   <el-dialog
     :model-value="props.modelValue"
     :title="props.title"
     width="min(620px, 94vw)"
-    append-to-body
     destroy-on-close
+    @click.stop
     @update:model-value="emit('update:modelValue', $event)"
   >
     <el-input v-model="keyword" size="small" clearable placeholder="输入集数或名称快速定位" />

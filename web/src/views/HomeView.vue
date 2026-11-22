@@ -8,6 +8,7 @@ import type { Vod, HistItem, Category } from '@/types'
 import TopBar from '@/components/TopBar.vue'
 import VodGrid from '@/components/VodGrid.vue'
 import SkeletonList from '@/components/SkeletonList.vue'
+import { gridCols } from '@/gridPrefs'
 
 const router = useRouter()
 const app = useAppStore()
@@ -287,7 +288,7 @@ function refresh() {
           <span class="more" @click="router.push('/history')">全部 ›</span>
         </div>
       </div>
-      <div class="continue-row">
+      <div class="continue-row" :style="{ gridTemplateColumns: `repeat(${gridCols}, 1fr)` }">
         <a
           v-for="h in history.slice(0, 20)"
           :key="h.siteKey + h.vodId"
@@ -369,11 +370,21 @@ function refresh() {
 }
 .continue-row {
   display: grid;
+  /* 列数由 gridPrefs.ts 的 gridCols 通过 inline style 决定（跟 VodGrid 的
+     「最近更新」保持一致），这里的 auto-fill 只是 inline style 还没挂上
+     那一帧的兜底，不要再写死列数。 */
   grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
   gap: 16px;
   padding: 0 24px;
 }
 .continue-item {
+  /* .name 是单行 nowrap + ellipsis：不设 min-width:0 的话，网格给每一项算
+     「自动最小宽度」时会按它未截断的整行文字宽度算（grid item 自身
+     overflow 默认 visible，子元素的 overflow:hidden 不会把这个尺寸盖掉），
+     标题越长那一列的 1fr 轨道就被撑得越宽，几列宽度完全不一致，
+     表现成「一列大一列小」。VodCard 用的是两行 line-clamp（允许换行），
+     中文逐字可断行，min-content 本来就很小，不会触发这个问题。 */
+  min-width: 0;
   cursor: pointer;
   color: inherit;
   text-decoration: none;
@@ -497,7 +508,6 @@ function refresh() {
 /* 移动端 */
 @media (max-width: 640px) {
   .continue-row {
-    grid-template-columns: repeat(2, 1fr);
     gap: 10px;
     padding: 0 12px;
   }

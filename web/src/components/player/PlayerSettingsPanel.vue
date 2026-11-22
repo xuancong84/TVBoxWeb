@@ -234,7 +234,7 @@ function delayLabel(d: number) {
   </div>
 
   <!-- 移动端：底部弹出 sheet（同样受 modelValue 控制） -->
-  <div v-else-if="props.modelValue" class="m-q-mask" @click.self="close">
+  <div v-else-if="props.modelValue" class="m-q-mask" @click.stop @click.self="close">
     <div class="m-q-sheet">
       <div class="m-q-handle"></div>
       <div class="m-q-title">播放设置</div>

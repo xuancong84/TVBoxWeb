@@ -49,32 +49,49 @@ func ProbeCtx(ctx context.Context, url string, ms time.Duration) bool {
 // 总量上）会被正确拦下来。
 const minStreamBytes = 48 * 1024
 
+// LineProbeResult ProbeAnyStreamCtx 里某一条线路「真的测过」的结果——调用方
+// 拿它去记每条线路的可靠度分数（见 store.RecordLineOutcome），而不是只知道
+// "频道整体能不能播"这一个粗粒度的布尔值。LatencyMs 只在找到真正的媒体地址
+// （resolveMediaTarget 成功）时才有意义；完全连不上/解析失败时是「从开始
+// 探测到确认失败」的耗时，仅供参考。
+type LineProbeResult struct {
+	URL       string
+	OK        bool
+	LatencyMs int64
+}
+
 // ProbeAnyStream 依次测一批线路（通常是同一个频道合并来的全部备用地址），
 // 只要有一条线路通过 ProbeStreamCtx 就立刻返回 true，不等剩下的线路测
 // 完——这跟真实播放器的行为一致：一条线播不出来会自动切下一条，只要有
 // 一条真能播，频道整体就该算「能播」，不该因为排在前面的某条线挂了就把
 // 整个频道打成「播不通」。
 func ProbeAnyStream(urls []string, dur time.Duration, maxLines int) bool {
-	return ProbeAnyStreamCtx(context.Background(), urls, dur, maxLines)
+	ok, _ := ProbeAnyStreamCtx(context.Background(), urls, dur, maxLines)
+	return ok
 }
 
-// ProbeAnyStreamCtx 与 ProbeAnyStream 相同，ctx 可取消。maxLines<=0 时不限制
-// 测试的线路数；合并之后个别频道线路数能到几十条，调用方可以传个上限
-// 防止极端情况下单个频道测试时间失控。
-func ProbeAnyStreamCtx(ctx context.Context, urls []string, dur time.Duration, maxLines int) bool {
+// ProbeAnyStreamCtx 与 ProbeAnyStream 相同，ctx 可取消，额外返回「这一轮
+// 真的测过」的每条线路的结果（按尝试顺序，命中成功那条之后不再继续测，
+// 后面没测到的线路不出现在返回值里——没有信息就不该写一个假结果回去）。
+// maxLines<=0 时不限制测试的线路数；合并之后个别频道线路数能到几十条，
+// 调用方可以传个上限防止极端情况下单个频道测试时间失控。
+func ProbeAnyStreamCtx(ctx context.Context, urls []string, dur time.Duration, maxLines int) (bool, []LineProbeResult) {
 	n := len(urls)
 	if maxLines > 0 && n > maxLines {
 		n = maxLines
 	}
+	var results []LineProbeResult
 	for i := 0; i < n; i++ {
 		if urls[i] == "" {
 			continue
 		}
-		if ProbeStreamCtx(ctx, urls[i], dur) {
-			return true
+		ok, latencyMs := ProbeStreamCtx(ctx, urls[i], dur)
+		results = append(results, LineProbeResult{URL: urls[i], OK: ok, LatencyMs: latencyMs})
+		if ok {
+			return true, results
 		}
 	}
-	return false
+	return false, results
 }
 
 // ProbeStream 跟轻量的 Probe 不一样：Probe 只看第一包的几 KB 像不像一个
@@ -89,16 +106,26 @@ func ProbeAnyStreamCtx(ctx context.Context, urls []string, dur time.Duration, ma
 // 顺着它找到真正的媒体分片（master 播放列表再多跟一层子播放列表），实际
 // 验证的是分片 URL 的连续传输情况，而不是 manifest 本身传了多少字节。
 func ProbeStream(u string, dur time.Duration) bool {
-	return ProbeStreamCtx(context.Background(), u, dur)
+	ok, _ := ProbeStreamCtx(context.Background(), u, dur)
+	return ok
 }
 
-// ProbeStreamCtx 与 ProbeStream 相同，ctx 可取消。
-func ProbeStreamCtx(ctx context.Context, u string, dur time.Duration) bool {
-	target, ok := resolveMediaTarget(ctx, u, 0)
-	if !ok {
-		return false
+// ProbeStreamCtx 与 ProbeStream 相同，ctx 可取消，额外返回这次探测的延迟
+// （毫秒）：从开始到解析出真正的媒体地址（resolveMediaTarget，含 m3u8
+// master/media 多跳）为止的耗时，不包含后面 dur 那段「老实读够这么久」的
+// 固定时间——那段时间长短是调用方传进来的固定参数，不反映这条线路本身
+// 的快慢，混进延迟里会让所有成功线路的分数挤在同一档，起不到排序作用。
+// 解析失败（完全连不上/不是能识别的播放列表）时延迟是到确认失败为止的
+// 耗时，仅供参考。
+func ProbeStreamCtx(ctx context.Context, u string, dur time.Duration) (ok bool, latencyMs int64) {
+	start := time.Now()
+	target, resolved := resolveMediaTarget(ctx, u, 0)
+	latencyMs = time.Since(start).Milliseconds()
+	if !resolved {
+		return false, latencyMs
 	}
-	return httpc.StreamCheckCtx(ctx, target, dur, minStreamBytes)
+	ok = httpc.StreamCheckCtx(ctx, target, dur, minStreamBytes)
+	return ok, latencyMs
 }
 
 // resolveMediaTarget 把一个直播地址解析成「真正要连续读的那个 URL」：不是

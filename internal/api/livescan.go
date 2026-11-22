@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"net/http"
 	"sort"
 	"sync"
@@ -135,7 +136,14 @@ func scanChannelsLowPriority(chs []model.Channel) (completed bool) {
 				if len(urls) == 0 && ch.URL != "" {
 					urls = []string{ch.URL}
 				}
-				alive := live.ProbeAnyStream(urls, liveScanStreamDur, liveScanMaxLines)
+				alive, results := live.ProbeAnyStreamCtx(context.Background(), urls, liveScanStreamDur, liveScanMaxLines)
+				// 顺带把这一轮「真的测过」的每条线路的可靠度分数记下来——
+				// 不止记频道整体能不能播，连「哪条线快、哪条线一直失败」
+				// 都留下来，下次 /api/live/channels 下发时能把最靠谱的线
+				// 排在前面，播放器不用再一条条慢慢试过去。
+				for _, res := range results {
+					store.RecordLineOutcomeBulk(res.URL, res.OK, res.LatencyMs)
+				}
 				store.SetChannelStatusBulk(ch.Name, alive)
 			}
 		}()
@@ -263,6 +271,11 @@ func hLivePlayable(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
+	// 把每个频道的备用线路按可靠度分数排好序：out 里的 Channel 是从
+	// liveScanCandidates() 的共享缓存逐个值拷贝来的，annotateLineScoresFlat
+	// 内部排序不会原地改 URLs，不会碰到那份缓存底层数组（它明确要求
+	// 只读，见 liveScanCandidates 注释）。
+	annotateLineScoresFlat(out, store.SnapshotLineScores())
 	ok(w, map[string]any{"channels": out})
 }
 

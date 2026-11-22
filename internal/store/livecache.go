@@ -58,6 +58,7 @@ var (
 type liveCacheFile struct {
 	Sources       map[string]LiveCacheEntry `json:"sources"`
 	ChannelStatus map[string]ChannelProbe   `json:"channelStatus"`
+	LineScores    map[string]LineScore      `json:"lineScores,omitempty"`
 }
 
 // InitLiveCrawlCache 在 store.Init 之后调用一次，加载磁盘上的直播源抓取缓存。
@@ -70,6 +71,7 @@ func InitLiveCrawlCache(dataDir string) {
 	liveCachePath = filepath.Join(dataDir, liveCacheFileName)
 	liveCache = map[string]LiveCacheEntry{}
 	channelStatus = map[string]ChannelProbe{}
+	lineScores = map[string]LineScore{}
 	liveCacheDirty = false
 
 	f, err := os.Open(liveCachePath)
@@ -117,6 +119,12 @@ func InitLiveCrawlCache(dataDir string) {
 					}
 					channelStatus = cs
 				}
+			}
+		}
+		if rawScores, ok := probe["lineScores"]; ok {
+			var ls map[string]LineScore
+			if err := json.Unmarshal(rawScores, &ls); err == nil {
+				lineScores = ls
 			}
 		}
 		return
@@ -255,9 +263,13 @@ func writeLiveCacheFile() {
 	for k, v := range channelStatus {
 		status[k] = v
 	}
+	scores := make(map[string]LineScore, len(lineScores))
+	for k, v := range lineScores {
+		scores[k] = v
+	}
 	liveCacheMu.RUnlock()
 
-	b, err := json.Marshal(liveCacheFile{Sources: sources, ChannelStatus: status})
+	b, err := json.Marshal(liveCacheFile{Sources: sources, ChannelStatus: status, LineScores: scores})
 	if err != nil {
 		log.Printf("[store] 直播源抓取缓存序列化失败: %v", err)
 		return

@@ -100,6 +100,19 @@ function authHeaders(): Record<string, string> {
 
 // 可离线缓存的 GET 路径（历史/收藏/分类/站源等只读数据）
 // 视频详情、搜索等也缓存，但 TTL 较短
+//
+// 故意不含 /live/channels：这是个 stale-while-revalidate 缓存——命中缓存
+// 时先把（可能过期的）旧值立刻返回，后台另起一次请求把 IndexedDB 里的值
+// 刷新成最新的，但那次刷新的结果只会便宜到"下一次"调用，不会推给这次已经
+// 拿到旧值的调用方。频道目录里每个频道的备用线路是按可靠度分数排好序
+// 发下来的（见服务端 annotateLineScores），分数会随后台扫描/播放反馈持续
+// 变化——命中这层缓存会让用户看到的线路顺序定格在最近一次真正打到网络
+// 的那一刻，之后同一个频道反复进出（尤其是 5 分钟内比较频繁地切来切去）
+// 可能永远刷不到最新排序，表现成"明明后台一直在学哪条线好使，这边却
+// 死活還是先试那几条老掉线"。这个接口本来就有服务端 15s 的 HTTP 缓存头
+// （Cache-Control: max-age=15）兜底重复请求，不需要再叠一层 5 分钟的
+// IndexedDB 缓存——/live/playable（"可播频道"默认视图用的那个接口）出于
+// 同样的理由也没放进这个列表。
 const CACHEABLE_PREFIXES = [
   '/status',
   '/sites',
@@ -110,7 +123,6 @@ const CACHEABLE_PREFIXES = [
   '/feed',
   '/live/url',
   '/live/sources',
-  '/live/channels',
   '/prefs',
   '/privacy',
   '/webdav/sources',

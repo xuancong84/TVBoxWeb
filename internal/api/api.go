@@ -2,6 +2,7 @@
 package api
 
 import (
+	"bytes"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -1507,6 +1508,7 @@ func postProcessLive(groups []model.ChannelGroup) []model.ChannelGroup {
 	}
 	live.SortGroups(groups)
 	annotateChannelStatus(groups)
+	annotateLineScores(groups)
 	return groups
 }
 
@@ -1525,6 +1527,35 @@ func annotateChannelStatus(groups []model.ChannelGroup) {
 				}
 			}
 		}
+	}
+}
+
+// annotateLineScores 把每个频道的备用线路（URLs）按可靠度分数从高到低
+// 排序，并让主地址（URL）跟着指向排完序后的第一条——播放器总是先试
+// URL、播不通再依次试 URLs 里的下一条，这里把「历史上最靠谱」的线路挪到
+// 最前面，用户不用等它一条条试过那些已知会失败的线路才轮到真正能播的
+// 那条。一次性取整份分数快照（SnapshotLineScores），而不是给每个频道的
+// 每条线路都单独查一次——全量频道目录常有十几万条，省下反复加锁的开销。
+func annotateLineScores(groups []model.ChannelGroup) {
+	scores := store.SnapshotLineScores()
+	for gi := range groups {
+		annotateLineScoresFlat(groups[gi].Channels, scores)
+	}
+}
+
+// annotateLineScoresFlat 跟 annotateLineScores 是同一件事，只是作用在一份
+// 拍平的频道列表上——给 hLivePlayable 这种不经过 postProcessLive/
+// ChannelGroup 结构、直接拍平成 []model.Channel 的接口复用，避免两套
+// 排序逻辑分叉。
+func annotateLineScoresFlat(chs []model.Channel, scores map[string]int) {
+	for ci := range chs {
+		urls := chs[ci].URLs
+		if len(urls) == 0 {
+			continue
+		}
+		sorted := store.SortURLsByScore(urls, scores)
+		chs[ci].URLs = sorted
+		chs[ci].URL = sorted[0]
 	}
 }
 
@@ -1565,7 +1596,15 @@ func hLiveLinesProbe(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	ok(w, live.ProbeLinesCtx(r.Context(), req.URLs, 4*time.Second))
+	results := live.ProbeLinesCtx(r.Context(), req.URLs, 4*time.Second)
+	// 播放页每隔几秒就会轮询一次这个接口，顺手把每条线路的结果记进可靠度
+	// 分数——这是比后台扫描更频繁、更贴近"用户这会儿实际在看"的信号，
+	// 下次这个频道下发线路列表时排序会更准。
+	for _, lq := range results {
+		store.RecordLineOutcomeBulk(lq.URL, lq.OK, int64(lq.MS))
+	}
+	store.FlushLiveCache()
+	ok(w, results)
 }
 
 func hLiveRankOne(w http.ResponseWriter, r *http.Request) {
@@ -2101,6 +2140,25 @@ func hProxy(w http.ResponseWriter, r *http.Request) {
 	isM3u8 := strings.Contains(ct, "mpegurl") || strings.Contains(ct, "m3u8") ||
 		strings.Contains(ct, "x-mpegurl") || strings.Contains(ct, "vnd.apple")
 
+	// 有些山寨 IPTV 镜像把 m3u8 返回成 text/html 之类的乱 Content-Type，
+	// 只信 header 会漏判——漏判的后果不是"播不了"这么简单：m3u8 不会被
+	// rewriteM3u8() 重写，里面的分片/密钥地址原样透传给浏览器，hls.js 直接
+	// 跨域请求那些分片，大概率被 CORS/鉴权拦下，而且 hls.js 对"分片一直加载
+	// 失败"不会很快判定为 fatal，表现成播放页永远卡在"缓冲中"、前端的换线路
+	// 兜底压根没有机会触发。这里嗅探正文兜底：HLS playlist 规范要求必须以
+	// #EXTM3U 开头。只在没带 Range 的请求上做（Range 命中的是分片/视频的某个
+	// 中间偏移，不可能恰好读到文件开头，嗅探没有意义，也不该为了嗅探多读
+	// 任何字节）。
+	var body io.Reader = res.Body
+	if !isM3u8 && res.StatusCode == http.StatusOK && r.Header.Get("Range") == "" {
+		peek := make([]byte, 7)
+		n, _ := io.ReadFull(res.Body, peek)
+		body = io.MultiReader(bytes.NewReader(peek[:n]), res.Body)
+		if string(peek[:n]) == "#EXTM3U" {
+			isM3u8 = true
+		}
+	}
+
 	if o := r.Header.Get("Origin"); OriginAllowed(o, r.Host) {
 		w.Header().Set("Access-Control-Allow-Origin", o)
 		w.Header().Set("Vary", "Origin")
@@ -2110,7 +2168,7 @@ func hProxy(w http.ResponseWriter, r *http.Request) {
 	if isM3u8 {
 		// 重写 m3u8，body 长度会变：不透传 Content-Length，让 Go 自动计算。
 		// 限制读取大小：正常 m3u8 文件很小（通常 < 1MB），超过 4MB 说明有问题。
-		data, _ := io.ReadAll(io.LimitReader(res.Body, 4<<20)) // max 4MB
+		data, _ := io.ReadAll(io.LimitReader(body, 4<<20)) // max 4MB
 		// base 用跟随重定向后的最终 URL，而非原始 target：
 		// 302 跳转到真实流地址时，m3u8 里的相对分片/子流地址应相对最终 URL 解析，
 		// 否则会拼错域名（如 iFan 聚合 → miguvideo 的场景）。
@@ -2136,7 +2194,7 @@ func hProxy(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	w.WriteHeader(res.StatusCode)
-	_, _ = io.Copy(w, res.Body)
+	_, _ = io.Copy(w, body)
 }
 
 // hImg GET /api/img?url=<封面图原始地址>：优先命中本地缓存（见 imgcache，
