@@ -2126,13 +2126,27 @@ func hProxy(w http.ResponseWriter, r *http.Request) {
 	if auth != "" {
 		req.Header.Set("Authorization", "Basic "+auth)
 	}
-	if rng := r.Header.Get("Range"); rng != "" {
+	rng := r.Header.Get("Range")
+	if rng != "" {
 		req.Header.Set("Range", rng)
 	}
 	res, err := httpc.StreamClient.Do(req)
-	if err != nil {
-		fail(w, http.StatusBadGateway, "无法连接上游资源："+err.Error())
-		return
+	if err != nil || res.StatusCode >= 400 {
+		// 直连被地区封锁（如 play.xluuss.com 对境外 IP 回 444/断连）：仅 m3u8 播放列表
+		// 和小体积密钥文件走 SSH 跳板重试；视频分片等主体数据绝不走 SSH。
+		if rng == "" && relayEligible(target) {
+			if data, rerr := crawler.FetchSmallViaGeoRelay(r.Context(), target, relayMaxBytes); rerr == nil {
+				if err == nil {
+					res.Body.Close()
+				}
+				serveRelayed(w, r, target, auth, data)
+				return
+			}
+		}
+		if err != nil {
+			fail(w, http.StatusBadGateway, "无法连接上游资源："+err.Error())
+			return
+		}
 	}
 	defer res.Body.Close()
 
@@ -2195,6 +2209,36 @@ func hProxy(w http.ResponseWriter, r *http.Request) {
 	}
 	w.WriteHeader(res.StatusCode)
 	_, _ = io.Copy(w, body)
+}
+
+const relayMaxBytes = 1 << 20 // 跳板只搬 ≤1MB 的小文件
+
+// relayEligible 只放行 m3u8 播放列表和 .key 密钥这类小文件走跳板。
+func relayEligible(target string) bool {
+	u, err := url.Parse(target)
+	if err != nil {
+		return false
+	}
+	if strings.Contains(strings.ToLower(u.RawQuery), ".m3u8") {
+		return true // 如 /live.php?url=xxx.m3u8
+	}
+	p := strings.ToLower(u.Path)
+	return strings.HasSuffix(p, ".m3u8") || strings.HasSuffix(p, ".m3u") || strings.HasSuffix(p, ".key")
+}
+
+// serveRelayed 输出经跳板取回的小文件；m3u8 同样重写里面的地址走代理。
+func serveRelayed(w http.ResponseWriter, r *http.Request, target, auth string, data []byte) {
+	if o := r.Header.Get("Origin"); OriginAllowed(o, r.Host) {
+		w.Header().Set("Access-Control-Allow-Origin", o)
+		w.Header().Set("Vary", "Origin")
+	}
+	if bytes.HasPrefix(bytes.TrimSpace(data), []byte("#EXTM3U")) {
+		w.Header().Set("Content-Type", "application/vnd.apple.mpegurl")
+		_, _ = w.Write([]byte(rewriteM3u8(string(data), target, auth, tokenFrom(r))))
+		return
+	}
+	w.Header().Set("Content-Type", "application/octet-stream")
+	_, _ = w.Write(data)
 }
 
 // hImg GET /api/img?url=<封面图原始地址>：优先命中本地缓存（见 imgcache，

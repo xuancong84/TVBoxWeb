@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"regexp"
+	"strconv"
 	"strings"
 
 	"github.com/xxl6097/TVBoxWeb/internal/httpc"
@@ -137,4 +138,52 @@ func withControlMaster(sshCmd string) string {
 	sock := "/tmp/tvboxweb-sshcm-" + hex.EncodeToString(h[:])[:12]
 	opts := "-o ControlMaster=auto -o ControlPersist=60s -o ControlPath=" + sock
 	return "ssh " + opts + strings.TrimPrefix(sshCmd, "ssh")
+}
+
+// WorthGeoRelay 是 worthGeoRelay 的导出版本，给 live 等包判断直连失败后是否值得走跳板。
+func WorthGeoRelay(ferr error) bool { return worthGeoRelay(ferr) }
+
+// FetchSmallViaGeoRelay 通过 SSH_CMDS_GEO_BLOCK 跳板抓取一个「小文件」（m3u8 播放列表、
+// AES 密钥）。只给 /api/proxy 在直连被地区封锁时兜底用：返回内容超过 maxBytes 会被
+// 丢弃并报错，所以即使调用方误传了视频分片地址，也不会通过 SSH 搬运视频主体数据。
+func FetchSmallViaGeoRelay(ctx context.Context, url string, maxBytes int) ([]byte, error) {
+	raw := strings.TrimSpace(os.Getenv("SSH_CMDS_GEO_BLOCK"))
+	if raw == "" {
+		return nil, errors.New("未配置 SSH_CMDS_GEO_BLOCK")
+	}
+	remoteCurl := "curl -sfL -A " + shQuote(httpc.UA) + " --max-time 20 --max-filesize " +
+		strconv.Itoa(maxBytes) + " " + shQuote(url)
+	lastErr := errors.New("所有跳板都没能取到内容")
+	for _, sshCmd := range strings.Split(raw, ";") {
+		sshCmd = strings.TrimSpace(sshCmd)
+		if sshCmd == "" {
+			continue
+		}
+		cmd := exec.CommandContext(ctx, "sh", "-c", withControlMaster(sshCmd)+" "+shQuote(remoteCurl))
+		var out bytes.Buffer
+		cmd.Stdout = &limitWriter{w: &out, n: maxBytes + 1}
+		if err := cmd.Run(); err != nil {
+			lastErr = errors.New("跳板抓取失败：" + err.Error())
+			continue
+		}
+		if out.Len() == 0 || out.Len() > maxBytes {
+			lastErr = errors.New("跳板返回内容为空或超出大小限制")
+			continue
+		}
+		return out.Bytes(), nil
+	}
+	return nil, lastErr
+}
+
+// limitWriter 超过 n 字节后报错，让 cmd.Run 提前结束（同时杀掉远端 curl）。
+type limitWriter struct {
+	w *bytes.Buffer
+	n int
+}
+
+func (l *limitWriter) Write(p []byte) (int, error) {
+	if l.w.Len()+len(p) > l.n {
+		return 0, errors.New("超出大小限制")
+	}
+	return l.w.Write(p)
 }

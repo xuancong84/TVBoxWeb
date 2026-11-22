@@ -10,7 +10,6 @@ import { usePlayerSubtitles } from '@/composables/usePlayerSubtitles'
 import { usePlayerGestures } from '@/composables/usePlayerGestures'
 import PlayerSettingsPanel from '@/components/player/PlayerSettingsPanel.vue'
 import EpisodeDrawer from '@/components/player/EpisodeDrawer.vue'
-import LinePickerDialog from '@/components/player/LinePickerDialog.vue'
 import TipToast from '@/components/TipToast.vue'
 import { PIP_HOST_ID, stopCurrentGhost, setCurrentGhost, clearCurrentGhost, type GhostHandle } from '@/playerGhost'
 
@@ -103,10 +102,9 @@ const STALL_RATIO_BAD = 0.35      // 窗口内卡顿占比超过这个值判定�
 const AUTO_SWITCH_COOLDOWN = 20000  // 两次自动切换之间至少隔这么久，避免来回抖
 const LINE_AVOID_MS = 60000         // 刚自动切走的线路，这么久内不再切回去
 const lineQuality = ref<Record<string, { ok: boolean; ms: number; kbps: number }>>({})
-// 自动选线开关：关掉后，当前线路失败/变差时不再自动换线路，只走
-// onPlayError 收尾（提示失败并退出），由用户自己在「选择线路」里手动选。
+// 自动选线开关：关掉后，当前线路失败/变差时不再自动换线路/退出频道，
+// 原地无限重试这条线路——由用户自己在「播放设置」的「线路」里手动选。
 const autoLineSwitch = ref(true)
-const showLinePicker = ref(false)
 let lineProbeTimer = 0
 let bufferWindowStart = 0
 let bufferStallMs = 0
@@ -2546,7 +2544,9 @@ function popOsd() {
 function hideUI() {
   if (osdTimer) { clearTimeout(osdTimer); osdTimer = 0 }
   showOsd.value = false
-  showQ.value = false
+  // 不连带关掉播放设置/选线路面板：面板本身是独立的浮层/弹层，有自己的
+  // 关闭按钮和点遮罩关闭，用户在里面看线路列表、犹豫选哪条时不该被这个
+  // 12 秒无操作计时器（或鼠标贴边）半路把面板强制收起。
   if (isFullscreen.value) cursorHidden.value = true
 }
 
@@ -2796,8 +2796,7 @@ onUnmounted(() => {
             <div class="vol-track"><div class="vol-fill" :style="{ width: (muted ? 0 : volume * 100) + '%' }"></div></div>
           </div>
           <button class="ctl" @click="togglePlaySpeed" :title="`当前 ${rateLabel}x，点击切换倍速`">{{ rateLabel }}x</button>
-          <button class="ctl" @click="showQ = !showQ" :title="qTitle">{{ qLabel }}</button>
-          <button v-if="isLive" class="ctl" title="选择线路" @click="showLinePicker = true">选择线路</button>
+          <button class="ctl" @click="showQ = !showQ" :title="qTitle">{{ isLive ? '选择线路' : qLabel }}</button>
           <button v-if="!isLive && player.count > 1" class="ctl" @click="showEps = true">选集</button>
           <!-- 自动连播开关：原来只有移动端有，桌面端播完只好被动连播，
                想逐集看完再停下也没法设置。 -->
@@ -2845,8 +2844,10 @@ onUnmounted(() => {
       :skip-own="skipOwn"
       :global-intro-skip="globalIntroSkip"
       :global-outro-skip="globalOutroSkip"
+      :auto-switch="autoLineSwitch"
       @choose-level="chooseLevel"
       @switch-line="switchLine"
+      @update:auto-switch="autoLineSwitch = $event"
       @sub-file="onSubFile"
       @sub-url="promptSubUrl"
       @remove-sub="removeExternalSub"
@@ -2859,17 +2860,6 @@ onUnmounted(() => {
       @mark-skip="markSkip"
       @skip-apply-all="applySkipToAll"
       @skip-reset="resetSkipCfg"
-    />
-
-    <!-- 选择线路弹窗（直播）：桌面浮层。 -->
-    <LinePickerDialog
-      v-model="showLinePicker"
-      :lines="player.current?.urls || []"
-      :raw-url="rawUrl"
-      :line-quality="lineQuality"
-      :auto-switch="autoLineSwitch"
-      @update:auto-switch="autoLineSwitch = $event"
-      @switch-line="(u) => switchLine(u)"
     />
 
     <!-- 选集抽屉：桌面端也要挂。
@@ -2974,7 +2964,6 @@ onUnmounted(() => {
               <svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><polyline points="13 17 22 12 13 7"/><line x1="2" y1="7" x2="2" y2="17"/><polyline points="2 17 11 12 2 7"/></svg>
             </button>
             <button class="m-icon-btn" style="margin-left:auto" title="编码信息" @click="toggleCodecInfo">ⓘ</button>
-            <button v-if="isLive" class="m-icon-btn" title="选择线路" @click="showLinePicker = true">🔀</button>
             <button class="m-icon-btn" @click="showQ = !showQ">⚙</button>
           </div>
         </div>
@@ -3043,11 +3032,7 @@ onUnmounted(() => {
         </button>
         <button class="m-aux-btn" @click="showQ = !showQ" :title="qTitle">
           <span class="m-aux-icon">⚙</span>
-          <span>{{ qLabel }}</span>
-        </button>
-        <button v-if="isLive" class="m-aux-btn" @click="showLinePicker = true">
-          <span class="m-aux-icon">🔀</span>
-          <span>选择线路</span>
+          <span>{{ isLive ? '选择线路' : qLabel }}</span>
         </button>
         <button v-if="!isLive && player.count > 1" class="m-aux-btn" @click="showEps = true">
           <span class="m-aux-icon">☷</span>
@@ -3096,8 +3081,10 @@ onUnmounted(() => {
       :skip-own="skipOwn"
       :global-intro-skip="globalIntroSkip"
       :global-outro-skip="globalOutroSkip"
+      :auto-switch="autoLineSwitch"
       @choose-level="chooseLevel"
       @switch-line="switchLine"
+      @update:auto-switch="autoLineSwitch = $event"
       @sub-file="onSubFile"
       @sub-url="promptSubUrl"
       @remove-sub="removeExternalSub"
@@ -3110,17 +3097,6 @@ onUnmounted(() => {
       @mark-skip="markSkip"
       @skip-apply-all="applySkipToAll"
       @skip-reset="resetSkipCfg"
-    />
-
-    <!-- 选择线路弹窗（直播）：移动端。 -->
-    <LinePickerDialog
-      v-model="showLinePicker"
-      :lines="player.current?.urls || []"
-      :raw-url="rawUrl"
-      :line-quality="lineQuality"
-      :auto-switch="autoLineSwitch"
-      @update:auto-switch="autoLineSwitch = $event"
-      @switch-line="(u) => switchLine(u)"
     />
 
     <!-- 选集抽屉 -->

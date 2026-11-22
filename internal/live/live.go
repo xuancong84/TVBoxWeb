@@ -9,6 +9,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/xxl6097/TVBoxWeb/internal/crawler"
 	"github.com/xxl6097/TVBoxWeb/internal/httpc"
 	"github.com/xxl6097/TVBoxWeb/internal/model"
 )
@@ -267,6 +268,15 @@ func LoadCtx(ctx context.Context, url string, timeout time.Duration) ([]model.Ch
 		timeout = 25 * time.Second
 	}
 	txt, err := httpc.TextCtx(ctx, url, nil, timeout)
+	if err != nil || strings.TrimSpace(txt) == "" {
+		// 直播源列表（m3u/txt，纯文本小文件）被地区封锁时，经 SSH_CMDS_GEO_BLOCK
+		// 跳板重试一次；只搬频道列表文本，绝不搬直播流本身。
+		if strings.HasPrefix(url, "http") && (err == nil || crawler.WorthGeoRelay(err)) {
+			if b, rerr := crawler.FetchSmallViaGeoRelay(ctx, url, 8<<20); rerr == nil && strings.TrimSpace(string(b)) != "" {
+				txt, err = string(b), nil
+			}
+		}
+	}
 	if err != nil {
 		return nil, err
 	}

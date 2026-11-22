@@ -19,6 +19,8 @@ const props = withDefaults(defineProps<{
   rawUrl: string
   /** 各条线路的轻量测速结果（url -> {ok, ms, kbps}），没测过的线路取不到值 */
   lineQuality?: Record<string, { ok: boolean; ms: number; kbps: number }>
+  /** 自动选线开关：关掉后，当前线路失败时原地无限重试，不切线路/不退出 */
+  autoSwitch: boolean
   subDelay: number
   subFontSize: number
   externalSubActive: boolean
@@ -51,6 +53,7 @@ const emit = defineEmits<{
   (e: 'update:modelValue', v: boolean): void
   (e: 'choose-level', cap: number): void
   (e: 'switch-line', url: string): void
+  (e: 'update:autoSwitch', v: boolean): void
   (e: 'sub-file', ev: Event): void
   (e: 'sub-url'): void
   (e: 'remove-sub'): void
@@ -119,9 +122,16 @@ function delayLabel(d: number) {
       </div>
       <div v-if="!props.levels.length" class="q-hint">源只提供这一档清晰度。</div>
 
-      <template v-if="props.isLive && props.lines.length > 1">
+      <template v-if="props.isLive">
         <div class="q-section">线路</div>
-        <div class="q-chips">
+        <label class="line-auto-row">
+          <el-checkbox
+            :model-value="props.autoSwitch"
+            @update:model-value="emit('update:autoSwitch', $event as boolean)"
+          />
+          <span>自动选线（当前线路播放失败时自动切换到其它线路；关闭后原地无限重试这条线路）</span>
+        </label>
+        <div v-if="props.lines.length > 1" class="q-chips">
           <span
             v-for="(u, i) in props.lines"
             :key="'line' + i"
@@ -251,9 +261,16 @@ function delayLabel(d: number) {
         >{{ labelOfLevel(lv) }}</span>
       </div>
 
-      <template v-if="props.isLive && props.lines.length > 1">
+      <template v-if="props.isLive">
         <div class="m-q-section">线路</div>
-        <div class="m-q-chips">
+        <label class="line-auto-row">
+          <el-checkbox
+            :model-value="props.autoSwitch"
+            @update:model-value="emit('update:autoSwitch', $event as boolean)"
+          />
+          <span>自动选线（当前线路播放失败时自动切换到其它线路；关闭后原地无限重试这条线路）</span>
+        </label>
+        <div v-if="props.lines.length > 1" class="m-q-chips">
           <span
             v-for="(u, i) in props.lines"
             :key="'line' + i"
@@ -411,6 +428,15 @@ function delayLabel(d: number) {
 .chip-bad {
   color: var(--warn, #ffb4ab);
   border-color: var(--warn, #ffb4ab);
+}
+.line-auto-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 13px;
+  color: var(--sub);
+  cursor: pointer;
+  margin-bottom: 10px;
 }
 
 /* ===== 跳过片头/片尾：两行紧凑排布 ===== */
