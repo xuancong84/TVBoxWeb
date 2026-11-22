@@ -187,8 +187,9 @@ function onNavClick(path: string, e: MouseEvent) {
 .topbar {
   display: flex;
   align-items: center;
-  padding: 6px 14px 5px;
-  gap: 12px;
+  padding: 6px 66px 5px 14px;
+  gap: 4px 12px;
+  flex-wrap: wrap;
   position: relative;
   z-index: 100;
 }
@@ -197,7 +198,7 @@ function onNavClick(path: string, e: MouseEvent) {
   align-items: center;
   gap: 8px;
   cursor: pointer;
-  flex-shrink: 0;
+  min-width: 0;
 }
 .logo-badge,
 .logo-icon {
@@ -215,10 +216,13 @@ function onNavClick(path: string, e: MouseEvent) {
 }
 .logo-icon {
   background: transparent;
+  flex-shrink: 0;
 }
 .title {
   font-size: 40px;
   font-weight: 700;
+  min-width: 0;
+  overflow-wrap: anywhere;
 }
 .navs {
   display: flex;
@@ -249,12 +253,12 @@ function onNavClick(path: string, e: MouseEvent) {
   gap: 10px;
   font-size: 30px;
   color: var(--dim);
-  flex-shrink: 0;
+  flex-wrap: wrap;
+  min-width: 0;
   text-align: right;
   font-variant-numeric: tabular-nums;
   font-feature-settings: 'tnum' 1;
   letter-spacing: 0.02em;
-  white-space: nowrap;
   user-select: none;
 }
 /* 日期/星期本来就不常变，不需要跟时间一样防抖动；时间段自己用等宽数字
@@ -264,6 +268,9 @@ function onNavClick(path: string, e: MouseEvent) {
 .clock .c-s { opacity: 0.65; }
 
 .fs-toggle {
+  position: absolute;
+  top: 6px;
+  right: 14px;
   flex-shrink: 0;
   width: 40px;
   height: 40px;
@@ -343,6 +350,12 @@ function onNavClick(path: string, e: MouseEvent) {
   color: var(--selected);
   border-left-color: var(--selected);
   background: var(--card);
+}
+
+/* 竖屏/窄屏：导航独占第二行横向换行，避免被 logo+时钟挤成一列把顶栏撑高 */
+@media (max-width: 1100px) {
+  .navs { order: 3; flex: 1 1 100%; }
+  .clock { margin-left: auto; }
 }
 
 /* 响应式断点 */

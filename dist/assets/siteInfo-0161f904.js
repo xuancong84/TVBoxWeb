@@ -1,0 +1,1 @@
+import{b as l}from"./index-3e81e1e2.js";let n=null,e=null;function a(){return n?Promise.resolve(n):(e||(e=l.sites().then(i=>(n=new Map(i.map(t=>[t.key,t])),n)).catch(()=>(e=null,new Map))),e)}function u(){n=null,e=null}export{u as i,a as s};

@@ -544,8 +544,8 @@ async function onImportFile(e: Event) {
 .grid {
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(160px, 1fr));
-  gap: 16px;
-  padding: 0 24px;
+  gap: 8px;
+  padding: 0 12px;
 }
 
 .item { cursor: pointer; }
@@ -708,8 +708,8 @@ async function onImportFile(e: Event) {
 
   .grid {
     grid-template-columns: repeat(auto-fill, minmax(120px, 1fr));
-    gap: 10px;
-    padding: 0 12px;
+    gap: 5px;
+    padding: 0 6px;
   }
   .item-overlay { opacity: 1; }
 }

@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, onMounted, watch } from 'vue'
+import { ref, computed, onMounted, watch } from 'vue'
 import { useRouter } from 'vue-router'
 import { api, imgUrl } from '@/api'
 import { useAppStore } from '@/stores/app'
@@ -9,6 +9,7 @@ import TopBar from '@/components/TopBar.vue'
 import VodGrid from '@/components/VodGrid.vue'
 import SkeletonList from '@/components/SkeletonList.vue'
 import { gridCols } from '@/gridPrefs'
+import { feedLimit } from '@/itemPrefs'
 
 const router = useRouter()
 const app = useAppStore()
@@ -16,6 +17,7 @@ const app = useAppStore()
 const history = ref<HistItem[]>([])
 const feed = ref<Vod[]>([])
 const feedSummary = ref('')
+const feedShown = computed(() => (feedLimit.value > 0 ? feed.value.slice(0, feedLimit.value) : feed.value))
 const loading = ref(true)
 const hasSites = ref(false)
 const confirmClear = ref(false)
@@ -322,11 +324,11 @@ function refresh() {
     <!-- 最近更新 -->
     <div class="section-title">
       最近更新
-      <span v-if="feed.length" class="count">{{ feed.length }} 条</span>
+      <span v-if="feed.length" class="count">{{ feedShown.length }} 条</span>
       <span v-if="feedSummary" class="summary">{{ feedSummary }}</span>
       <span class="more" :class="{ updating }" @click="refresh">{{ updating ? `更新中 ${updatePct}%` : '更新 ›' }}</span>
     </div>
-    <VodGrid :vods="feed" :loading="loading" />
+    <VodGrid :vods="feedShown" :loading="loading" />
     <div v-if="!loading && !feed.length" class="empty">
       <template v-if="hasSites">
         <p>暂无内容，正在拉取最新影片…</p>
@@ -374,8 +376,8 @@ function refresh() {
      「最近更新」保持一致），这里的 auto-fill 只是 inline style 还没挂上
      那一帧的兜底，不要再写死列数。 */
   grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
-  gap: 16px;
-  padding: 0 24px;
+  gap: 8px;
+  padding: 0 12px;
 }
 .continue-item {
   /* .name 是单行 nowrap + ellipsis：不设 min-width:0 的话，网格给每一项算
@@ -508,8 +510,8 @@ function refresh() {
 /* 移动端 */
 @media (max-width: 640px) {
   .continue-row {
-    gap: 10px;
-    padding: 0 12px;
+    gap: 5px;
+    padding: 0 6px;
   }
   /* 移动端删除按钮始终可见（hover 在触摸屏无效） */
   .del {

@@ -3,6 +3,7 @@ import { ref, computed, onMounted, onActivated, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { api, humanizeApiError } from '@/api'
 import { useAppStore } from '@/stores/app'
+import { vodPerPage } from '@/itemPrefs'
 import type { Site, Category, VodPage, FilterGroup, Vod } from '@/types'
 import TopBar from '@/components/TopBar.vue'
 import VodGrid from '@/components/VodGrid.vue'
@@ -111,8 +112,16 @@ async function loadHealth() {
 }
 
 // 顶层分类（pid 为空且 id 不为空，过滤掉后端注入的虚拟「全部」条目）
-const topCats = computed(() => categories.value.filter((c) => c.pid === '' && c.id !== ''))
-const childrenOf = (tid: string) => categories.value.filter((c) => c.pid === tid)
+// 后端探测出的空分类 id（没有结果时为空集 = 显示全部分类，不增加任何等待）。
+const emptyCats = ref<Set<string>>(new Set())
+// 当前选中的分类（含从 URL tid 恢复的）永远可见；空父分类只有在它的子分类也全空时才藏。
+const isHidden = (c: Category): boolean => {
+  if (!emptyCats.value.has(c.id)) return false
+  if (c.id === selectedParent.value || c.id === selectedChild.value) return false
+  return !categories.value.some((k) => k.pid === c.id && !emptyCats.value.has(k.id))
+}
+const topCats = computed(() => categories.value.filter((c) => c.pid === '' && c.id !== '' && !isHidden(c)))
+const childrenOf = (tid: string) => categories.value.filter((c) => c.pid === tid && !isHidden(c))
 
 // 初始化期间 siteKey 的首次赋值不算「用户切换站点」，不能清空刚恢复的筛选
 let restoring = true
@@ -143,7 +152,10 @@ async function init() {
   void loadHealth()
   const list = await api.sites()
   sites.value = list.filter((s) => s.usable)
-  const qSite = (route.query.site as string) || ''
+  let qSite = (route.query.site as string) || ''
+  // URL/记忆里的站已不在列表里（比如它所属的单仓源被停用了）：当作没指定
+  if (qSite && !sites.value.some((s) => s.key === qSite)) qSite = ''
+  if (siteKey.value && !sites.value.some((s) => s.key === siteKey.value)) siteKey.value = ''
   if (qSite) {
     siteKey.value = qSite
   } else if (!siteKey.value) {
@@ -185,6 +197,18 @@ onActivated(async () => {
     skipNextActivate = false
     return
   }
+  // 页面是 keep-alive 缓存的：在设置里停用/启用单仓源后回到这里，站源下拉
+  // 必须重新取一遍（有 ETag/缓存，几乎零成本）。当前站已经没了就整页重新初始化。
+  try {
+    const list = (await api.sites()).filter((s) => s.usable)
+    sites.value = list
+    if (siteKey.value && !list.some((s) => s.key === siteKey.value)) {
+      restoring = true
+      await init()
+      restoring = false
+      return
+    }
+  } catch { /* 保持旧列表 */ }
   const qSite = (route.query.site as string) || ''
   const qTid = (route.query.tid as string) || ''
   // route.query 跟当前状态完全一致：就是从详情页点「返回」回到刚才浏览
@@ -247,10 +271,22 @@ async function loadCategories() {
   catLoading.value = true
   try {
     categories.value = await api.categories(siteKey.value)
+    void loadEmptyCats(siteKey.value)
   } catch (e: any) {
     app.showTip('分类加载失败：' + humanizeApiError(e))
   } finally {
     catLoading.value = false
+  }
+}
+
+// 不 await：拿不到（后端还在后台探测）就保持显示全部，下次进来再生效。
+async function loadEmptyCats(site: string) {
+  emptyCats.value = new Set()
+  try {
+    const r = await api.categoriesEmpty(site)
+    if (site === siteKey.value && r.ready) emptyCats.value = new Set(r.empty)
+  } catch {
+    /* 探测只是锦上添花，失败就当没有 */
   }
 }
 
@@ -286,13 +322,61 @@ function currentChildren(): string {
   return childrenOf(selectedParent.value).map((c) => c.id).join(',')
 }
 
+// 每页条数自定义：站源自己的分页大小 S 固定（取第 1 页的条数），
+// 自定义第 p 页 = 总序号 [(p-1)N, pN)，换算成站源页 floor(start/S)+1 ..
+// floor((end-1)/S)+1，并发拉这几页再拼起来切片。分类聚合（children）走的
+// 是「父+子分类第 1 页合并」，不能这样换算，保持原样。
+const srcSize = new Map<string, number>()
+async function loadPage(ext: string): Promise<VodPage> {
+  const site = siteKey.value
+  const tid = currentTid()
+  const children = currentChildren()
+  const N = vodPerPage.value
+  if (!N || children) return api.vodList(site, tid, curPage.value, ext, children)
+  const key = site + '|' + tid + '|' + ext
+  let p1: VodPage | null = null
+  let S = srcSize.get(key) || 0
+  if (!S) {
+    p1 = await api.vodList(site, tid, 1, ext, '')
+    S = p1.items.length
+    if (!S) return p1
+    srcSize.set(key, S)
+  }
+  const start = (curPage.value - 1) * N
+  const from = Math.floor(start / S) + 1
+  const to = Math.floor((start + N - 1) / S) + 1
+  const first = p1
+  const pgs = await Promise.all(
+    Array.from({ length: to - from + 1 }, (_, i) => {
+      const n = from + i
+      return n === 1 && first ? Promise.resolve(first) : api.vodList(site, tid, n, ext, '')
+    })
+  )
+  const last = pgs[pgs.length - 1]
+  const all = pgs.flatMap((p) => p.items)
+  const off = start - (from - 1) * S
+  const total = last.total || last.pageCount * S
+  return {
+    items: all.slice(off, off + N),
+    page: curPage.value,
+    pageCount: Math.max(1, Math.ceil((last.pageCount > 0 ? Math.max(total, 0) : 0) / N)),
+    total: last.total
+  }
+}
+
+watch(vodPerPage, () => {
+  curPage.value = 1
+  syncQuery()
+  load()
+})
+
 async function load() {
   if (!siteKey.value) return
   loading.value = true
   loadError.value = ''
   try {
     const ext = buildExt()
-    page.value = await api.vodList(siteKey.value, currentTid(), curPage.value, ext, currentChildren())
+    page.value = await loadPage(ext)
   } catch (e: any) {
     loadError.value = humanizeApiError(e)
     app.showTip('列表加载失败：' + humanizeApiError(e))
@@ -323,6 +407,25 @@ function goto(p: number) {
   curPage.value = p
   syncQuery()
   load()
+}
+
+// 翻页步长：10 的幂，且小于总页数（>10 页出现 10 页，>100 页出现 100 页，>1000 页出现 1000 页…）
+const jumpSteps = computed(() => {
+  const out: number[] = []
+  for (let s = 10; s < page.value.pageCount; s *= 10) out.push(s)
+  return out
+})
+const jumpInput = ref('')
+watch(() => page.value.page, (p) => { jumpInput.value = String(p) }, { immediate: true })
+function jumpTo(p: number) {
+  goto(Math.min(Math.max(p, 1), page.value.pageCount))
+}
+function commitJump() {
+  const n = parseInt(jumpInput.value, 10)
+  if (!Number.isFinite(n)) { jumpInput.value = String(page.value.page); return }
+  const t = Math.min(Math.max(n, 1), page.value.pageCount)
+  jumpInput.value = String(t)
+  if (t !== page.value.page) goto(t)
 }
 
 // 解析站点 ext 里的 filters（与后端 cms.FiltersOf 同逻辑）
@@ -435,9 +538,18 @@ function parseFilters(ext: string, tid: string): FilterGroup[] {
       </div>
 
       <div v-if="!isSearching && page.pageCount > 1" class="pager">
-        <el-button size="small" :disabled="page.page <= 1" @click="goto(page.page - 1)">上一页</el-button>
-        <span class="pager-info">{{ page.page }} / {{ page.pageCount }}</span>
-        <el-button size="small" :disabled="page.page >= page.pageCount" @click="goto(page.page + 1)">下一页</el-button>
+        <el-button v-for="st in [...jumpSteps].reverse()" :key="'b' + st" size="small"
+          :disabled="page.page <= 1" @click="jumpTo(page.page - st)">上{{ st }}页</el-button>
+        <el-button size="small" :disabled="page.page <= 1" @click="goto(page.page - 1)">上1页</el-button>
+        <span class="pager-info">
+          第
+          <input v-model="jumpInput" class="pager-input" type="number" inputmode="numeric" min="1"
+            :max="page.pageCount" aria-label="页码" @keydown.enter="commitJump" @blur="commitJump" />
+          / {{ page.pageCount }} 页
+        </span>
+        <el-button size="small" :disabled="page.page >= page.pageCount" @click="goto(page.page + 1)">下1页</el-button>
+        <el-button v-for="st in jumpSteps" :key="'f' + st" size="small"
+          :disabled="page.page >= page.pageCount" @click="jumpTo(page.page + st)">下{{ st }}页</el-button>
       </div>
     </div>
   </div>
@@ -445,7 +557,7 @@ function parseFilters(ext: string, tid: string): FilterGroup[] {
 
 <style scoped>
 .vod-head {
-  padding: 8px 24px 16px;
+  padding: 8px 12px 16px;
 }
 .site-row {
   display: flex;
@@ -474,11 +586,21 @@ function parseFilters(ext: string, tid: string): FilterGroup[] {
 .cats {
   display: flex;
   flex-wrap: wrap;
+  align-content: flex-start;
   gap: 8px;
   margin-bottom: 10px;
+  /* 最多露出 2 行胶囊，更多的纵向滚动 */
+  max-height: 76px;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+}
+.cats .chip {
+  box-sizing: border-box;
+  height: 34px;
+  flex-shrink: 0;
 }
 .cats.sub {
-  padding-left: 24px;
+  padding-left: 12px;
 }
 .cats.filter {
   align-items: center;
@@ -490,15 +612,31 @@ function parseFilters(ext: string, tid: string): FilterGroup[] {
 }
 .pager {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
   justify-content: center;
-  gap: 16px;
+  gap: 8px 12px;
   padding: 24px;
 }
 .pager-info {
   color: var(--sub);
   font-size: 14px;
 }
+.pager .el-button + .el-button { margin-left: 0; }
+.pager-input {
+  width: 48px;
+  height: 24px;
+  margin: 0 4px;
+  text-align: center;
+  color: inherit;
+  background: transparent;
+  border: 1px solid var(--dim, #888);
+  border-radius: 4px;
+  font-size: 14px;
+  -moz-appearance: textfield;
+}
+.pager-input::-webkit-outer-spin-button,
+.pager-input::-webkit-inner-spin-button { -webkit-appearance: none; margin: 0; }
 
 /* ===== 移动端响应式 ===== */
 @media (max-width: 640px) {
@@ -506,11 +644,9 @@ function parseFilters(ext: string, tid: string): FilterGroup[] {
   .site-name { font-size: 18px; }
   .cats, .cats.sub {
     padding: 8px 16px;
-    overflow-x: auto;
-    flex-wrap: nowrap;
-    padding-bottom: 8px;
+    max-height: 84px;
   }
-  .cats .chip, .cats.sub .chip { flex-shrink: 0; }
+  .cats .chip, .cats.sub .chip { height: 30px; }
   .pager { padding: 16px; gap: 12px; }
   .vod-total { font-size: 13px; }
   /* 窄屏换行后不用 auto 外边距硬顶右边，否则换行后前面会空出一大截 */

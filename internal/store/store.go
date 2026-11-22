@@ -526,7 +526,9 @@ func ActiveSites() []model.Site {
 	}
 	var out []model.Site
 	for _, s := range siteList {
-		if s.Usable && set[s.Key] {
+		// 标记为不可用的站源如果用户手动启用了（设置页开关会先探测能连通才放行），
+		// 只要接口是 HTTP 就照样启用。
+		if set[s.Key] && (s.Usable || hasPrefix(s.API)) {
 			out = append(out, s)
 		}
 	}

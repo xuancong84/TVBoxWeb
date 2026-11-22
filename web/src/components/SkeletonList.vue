@@ -129,8 +129,8 @@ defineProps<{
 .skeleton-cards {
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(160px, 1fr));
-  gap: 16px;
-  padding: 0 24px;
+  gap: 8px;
+  padding: 0 12px;
 }
 
 .skeleton-card .skeleton-poster {
@@ -168,8 +168,8 @@ defineProps<{
   
   .skeleton-cards {
     grid-template-columns: repeat(auto-fill, minmax(110px, 1fr));
-    gap: 10px;
-    padding: 0 12px;
+    gap: 5px;
+    padding: 0 6px;
   }
 }
 </style>

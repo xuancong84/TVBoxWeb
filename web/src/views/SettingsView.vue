@@ -4,6 +4,8 @@ import { useRouter } from 'vue-router'
 import { api, humanizeApiError, getAuthToken, setAuthToken } from '@/api'
 import { getTheme, setTheme, type ThemeMode } from '@/theme'
 import { gridCols, setGridCols, resetGridColsToAuto } from '@/gridPrefs'
+import { historyMode, setHistoryMode, type HistoryMode } from '@/historyPrefs'
+import { feedLimit, setFeedLimit, vodPerPage, setVodPerPage } from '@/itemPrefs'
 import { showClockDate, showClockTime, showClockDow } from '@/clockPrefs'
 import { useAppStore } from '@/stores/app'
 import { authState, logout } from '@/auth'
@@ -33,6 +35,24 @@ const gridColsModel = computed({
   get: () => gridCols.value,
   set: (v: number) => setGridCols(v)
 })
+const feedLimitModel = computed({
+  get: () => feedLimit.value,
+  set: (v: number | undefined) => setFeedLimit(v)
+})
+const vodPerPageModel = computed({
+  get: () => vodPerPage.value,
+  set: (v: number | undefined) => setVodPerPage(v)
+})
+const HIST_MODES: { k: HistoryMode; n: string }[] = [
+  { k: 'none', n: '不记录' },
+  { k: 'local', n: '仅本机' },
+  { k: 'sync', n: '同步到服务端' }
+]
+function changeHistoryMode(m: HistoryMode) {
+  setHistoryMode(m)
+  app.feedVersion++
+  app.showTip({ none: '已关闭播放历史', local: '播放历史仅保存在本浏览器', sync: '播放历史同步到服务端' }[m])
+}
 function resetGridCols() {
   resetGridColsToAuto()
   app.showTip(`已恢复自动列数（${gridCols.value} 列）`)
@@ -118,6 +138,7 @@ const liveSources     = ref<RawLive[]>([])
 const liveEnabledSet  = ref<Set<string>>(new Set())
 const liveBusy        = ref<Record<string, boolean>>({})
 const showVodSources  = ref(false)
+const showSubList     = ref(false)
 const showLiveSources = ref(false)
 
 // ===== 内容更新 =====
@@ -329,12 +350,35 @@ async function doCrawl() {
 }
 
 // ---------- 站源 ----------
+const probingKey = ref('')
 async function toggleSite(s: Site, val: boolean | string | number) {
   const on = val as boolean
-  const next = new Set(enabledKeys.value)
+  const prev = enabledKeys.value
+  const next = new Set(prev)
   if (on) next.add(s.key); else next.delete(s.key)
+  // 「不可用」站源可能只是暂时连不上：允许手动启用，但先探测一次；
+  // 探测期间开关保持在「开」，失败就拨回去并弹提示。
+  if (on && !s.usable) {
+    enabledKeys.value = next
+    probingKey.value = s.key
+    try {
+      await api.probeSite(s.key)
+    } catch (e: any) {
+      enabledKeys.value = prev
+      app.showTip(`「${s.name}」启用失败：${humanizeApiError(e)}`)
+      return
+    } finally {
+      probingKey.value = ''
+    }
+  }
   enabledKeys.value = next
-  await api.setEnabled([...next])
+  try {
+    await api.setEnabled([...next])
+  } catch (e: any) {
+    enabledKeys.value = prev
+    app.showTip(`「${s.name}」设置失败：${humanizeApiError(e)}`)
+    return
+  }
   invalidateSiteInfo()
 }
 
@@ -654,20 +698,21 @@ async function clearHistory() {
               <!-- 单仓源：上面订阅源地址递归展开、去重后的叶子地址，每条
                    都是一个独立的单一来源（相对「聚合清单」这种带菜单的
                    多来源地址而言） -->
-              <template v-if="subscriptions.length">
-                <!-- margin:0 —— 这条分割线嵌在 .srow-sub 内部，外层已经有
-                     18px 左右内边距，不用再叠加 .sdiv 自带的那份 margin，
-                     否则会比「点播源」上方那条（在 .card 顶层、靠 margin
-                     撑出 18px）缩进更深，两条线对不齐。 -->
-                <div class="sdiv" style="margin: 0"></div>
-                <div class="list-title-row">
-                  <div class="list-title">单仓源 <span class="list-title-count">{{ subscriptions.length }} 个</span></div>
-                  <div class="list-actions">
-                    <el-button size="small" text @click="selectAllSubs">全选</el-button>
-                    <el-button size="small" text @click="toggleAllSubs">全部反选</el-button>
-                  </div>
+            </div>
+            <template v-if="subscriptions.length">
+              <div class="sdiv"></div>
+              <div class="srow srow-clickable" @click="showSubList = !showSubList">
+                <div class="srow-left">
+                  <span class="srow-title">单仓源</span>
+                  <span class="srow-dim">{{ subscriptions.length }} 个 · {{ showSubList ? '收起' : '展开' }}</span>
                 </div>
-                <div class="sub-list">
+                <span class="arrow">›</span>
+              </div>
+              <div v-if="showSubList" class="list-actions list-actions-pad">
+                <el-button size="small" text @click="selectAllSubs">全选</el-button>
+                <el-button size="small" text @click="toggleAllSubs">全部反选</el-button>
+              </div>
+                <div v-if="showSubList" class="sub-list" style="padding: 0 18px 12px">
                   <div v-for="s in subscriptions" :key="s.id" class="sub-item" :class="{ 'sub-item-off': !s.enabled }">
                     <div class="sub-item-main">
                       <div class="sub-item-top">
@@ -690,8 +735,7 @@ async function clearHistory() {
                     </div>
                   </div>
                 </div>
-              </template>
-            </div>
+            </template>
             <div class="sdiv"></div>
             <!-- 点播源：内容来自上面订阅源合并后的结果，可单条启停——关掉
                  某个点播源之后，它就不会再出现在点播页/首页里（跟「站源」
@@ -713,7 +757,7 @@ async function clearHistory() {
                 <el-switch
                   :model-value="enabledKeys.has(s.key)"
                   size="small"
-                  :disabled="!s.usable"
+                  :loading="probingKey === s.key"
                   @change="(v: any) => toggleSite(s, v)"
                 />
                 <div class="schild-main">
@@ -885,7 +929,7 @@ async function clearHistory() {
               </div>
               <div v-for="s in sites" :key="s.key" class="site-row">
                 <div class="site-bar">
-                  <el-switch :model-value="enabledKeys.has(s.key)" :disabled="!s.usable" @change="(v: any) => toggleSite(s, v)" />
+                  <el-switch :model-value="enabledKeys.has(s.key)" :loading="probingKey === s.key" @change="(v: any) => toggleSite(s, v)" />
                 </div>
                 <div class="site-info">
                   <div class="site-name">
@@ -973,12 +1017,46 @@ async function clearHistory() {
             </div>
             <div class="sdiv"></div>
             <div class="srow">
+              <span class="srow-title">播放历史</span>
+              <span class="srow-val">不记录：不保存任何播放记录；仅本机：只存在本浏览器；同步：存服务端，各设备共享。三种记录互相独立，切换不会迁移已有记录</span>
+            </div>
+            <div class="srow">
+              <span class="srow-val" style="display:flex;gap:8px;flex-wrap:wrap">
+                <span
+                  v-for="m in HIST_MODES"
+                  :key="m.k"
+                  class="chip"
+                  :class="{ active: historyMode === m.k }"
+                  @click="changeHistoryMode(m.k)"
+                >{{ m.n }}</span>
+              </span>
+            </div>
+            <div class="sdiv"></div>
+            <div class="srow">
               <span class="srow-title">每行列数</span>
               <span class="srow-val">点播/首页/搜索/收藏的卡片网格，默认按窗口宽度自动适应，可手动固定（适合电视等大屏）</span>
             </div>
             <div class="srow">
               <el-input-number v-model="gridColsModel" :min="1" :max="20" size="small" />
               <el-button size="small" text @click="resetGridCols">默认/自动</el-button>
+            </div>
+            <div class="sdiv"></div>
+            <div class="srow">
+              <span class="srow-title">最近更新条数</span>
+              <span class="srow-val">首页「最近更新」最多显示多少条，0 = 全部（不会超过已抓取的总数）</span>
+            </div>
+            <div class="srow">
+              <el-input-number v-model="feedLimitModel" :min="0" :max="5000" :step="10" size="small" />
+              <el-button size="small" text @click="setFeedLimit(0)">默认/全部</el-button>
+            </div>
+            <div class="sdiv"></div>
+            <div class="srow">
+              <span class="srow-title">点播每页条数</span>
+              <span class="srow-val">点播页每页显示多少条，0 = 跟随站源自己的分页大小；设大了会多拉几页再拼起来，加载会慢一些</span>
+            </div>
+            <div class="srow">
+              <el-input-number v-model="vodPerPageModel" :min="0" :max="200" :step="10" size="small" />
+              <el-button size="small" text @click="setVodPerPage(0)">默认</el-button>
             </div>
             <div class="sdiv"></div>
             <div class="srow">

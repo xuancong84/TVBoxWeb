@@ -237,7 +237,7 @@ html.dark {
   font-size: 24px;
   font-weight: 600;
   color: var(--txt);
-  padding: 0 16px;
+  padding: 0 12px;
   margin: 16px 0 10px;
 }
 .section-title .count {

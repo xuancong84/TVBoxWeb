@@ -27,6 +27,26 @@ import type {
   WebdavVod
 } from '@/types'
 import { idbGet, idbSet, idbDelete, idbKeys } from '@/idb'
+import {
+  historyMode,
+  localHistoryList,
+  localHistoryUpdate,
+  localHistoryRemove,
+  localHistoryClear
+} from '@/historyPrefs'
+
+// 播放历史按模式分流：sync 走服务端；local 走 localStorage；none 什么都不记。
+const noopOk = () => Promise.resolve({ ok: true } as any)
+function histRoute<T>(kind: 'vod' | 'wd', op: 'list' | 'update' | 'remove' | 'clear', arg: any, remote: () => Promise<T>): Promise<T> {
+  const m = historyMode.value
+  if (m === 'sync') return remote()
+  if (m === 'none') return op === 'list' ? (Promise.resolve([]) as any) : noopOk()
+  if (op === 'list') return Promise.resolve(localHistoryList(kind)) as any
+  if (op === 'update') localHistoryUpdate(kind, arg)
+  else if (op === 'remove') localHistoryRemove(kind, arg)
+  else localHistoryClear(kind)
+  return noopOk()
+}
 
 const BASE = '/api'
 
@@ -307,6 +327,7 @@ export const api = {
   metrics: () => get<any>('/metrics'),
   sites: () => get<Site[]>('/sites'),
   setEnabled: (keys: string[]) => post('/sites/enabled', { keys }),
+  probeSite: (key: string) => post('/sites/probe', { key }),
   sitesSpeed: () => get<{ key: string; name: string; ms: number; ok: boolean }[]>('/sites/speed'),
   sitesHealth: () =>
     get<{ statuses: SiteHealthStatus[]; time: number }>('/sites/health').catch(() => ({ statuses: [], time: 0 })),
@@ -333,6 +354,8 @@ export const api = {
     ),
 
   categories: (site: string) => get<Category[]>(`/categories?site=${encodeURIComponent(site)}`),
+  // 空分类探测：后端永远立即返回；ready=false 表示后台还在探测（路径刻意不放在 /categories 下，避免被 IndexedDB 缓存住 ready=false）
+  categoriesEmpty: (site: string) => get<{ ready: boolean; empty: string[] }>(`/catempty?site=${encodeURIComponent(site)}`),
   vodList: (site: string, tid: string, page: number, ext = '', children = '') =>
     get<VodPage>(
       `/vod?site=${encodeURIComponent(site)}&tid=${encodeURIComponent(tid)}&page=${page}` +
@@ -357,10 +380,10 @@ export const api = {
   suggest: (kw: string, signal?: AbortSignal) => get<string[]>(`/suggest?kw=${encodeURIComponent(kw)}`, signal),
   resolve: (url: string) => post<{ url: string; header: Record<string, string>; via: string; ok: boolean }>('/resolve', { url }),
 
-  history: () => get<HistItem[]>('/history'),
-  updateHistoryPos: (h: HistItem) => post('/history/pos', h),
-  removeHistory: (h: HistItem) => post('/history/remove', h),
-  clearHistory: () => post('/history/clear'),
+  history: () => histRoute('vod', 'list', null, () => get<HistItem[]>('/history')),
+  updateHistoryPos: (h: HistItem) => histRoute('vod', 'update', h, () => post('/history/pos', h)),
+  removeHistory: (h: HistItem) => histRoute('vod', 'remove', h, () => post('/history/remove', h)),
+  clearHistory: () => histRoute('vod', 'clear', null, () => post('/history/clear')),
 
   favorites: () => get<FavItem[]>('/favorites'),
   toggleFavorite: (f: FavItem) => post<{ added: boolean }>('/favorites/toggle', f),
@@ -476,10 +499,10 @@ export const api = {
   webdavList: (src: WebdavSource, path: string) => post<WebdavEntry[]>('/webdav/list', { src, path }),
   webdavScan: (src: WebdavSource, maxDepth: number) => post<WebdavVod[]>('/webdav/scan', { src, maxDepth }),
   webdavVods: (srcId: string) => get<WebdavVod[]>(`/webdav/vods?srcId=${encodeURIComponent(srcId)}`),
-  webdavHistory: () => get<any[]>('/webdav/history'),
-  updateWdHistory: (h: any) => post('/webdav/history/update', h),
-  removeWdHistory: (h: any) => post('/webdav/history/remove', h),
-  clearWebdavHistory: () => post('/webdav/history/clear'),
+  webdavHistory: () => histRoute('wd', 'list', null, () => get<any[]>('/webdav/history')),
+  updateWdHistory: (h: any) => histRoute('wd', 'update', h, () => post('/webdav/history/update', h)),
+  removeWdHistory: (h: any) => histRoute('wd', 'remove', h, () => post('/webdav/history/remove', h)),
+  clearWebdavHistory: () => histRoute('wd', 'clear', null, () => post('/webdav/history/clear')),
 
   directList: () => get<string[]>('/direct'),
   pushDirect: (url: string) => post('/direct', { url }),

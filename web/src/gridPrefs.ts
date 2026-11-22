@@ -16,8 +16,8 @@ const MAX_COLS = 20
 export function autoCols(): number {
   const mobile = window.innerWidth <= 640
   const minCardW = mobile ? 110 : 160
-  const gap = mobile ? 10 : 16
-  const pad = mobile ? 12 : 24
+  const gap = mobile ? 5 : 8
+  const pad = mobile ? 6 : 12
   const avail = Math.max(0, window.innerWidth - pad * 2)
   return Math.max(1, Math.floor((avail + gap) / (minCardW + gap)))
 }

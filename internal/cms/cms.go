@@ -245,10 +245,54 @@ func fetchCtx(ctx context.Context, url string, ttl time.Duration, ms time.Durati
 	}
 	txt, err := httpc.TextCtx(ctx, url, nil, ms)
 	if err != nil {
+		// 直连失败（典型：站源 API 对本机出口 IP 地区封锁）：尝试 SSH_CMDS_GEO_BLOCK
+		// 跳板兜底。只用于 CMS 的 JSON/XML 接口响应（小体积），视频数据从不走这里。
+		if rt, rerr := relayFetch(ctx, url, err); rerr == nil {
+			keep(url, rt)
+			return rt, nil
+		}
 		return "", err
 	}
 	keep(url, txt)
 	return txt, nil
+}
+
+// RelayFetch / RelayWorthy 由 crawler 包在 init 里注入（crawler 依赖 cms，
+// cms 不能反过来 import crawler），指向 SSH 跳板抓取。
+var (
+	RelayFetch  func(ctx context.Context, url string, maxBytes int) ([]byte, error)
+	RelayWorthy func(err error) bool
+)
+
+const (
+	relayMaxBytes = 8 << 20
+	relayCooldown = 5 * time.Minute
+)
+
+// relayFailed 记录各主机最近一次跳板也失败的时间：真正挂掉的站源在冷却期内
+// 不再每次都多付一轮 SSH 握手 + 远端超时的等待。
+var relayFailed sync.Map // host -> time.Time
+
+func relayFetch(ctx context.Context, rawURL string, ferr error) (string, error) {
+	if RelayFetch == nil || RelayWorthy == nil || !strings.HasPrefix(rawURL, "http") || ctx.Err() != nil || !RelayWorthy(ferr) {
+		return "", ferr
+	}
+	host := rawURL
+	if u, err := url.Parse(rawURL); err == nil {
+		host = u.Host
+	}
+	if t, ok := relayFailed.Load(host); ok && time.Since(t.(time.Time)) < relayCooldown {
+		return "", ferr
+	}
+	b, err := RelayFetch(ctx, rawURL, relayMaxBytes)
+	if err != nil || len(bytes.TrimSpace(b)) == 0 {
+		if ctx.Err() == nil {
+			relayFailed.Store(host, time.Now())
+		}
+		return "", ferr
+	}
+	relayFailed.Delete(host)
+	return string(b), nil
 }
 
 func (c *Cms) u(params string) string {

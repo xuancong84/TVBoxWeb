@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { ref, computed, onMounted, onUnmounted, onBeforeUnmount } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
+import { historyMode, localHistoryUpdate } from '@/historyPrefs'
 import { api, proxied, remuxed, humanizeApiError } from '@/api'
 import { useAppStore } from '@/stores/app'
 import { usePlayerStore } from '@/stores/player'
@@ -132,6 +133,7 @@ let liveStallTimer = 0
 // 播放器之间留个短间隔，避免线路瞬间失败（比如地址被猜错容器类型那种，
 // 没有真实网络等待）时原地死循环狂打上游请求。
 const RETRY_FOREVER_DELAY_MS = 1500
+const LIVE_ALL_FAILED_RETRY_MS = 4000
 let retryForeverTimer = 0
 // 这条线这一轮有没有已经武装过"宽限期"检查——只在第一次 onplaying 时武装
 // 一次，避免播放过程中正常的卡顿/恢复反复重新武装，跟 STALL_WINDOW_MS
@@ -311,8 +313,8 @@ function clearRetryForeverTimer() {
  * 列表。隔 RETRY_FOREVER_DELAY_MS 再重建播放器，避免瞬间失败（比如地址
  * 被猜错容器类型、完全没有真实网络等待）时原地死循环狂打上游请求。
  */
-function retryCurrentLineForever() {
-  app.showTip('当前线路播放失败，自动选线已关闭，继续重试这条线路…', 2000)
+function retryCurrentLineForever(tip = '当前线路播放失败，自动选线已关闭，继续重试这条线路…', delayMs = RETRY_FOREVER_DELAY_MS, tipMs = 2000) {
+  app.showTip(tip, tipMs)
   hlsRecover = 0
   lineFatalTotal = 0
   destroyPlayer()
@@ -325,7 +327,7 @@ function retryCurrentLineForever() {
   retryForeverTimer = window.setTimeout(() => {
     retryForeverTimer = 0
     initPlayer()
-  }, RETRY_FOREVER_DELAY_MS)
+  }, delayMs)
 }
 
 /**
@@ -420,6 +422,11 @@ const buffering = ref(false)
 const curMs = ref(0)
 const durMs = ref(0)
 const showOsd = ref(true)
+// 直播控制条平时常驻（不受 12 秒自动隐藏影响），但用户点「隐藏界面」按钮后
+// 要能真的收起来；碰一下画面/动鼠标/按键会再唤出（popOsd 里复位）。
+const liveHidden = ref(false)
+// 控制条此刻是否应当显示：直播看 liveHidden，点播看 showOsd。
+const osdShown = computed(() => (isLive ? !liveHidden.value : showOsd.value))
 const showQ = ref(false)
 const showVol = ref(false)
 const volume = ref(1)
@@ -935,9 +942,17 @@ async function resolveUrl(skipLiveProbe = false) {
       // 这个频道自己的线路（含备用线路）一条都连不上：不自动跳到下一个
       // 频道（那样用户会被悄悄带到一个自己没选的频道），退回频道选择页，
       // 用一条三秒的提示说清楚原因。
+      // 现在也不退回了：隔几秒重新探测/尝试所有线路，直到有线路可用或用户自己离开。
       reportLiveStatus(false)
-      app.showTip('该频道暂时无法播放', 3000)
-      goBack()
+      app.showTip('该频道所有线路暂时都无法播放，几秒后重新尝试…', 3000)
+      buffering.value = true
+      clearRetryForeverTimer()
+      retryForeverTimer = window.setTimeout(() => {
+        retryForeverTimer = 0
+        const keepAuto = autoLineSwitch.value // retry() 会把自动选线重置为开，这里要保留用户的选择
+        retry()
+        autoLineSwitch.value = keepAuto
+      }, LIVE_ALL_FAILED_RETRY_MS)
       return
     }
     finalUrl = url
@@ -1515,8 +1530,11 @@ function onPlayError(errKind?: string) {
     const msg = codecIncompatibleSeen
       ? '该频道所有线路均播放失败，常见原因：源是 HEVC/H.265 编码，当前浏览器/设备不支持硬解码'
       : '该频道所有线路均无法播放'
-    app.showTip(msg, codecIncompatibleSeen ? 5000 : 3000)
-    goBack()
+    // 不退回频道选择页：清空「已试过」记录，隔几秒从头把所有线路再轮一遍，
+    // 直到有线路能播或用户自己换台/返回。间隔拉长一点，避免全部瞬间失败时
+    // 原地狂打上游。
+    triedLines = new Set<string>()
+    retryCurrentLineForever(msg + '，几秒后重新尝试所有线路…', LIVE_ALL_FAILED_RETRY_MS, codecIncompatibleSeen ? 5000 : 3000)
     return
   }
   // 转封装兜底：网盘里很多文件没有扩展名（如「异星战境 Atlas」），
@@ -1837,7 +1855,7 @@ function togglePlay() {
 
 // 点画面：控制条收着时先唤出，再点才切播放/暂停。
 function onSurfaceClick() {
-  if (!showOsd.value) {
+  if (!osdShown.value) {
     popOsd()
     return
   }
@@ -1858,7 +1876,7 @@ function onMouseMove(e: MouseEvent) {
     }
   }
   cursorHidden.value = false
-  if (!showOsd.value && prepared.value) popOsd()
+  if (!osdShown.value && prepared.value) popOsd()
 }
 
 // ---------- 进度条拖动定位 ----------
@@ -2496,6 +2514,11 @@ function savePosBeacon() {
       time: Date.now()
     }
   }
+  if (historyMode.value !== 'sync') {
+    // 本机/不记录模式：不能发给服务端；本机模式同步写 localStorage（关页时也来得及）
+    if (historyMode.value === 'local') localHistoryUpdate(isWd ? 'wd' : 'vod', body)
+    return
+  }
   try {
     const blob = new Blob([JSON.stringify(body)], { type: 'application/json' })
     navigator.sendBeacon(path, blob)
@@ -2525,6 +2548,7 @@ function onVisibilityChange() {
 // ---------- 提示 ----------
 
 function popOsd() {
+  liveHidden.value = false
   // 用 realPosMs() 而不是裸的 currentTime：转封装模式下视频时间戳从
   // seek 点重新计数，直接取会让进度条在每次唤出 OSD 时瞬间往回跳。
   curMs.value = realPosMs()
@@ -2541,7 +2565,9 @@ function popOsd() {
  * 12 秒无操作自动隐藏，三个入口共用这一个函数，保证"隐藏"这个动作本身
  * （包括全屏时顺带隐藏鼠标指针）只有一处实现。
  */
-function hideUI() {
+function hideUI(manual = false) {
+  // 直播只响应用户主动点按钮；12 秒无操作/贴边仍不收起（保持原有常驻行为）。
+  if (manual && isLive) liveHidden.value = true
   if (osdTimer) { clearTimeout(osdTimer); osdTimer = 0 }
   showOsd.value = false
   // 不连带关掉播放设置/选线路面板：面板本身是独立的浮层/弹层，有自己的
@@ -2629,7 +2655,7 @@ function onKey(e: KeyboardEvent) {
   const k = e.key.toLowerCase()
   if (e.key === ' ' || e.key === 'Enter') {
     e.preventDefault()
-    if (!showOsd.value) popOsd()
+    if (!osdShown.value) popOsd()
     else togglePlay()
   } else if (e.key === 'ArrowLeft') {
     e.preventDefault()
@@ -2760,7 +2786,7 @@ onUnmounted(() => {
          按钮的个数不一样，全屏按钮在行里的位置会跟着来回挪，这里改成和
          画中画按钮一样的角标按钮，位置永远固定。 -->
     <button
-      v-if="isLive || showOsd"
+      v-if="osdShown"
       class="corner-btn fullscreen-corner-btn"
       :title="isFullscreen ? '退出全屏 (F)' : '全屏 (F)'"
       @click.stop="toggleFullscreen"
@@ -2768,7 +2794,7 @@ onUnmounted(() => {
 
   <!-- 控制条：不等 prepared，起播前也常驻显示——点播/直播都一样，只是
        直播额外不受 showOsd 自动隐藏影响（见 popOsd 调用处）。 -->
-    <div v-if="isLive || showOsd" class="osd" @click.stop>
+    <div v-if="osdShown" class="osd" @click.stop>
       <div class="osd-top">
         <button class="back-btn" @click="goBack">
           <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M15 18l-6-6 6-6" /></svg>
@@ -2811,9 +2837,9 @@ onUnmounted(() => {
                常驻占地方，点一下才展开。 -->
           <button class="ctl" title="编码信息" @click="toggleCodecInfo">ⓘ</button>
           <!-- 主动隐藏界面：以前只能等 12 秒无操作自动收起，看片想单纯看
-               画面时没法立刻把控制条弄掉。直播控制条已经改成常驻显示，
-               点这个按钮不会有任何可见效果，所以直播下不显示。 -->
-          <button v-if="!isLive" class="ctl" title="隐藏界面" @click="hideUI">隐藏界面</button>
+               画面时没法立刻把控制条弄掉。直播控制条平时常驻，点这个按钮
+               才会收起（liveHidden），碰一下画面/动鼠标再唤出。 -->
+          <button class="ctl" title="隐藏界面" @click="hideUI(true)">隐藏界面</button>
         </div>
         <span class="time">{{ durMs > 0 ? fmtMs(durMs) : (isLive ? '直播' : '') }}</span>
         <span v-if="showVol" class="vol">{{ volPct }}</span>
@@ -2924,13 +2950,13 @@ onUnmounted(() => {
 
       <!-- 全屏时的浮动 OSD（覆盖在视频上方）：不等 prepared，起播前也常驻
            显示；直播额外不受 showOsd 自动隐藏影响。 -->
-      <div v-if="isFullscreen && (isLive || showOsd)" class="m-osd-fullscreen" @click.stop>
+      <div v-if="isFullscreen && osdShown" class="m-osd-fullscreen" @click.stop>
         <div class="m-fs-top">
           <button class="m-back-btn" @click="goBack">
             <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M15 18l-6-6 6-6" /></svg>
           </button>
           <span class="m-fs-title">{{ title }}</span>
-          <button v-if="!isLive" class="m-icon-btn" title="隐藏界面" @click="hideUI">⌄</button>
+          <button class="m-icon-btn" title="隐藏界面" @click="hideUI(true)">⌄</button>
           <button class="m-icon-btn" @click="toggleFullscreen">⤓</button>
         </div>
         <div class="m-fs-bottom">

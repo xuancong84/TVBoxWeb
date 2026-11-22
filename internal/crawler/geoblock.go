@@ -13,8 +13,14 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/xxl6097/TVBoxWeb/internal/cms"
 	"github.com/xxl6097/TVBoxWeb/internal/httpc"
 )
+
+func init() {
+	cms.RelayFetch = FetchSmallViaGeoRelay
+	cms.RelayWorthy = worthGeoRelay
+}
 
 // blobRe 识别「伪装成图片」的地区限制源里嵌入的 base64 配置块：有些源
 // （例如饭太硬 /tv 接口）对境外 IP 返回一张干净的占位「图片」，只有对大陆

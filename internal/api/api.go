@@ -3,6 +3,7 @@ package api
 
 import (
 	"bytes"
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -101,6 +102,7 @@ func Handler() *http.ServeMux {
 	mux.HandleFunc("/api/upgrade/run", hUpgradeRun)
 	mux.HandleFunc("/api/sites", hSites)
 	mux.HandleFunc("/api/sites/enabled", hSitesEnabled)
+	mux.HandleFunc("/api/sites/probe", hSitesProbe)
 	mux.HandleFunc("/api/sites/speed", hSitesSpeed)
 	mux.HandleFunc("/api/sites/health", hSitesHealth)
 	mux.HandleFunc("/api/config", hConfig)
@@ -112,6 +114,7 @@ func Handler() *http.ServeMux {
 	mux.HandleFunc("/api/subscriptions/roots", hSubscriptionRoots)
 	mux.HandleFunc("/api/subscriptions/sync", hSubscriptionsSync)
 	mux.HandleFunc("/api/categories", hCategories)
+	mux.HandleFunc("/api/catempty", hCategoriesEmpty)
 	mux.HandleFunc("/api/vod", hVod)
 	mux.HandleFunc("/api/vod/detail", hVodDetail)
 	mux.HandleFunc("/api/vod/search", hVodSiteSearch)
@@ -643,6 +646,39 @@ func siteSeverity(stat store.SiteHealthStat, count int) int {
 		return 2
 	}
 	return 3
+}
+
+// hSitesProbe 在用户手动启用一个「不可用」站源前探测它此刻能不能连通：
+// 能取到分类列表才算通。失败时前端把开关拨回去并弹提示。
+func hSitesProbe(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Key string `json:"key"`
+	}
+	if err := body(r, &req); err != nil {
+		fail(w, 400, "参数错误")
+		return
+	}
+	site := store.Site(req.Key)
+	if site == nil {
+		fail(w, 400, "站源不存在")
+		return
+	}
+	if !strings.HasPrefix(site.API, "http") {
+		fail(w, 400, "接口地址不是 HTTP，无法使用")
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 20*time.Second)
+	defer cancel()
+	cats, err := cms.New(*site).CategoriesCtx(ctx)
+	if err != nil {
+		fail(w, 502, "站源暂时连不上："+err.Error())
+		return
+	}
+	if len(cats) == 0 {
+		fail(w, 502, "站源连上了但没有返回任何分类")
+		return
+	}
+	ok(w, map[string]any{"ok": true, "categories": len(cats)})
 }
 
 func hSitesEnabled(w http.ResponseWriter, r *http.Request) {

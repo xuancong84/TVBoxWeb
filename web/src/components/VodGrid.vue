@@ -257,8 +257,8 @@ onUnmounted(() => {
   /* 实际列数由 gridPrefs.ts 的 gridCols 通过 inline style 决定（见上面模板），
      这里的 auto-fill 只是兜底（inline style 还没挂上之前的一帧）。 */
   grid-template-columns: repeat(auto-fill, minmax(160px, 1fr));
-  gap: 16px;
-  padding: 0 24px;
+  gap: 8px;
+  padding: 0 12px;
 }
 
 /* 卡片高度必须一致，行高才能算准：
@@ -279,8 +279,8 @@ onUnmounted(() => {
 @media (max-width: 640px) {
   .vod-grid {
     grid-template-columns: repeat(auto-fill, minmax(110px, 1fr));
-    gap: 10px;
-    padding: 0 12px;
+    gap: 5px;
+    padding: 0 6px;
   }
   .vod-grid :deep(.name) {
     min-height: calc(13px * 1.3 * 2);
