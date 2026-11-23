@@ -48,8 +48,10 @@ type Data struct {
 	// 默认开启，置 true 时后台扫描循环直接跳过，不联网测任何频道——给不
 	// 想要这个常驻后台任务占用带宽/连接数的用户关掉用，已经测出来的结果
 	// 不受影响，重新打开立刻从断点接着扫。
-	LiveScanOff   bool                         `json:"liveScanOff"`
-	Feed          []model.Vod                  `json:"feed"`
+	LiveScanOff bool        `json:"liveScanOff"`
+	Feed        []model.Vod `json:"feed"`
+	// FeedIdx：Feed（原始顺序，只存一份）按各排行指标降序排好的下标，见 BuildFeedIndex。
+	FeedIdx       map[string][]int             `json:"feedIdx,omitempty"`
 	CrawlAt       int64                        `json:"crawlAt"`
 	CrawlSummary  string                       `json:"crawlSummary"`
 	DeadKeys      []string                     `json:"deadKeys"`
@@ -1227,7 +1229,6 @@ func SetTapVibrate(v int) { mu.Lock(); data.TapVibrate = v; mu.Unlock(); flush()
 // ---------- 定时抓取 ----------
 
 func Feed() []model.Vod          { mu.RLock(); defer mu.RUnlock(); return data.Feed }
-func SaveFeed(list []model.Vod)  { mu.Lock(); data.Feed = list; mu.Unlock(); flush() }
 func LastCrawlAt() int64         { mu.RLock(); defer mu.RUnlock(); return data.CrawlAt }
 func SetLastCrawlAt(t int64)     { mu.Lock(); data.CrawlAt = t; mu.Unlock(); flush() }
 func CrawlSummary() string       { mu.RLock(); defer mu.RUnlock(); return data.CrawlSummary }

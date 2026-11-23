@@ -21,13 +21,20 @@ type SiteCrawlEntry struct {
 	OK    bool        `json:"ok"`
 	Total int         `json:"total"`
 	Items []model.Vod `json:"items"`
+	// V 是条目结构版本：低于 crawler.siteCacheVer 的旧缓存（比如还没带排行
+	// 指标字段的）视为过期，下一轮重新联网抓一次。
+	V int `json:"v,omitempty"`
+	// Pages 是站源报告的总页数；Deep 是第 2..N 页的影片（只给提供排行指标的站源
+	// 抓，供各指标榜单用，不进首页轮转）。
+	Pages int         `json:"pages,omitempty"`
+	Deep  []model.Vod `json:"deep,omitempty"`
 }
 
 // siteCacheFileName 跟 store.json 分开存的原因：条目数跟站源总数（几千）
 // 同量级，每条还带最多 SitePool 条影片，塞进 store.json 会让它体积暴涨、
 // 任何一个小改动（比如切个开关）都要整份重新序列化落盘；这份数据本质上
 // 是可丢弃的缓存（丢了大不了重新抓一遍），拆成单独文件、用 gzip 压缩
-//（JSON 高度重复，压缩比很高）更合适。
+// （JSON 高度重复，压缩比很高）更合适。
 const siteCacheFileName = "sitecrawl_cache.json.gz"
 
 var (

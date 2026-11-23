@@ -1738,7 +1738,7 @@ func hCrawl(w http.ResponseWriter, r *http.Request) {
 }
 
 func hFeed(w http.ResponseWriter, r *http.Request) {
-	ok(w, map[string]any{"feed": store.Feed(), "deadKeys": store.DeadKeys(), "summary": store.CrawlSummary()})
+	ok(w, map[string]any{"feed": store.Feed(), "index": store.FeedIndex(), "pool": store.FeedPool(), "deadKeys": store.DeadKeys(), "summary": store.CrawlSummary()})
 }
 
 func hQualityMaster(w http.ResponseWriter, r *http.Request) {

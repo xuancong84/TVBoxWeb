@@ -61,6 +61,14 @@ export interface Vod {
   // 砍掉了，省存储），后端会顺手存一个总集数算好的整数；有 playUrl 的
   // 地方（点播/搜索）不用这个字段，前端直接现算更准。
   epCount?: number
+  // 排行指标（站源没给/填 0 时缺省）：ts = vod_time 的 Unix 秒
+  ts?: number
+  score?: number
+  douban?: number
+  hits?: number
+  hitsWeek?: number
+  hitsMonth?: number
+  up?: number
 }
 
 export interface Episode {

@@ -31,6 +31,24 @@ func (f FlexInt) MarshalJSON() ([]byte, error) {
 	return []byte(strconv.Itoa(int(f))), nil
 }
 
+// FlexFloat 兼容「数字 / 字符串数字 / 空串」三种 JSON 取值（采集站的评分、点击数
+// 字段写法五花八门），解不出来一律按 0 处理。
+type FlexFloat float64
+
+func (f *FlexFloat) UnmarshalJSON(b []byte) error {
+	s := strings.Trim(strings.TrimSpace(string(b)), `"`)
+	if v, err := strconv.ParseFloat(s, 64); err == nil {
+		*f = FlexFloat(v)
+	} else {
+		*f = 0
+	}
+	return nil
+}
+
+func (f FlexFloat) MarshalJSON() ([]byte, error) {
+	return []byte(strconv.FormatFloat(float64(f), 'f', -1, 64)), nil
+}
+
 // ============ TVBox 配置 JSON 原始结构 ============
 
 type RawSite struct {
@@ -94,8 +112,15 @@ type JVod struct {
 	VodPlayFrom string  `json:"vod_play_from"`
 	VodPlayURL  string  `json:"vod_play_url"`
 	VodTime     string  `json:"vod_time"`
-	TypeName    string  `json:"type_name"`
-	Tid         FlexInt `json:"tid"`
+	// 排行类指标（标准 Maccms 才有，不少站源填 0 或乱填，只用来站内排序）
+	VodScore       FlexFloat `json:"vod_score"`
+	VodDoubanScore FlexFloat `json:"vod_douban_score"`
+	VodHits        FlexFloat `json:"vod_hits"`
+	VodHitsWeek    FlexFloat `json:"vod_hits_week"`
+	VodHitsMonth   FlexFloat `json:"vod_hits_month"`
+	VodUp          FlexFloat `json:"vod_up"`
+	TypeName       string    `json:"type_name"`
+	Tid            FlexInt   `json:"tid"`
 }
 
 type JClass struct {
@@ -182,6 +207,16 @@ type Vod struct {
 	// 了 From/PlayURL 的场景（点播/搜索）前端会直接现算，比这个快照
 	// 更准，不依赖这个字段。
 	EpCount int `json:"epCount,omitempty"`
+	// 排行指标（都是 omitempty：站源没给/填 0 就不落盘）。Time 是 vod_time
+	// 解析出的 Unix 秒；其余来自 Maccms 的 vod_score / vod_douban_score /
+	// vod_hits / vod_hits_week / vod_hits_month / vod_up。首页按它们排序取前 N。
+	Time      int64   `json:"ts,omitempty"`
+	Score     float64 `json:"score,omitempty"`
+	Douban    float64 `json:"douban,omitempty"`
+	Hits      float64 `json:"hits,omitempty"`
+	HitsWeek  float64 `json:"hitsWeek,omitempty"`
+	HitsMonth float64 `json:"hitsMonth,omitempty"`
+	Up        float64 `json:"up,omitempty"`
 }
 
 type Episode struct {

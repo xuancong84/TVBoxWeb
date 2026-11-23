@@ -530,6 +530,14 @@ func (c *Cms) toVod(j model.JVod) model.Vod {
 		PlayURL:  unescapeEntities(s(j.VodPlayURL)),
 		SiteKey:  c.site.Key,
 		SiteName: c.site.Name,
+
+		Time:      parseVodTime(j.VodTime),
+		Score:     float64(j.VodScore),
+		Douban:    float64(j.VodDoubanScore),
+		Hits:      float64(j.VodHits),
+		HitsWeek:  float64(j.VodHitsWeek),
+		HitsMonth: float64(j.VodHitsMonth),
+		Up:        float64(j.VodUp),
 	}
 	content := s(j.VodContent)
 	if content == "" {
@@ -540,6 +548,28 @@ func (c *Cms) toVod(j model.JVod) model.Vod {
 }
 
 // ---------- 静态工具 ----------
+
+// parseVodTime 把 vod_time（"2006-01-02 15:04:05" / 纯日期 / Unix 秒）解析成
+// Unix 秒，按东八区解释（采集站基本都在国内）。解不出来返回 0。
+func parseVodTime(raw string) int64 {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return 0
+	}
+	if n, err := strconv.ParseInt(raw, 10, 64); err == nil && n > 1e9 {
+		if n > 1e12 {
+			n /= 1000
+		}
+		return n
+	}
+	loc := time.FixedZone("CST", 8*3600)
+	for _, layout := range []string{"2006-01-02 15:04:05", "2006-01-02 15:04", "2006-01-02", "2006/01/02 15:04:05", "2006/01/02"} {
+		if t, err := time.ParseInLocation(layout, raw, loc); err == nil {
+			return t.Unix()
+		}
+	}
+	return 0
+}
 
 func s(v string) string { return strings.TrimSpace(v) }
 

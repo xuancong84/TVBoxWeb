@@ -9,7 +9,7 @@ import TopBar from '@/components/TopBar.vue'
 import VodGrid from '@/components/VodGrid.vue'
 import SkeletonList from '@/components/SkeletonList.vue'
 import { gridCols } from '@/gridPrefs'
-import { feedLimit } from '@/itemPrefs'
+import { feedLimit, feedSort, setFeedSort, FEED_SORTS } from '@/itemPrefs'
 
 const router = useRouter()
 const app = useAppStore()
@@ -17,7 +17,20 @@ const app = useAppStore()
 const history = ref<HistItem[]>([])
 const feed = ref<Vod[]>([])
 const feedSummary = ref('')
-const feedShown = computed(() => (feedLimit.value > 0 ? feed.value.slice(0, feedLimit.value) : feed.value))
+// 排序下标由后端算好（各指标一份，只存下标）；不提供该指标的站源的影片不在索引里。
+// 'orig'（站点排序）直接用原始顺序。后端没给 index（旧缓存）时退回原始顺序。
+const feedIndex = ref<Record<string, number[]> | undefined>()
+const feedPool = ref<Vod[]>([]) // 各榜单用到、但不在首页轮转列表里的候选，下标接在 feed 后面
+const feedSorted = computed<Vod[]>(() => {
+  const k = feedSort.value
+  if (k === 'orig' || !feedIndex.value) return feed.value
+  const idx = feedIndex.value[k]
+  if (!idx) return []
+  const nf = feed.value.length
+  return idx.map((i) => (i < nf ? feed.value[i] : feedPool.value[i - nf])).filter(Boolean)
+})
+const feedShown = computed(() => (feedLimit.value > 0 ? feedSorted.value.slice(0, feedLimit.value) : feedSorted.value))
+const feedTitle = computed(() => FEED_SORTS.find((s) => s.k === feedSort.value)?.title || '最近更新')
 const loading = ref(true)
 const hasSites = ref(false)
 const confirmClear = ref(false)
@@ -75,6 +88,8 @@ async function loadFeed() {
       } as HistItem))
     history.value = [...normal, ...wdItems].sort((a, b) => (b.time || 0) - (a.time || 0))
     feed.value = f.feed
+    feedIndex.value = f.index
+    feedPool.value = f.pool || []
     feedSummary.value = f.summary
   } finally {
     loading.value = false
@@ -323,12 +338,19 @@ function refresh() {
 
     <!-- 最近更新 -->
     <div class="section-title">
-      最近更新
+      {{ feedTitle }}
       <span v-if="feed.length" class="count">{{ feedShown.length }} 条</span>
       <span v-if="feedSummary" class="summary">{{ feedSummary }}</span>
+      <el-select :model-value="feedSort" size="small" class="sort-sel" :teleported="true" @update:model-value="setFeedSort">
+        <el-option v-for="s in FEED_SORTS" :key="s.k" :label="s.n" :value="s.k" />
+      </el-select>
       <span class="more" :class="{ updating }" @click="refresh">{{ updating ? `更新中 ${updatePct}%` : '更新 ›' }}</span>
     </div>
     <VodGrid :vods="feedShown" :loading="loading" />
+    <div v-if="!loading && feed.length && !feedShown.length" class="empty">
+      <p>没有站源提供「{{ FEED_SORTS.find((s) => s.k === feedSort)?.n }}」这项数据</p>
+      <p class="hint">换一个排序方式试试</p>
+    </div>
     <div v-if="!loading && !feed.length" class="empty">
       <template v-if="hasSites">
         <p>暂无内容，正在拉取最新影片…</p>
@@ -475,6 +497,32 @@ function refresh() {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+.sort-sel {
+  width: 140px;
+  margin: 0 10px 0 auto; /* 靠右，紧挨着「更新」 */
+  flex: none;
+  vertical-align: middle;
+  font-weight: normal;
+}
+/* 高度/字号跟小节标题（桌面 24px、≤640px 手机 18px）对齐 */
+.sort-sel :deep(.el-select__wrapper) {
+  min-height: 34px;
+  font-size: 18px;
+  padding: 0 12px;
+}
+@media (max-width: 640px) {
+  .sort-sel {
+    width: 108px;
+  }
+  .sort-sel :deep(.el-select__wrapper) {
+    min-height: 26px;
+    font-size: 14px;
+    padding: 0 8px;
+  }
+}
+.sort-sel + .more {
+  margin-left: 0;
 }
 .summary {
   font-size: 12px;

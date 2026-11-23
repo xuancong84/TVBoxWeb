@@ -89,6 +89,16 @@ const (
 	// 组装时去重撞车了就换这个池子里的下一条候选继续凑。站源自己一页
 	// 通常也就返回二三十条，这个数再大也没有更多候选可留，纯粹是上限。
 	SitePool = 32
+	// siteCacheVer 站源缓存条目的结构版本：2 = 带排行指标（时间/评分/点击/点赞）。
+	siteCacheVer = 3
+	// DeepPages 给「提供排行指标」的站源额外往后抓到第几页（含第 1 页）：各指标榜单
+	// 的候选池。按「页号在外层、站源在内层」的顺序抓——先把所有站源的第 2 页
+	// 抓完，再抓所有站源的第 3 页……这样同一个站源两次请求之间天然隔着一整轮。
+	DeepPages = 10
+	// DeepRate 深层分页抓取的全局限速（相邻两次请求的最小间隔）；DeepRoundMin 是
+	// 每一页轮次的最短耗时（站源很少时防止对同一站源连续猛敲）。
+	DeepRate     = 80 * time.Millisecond
+	DeepRoundMin = 1500 * time.Millisecond
 	// FeedMax 首页「最近更新」最终的总条数上限（即需求里的 totalN），
 	// 默认 720 = 6!。组装方式见 Run() 里的「按站源热度排序后轮转取样」：
 	// 不再是「站源 A 一次拿够 8 条再换站源 B」，而是把所有贡献了候选的
@@ -224,7 +234,7 @@ func Run(force bool) CrawlResult {
 	var staleSites []model.Site
 	for _, s := range sites {
 		entry, ok := store.GetSiteCrawlEntry(s.Key)
-		if ok && now.Sub(time.UnixMilli(entry.At)) < SiteCacheMaxAge {
+		if ok && entry.V >= siteCacheVer && now.Sub(time.UnixMilli(entry.At)) < SiteCacheMaxAge {
 			apply(s, entry.Items)
 			continue
 		}
@@ -233,6 +243,8 @@ func Run(force bool) CrawlResult {
 
 	var cursor int
 	var cursorMu sync.Mutex
+	var deepSites []deepJob
+	var deepMu sync.Mutex
 	worker := func() {
 		for {
 			cursorMu.Lock()
@@ -246,12 +258,13 @@ func Run(force bool) CrawlResult {
 
 			s := staleSites[i]
 			var items []model.Vod
-			total := 0
+			total, pages := 0, 0
 			ok := false
 			c := cms.New(s)
 			if pg, err := c.List("", 1); err == nil {
 				ok = true
 				total = pg.Total
+				pages = pg.PageCount
 				for k, v := range pg.Items {
 					if k >= SitePool {
 						break
@@ -259,14 +272,7 @@ func Run(force bool) CrawlResult {
 					if v.ID == "" || v.Name == "" {
 						continue
 					}
-					items = append(items, model.Vod{
-						ID: v.ID, Name: v.Name, Pic: v.Pic, Remark: v.Remark,
-						Year: v.Year, Area: v.Area, TypeName: v.TypeName,
-						SiteKey: s.Key, SiteName: s.Name,
-						// From/PlayURL 整份不留（太占地方），总集数这个小
-						// 整数在落盘前先从这次抓到的完整数据里算出来存着。
-						EpCount: cms.EpCount(v.From, v.PlayURL),
-					})
+					items = append(items, slimVod(v, s))
 				}
 				if total <= 0 {
 					total = len(pg.Items) // 有些站不报总数，退化成用本页条数
@@ -279,8 +285,13 @@ func Run(force bool) CrawlResult {
 			// 落进本地缓存，带上这次抓取的时间戳：下一轮（哪怕是服务重启
 			// 触发的那一轮）只要没超过 SiteCacheMaxAge 就不用再联网。
 			store.SetSiteCrawlEntry(s.Key, store.SiteCrawlEntry{
-				At: time.Now().UnixMilli(), OK: ok, Total: total, Items: items,
+				At: time.Now().UnixMilli(), OK: ok, Total: total, Items: items, V: siteCacheVer, Pages: pages,
 			})
+			if ok && pages > 1 && hasRankMetric(items) {
+				deepMu.Lock()
+				deepSites = append(deepSites, deepJob{site: s, pages: pages})
+				deepMu.Unlock()
+			}
 			apply(s, items)
 		}
 	}
@@ -294,6 +305,8 @@ func Run(force bool) CrawlResult {
 		}()
 	}
 	wg.Wait()
+	// 提供排行指标的站源再往后抓几页，给各指标榜单凑足候选（见 DeepPages）。
+	fetchDeepPages(deepSites)
 	// 这一轮真正联网抓到的站源结果统一落一次盘（gzip 压缩），而不是
 	// 每抓完一个站源就落盘一次——几千个站源逐条落盘太费 IO。
 	store.FlushSiteCrawlCache()
@@ -382,6 +395,7 @@ func Run(force bool) CrawlResult {
 	}
 	feed = filterVodBySite(feed, activeNow)
 	dead = filterKeys(dead, activeNow)
+	extra := collectPoolCandidates(feed, activeNow)
 
 	res.Alive = aliveCount
 	res.Dead = len(dead)
@@ -392,7 +406,7 @@ func Run(force bool) CrawlResult {
 		res.Msg = "这一轮没有抓到数据，可能是网络不通或站源集体失效"
 	}
 
-	store.SaveFeed(feed)
+	store.SaveFeedWithPool(feed, extra)
 	store.SaveDeadKeys(dead)
 	store.SetLastCrawlAt(res.At)
 	store.SaveCrawlSummary(SummaryOf(res))
@@ -628,13 +642,7 @@ func RebuildFromSubscriptions() store.SubResult {
 	for _, s := range store.Sites() {
 		keepSite[s.Key] = true
 	}
-	var kept []model.Vod
-	for _, v := range store.Feed() {
-		if keepSite[v.SiteKey] {
-			kept = append(kept, v)
-		}
-	}
-	store.SaveFeed(kept)
+	store.FilterFeedSites(keepSite)
 
 	mergedName := strings.Join(names, " + ")
 	store.SetSubName(mergedName)
@@ -1116,4 +1124,146 @@ func fmtTime(ms int64) string {
 	}
 	t := time.UnixMilli(ms)
 	return t.Format("01-02 15:04")
+}
+
+// slimVod 把抓到的完整影片压成「缓存/首页用」的小结构：From/PlayURL 整份不留
+// （太占地方），总集数这个小整数先从完整数据里算出来存着。
+func slimVod(v model.Vod, s model.Site) model.Vod {
+	return model.Vod{
+		ID: v.ID, Name: v.Name, Pic: v.Pic, Remark: v.Remark,
+		Year: v.Year, Area: v.Area, TypeName: v.TypeName,
+		SiteKey: s.Key, SiteName: s.Name,
+		EpCount: cms.EpCount(v.From, v.PlayURL),
+		Time:    v.Time, Score: v.Score, Douban: v.Douban,
+		Hits: v.Hits, HitsWeek: v.HitsWeek, HitsMonth: v.HitsMonth, Up: v.Up,
+	}
+}
+
+// hasRankMetric 站源这一页里有没有任何一条带有效（>0）的排行指标——没有就说明
+// 这个站源不提供这些数据，往后翻页也是白抓。（更新时间不算：它每个站源都有，
+// 而且往后翻页只会更旧。）
+func hasRankMetric(items []model.Vod) bool {
+	for _, v := range items {
+		if v.Hits > 0 || v.HitsWeek > 0 || v.HitsMonth > 0 || v.Up > 0 || v.Score > 0 || v.Douban > 0 {
+			return true
+		}
+	}
+	return false
+}
+
+type deepJob struct {
+	site  model.Site
+	pages int
+}
+
+// fetchDeepPages 对 jobs 里的站源抓第 2..DeepPages 页。外层循环是页号、内层
+// 是站源（并发 + 全局限速）：同一个站源的两次请求之间隔着其余所有站源的同
+// 一页，不会对单个站源连续猛敲。某站源出错 / 翻到头 / 这页没有新条目（有些站
+// 忽略 pg 参数一直返回同一页）就不再往后翻它。结果写回站源缓存的 Deep 字段。
+func fetchDeepPages(jobs []deepJob) {
+	if len(jobs) == 0 {
+		return
+	}
+	type state struct {
+		deepJob
+		items []model.Vod
+		seen  map[string]bool
+		done  bool
+	}
+	states := make([]*state, len(jobs))
+	for i, j := range jobs {
+		states[i] = &state{deepJob: j, seen: map[string]bool{}}
+		if e, ok := store.GetSiteCrawlEntry(j.site.Key); ok {
+			for _, v := range e.Items {
+				states[i].seen[v.ID] = true
+			}
+		}
+	}
+	tick := time.NewTicker(DeepRate)
+	defer tick.Stop()
+	for p := 2; p <= DeepPages; p++ {
+		var active []*state
+		for _, st := range states {
+			if !st.done && p <= st.pages {
+				active = append(active, st)
+			}
+		}
+		if len(active) == 0 {
+			break
+		}
+		start := time.Now()
+		var cur int
+		var curMu sync.Mutex
+		var wg sync.WaitGroup
+		for w := 0; w < Conc*2; w++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				for {
+					curMu.Lock()
+					if cur >= len(active) {
+						curMu.Unlock()
+						return
+					}
+					st := active[cur]
+					cur++
+					<-tick.C // 全局限速：相邻两次请求至少隔 DeepRate
+					curMu.Unlock()
+					pg, err := cms.New(st.site).List("", p)
+					fresh := 0
+					if err == nil {
+						for _, v := range pg.Items {
+							if v.ID == "" || v.Name == "" || st.seen[v.ID] {
+								continue
+							}
+							st.seen[v.ID] = true
+							st.items = append(st.items, slimVod(v, st.site))
+							fresh++
+						}
+					}
+					if err != nil || fresh == 0 {
+						st.done = true
+					}
+				}
+			}()
+		}
+		wg.Wait()
+		if d := time.Since(start); d < DeepRoundMin {
+			time.Sleep(DeepRoundMin - d)
+		}
+	}
+	for _, st := range states {
+		if e, ok := store.GetSiteCrawlEntry(st.site.Key); ok {
+			e.Deep = st.items
+			store.SetSiteCrawlEntry(st.site.Key, e)
+		}
+	}
+}
+
+// collectPoolCandidates 把所有现役站源缓存里（第 1 页 + 深层分页）不在首页列表
+// 里的影片收集成各指标榜单的候选池（最终由 store.BuildFeedIndex 筛出真正
+// 入榜的那部分再落盘）。
+func collectPoolCandidates(feed []model.Vod, active map[string]bool) []model.Vod {
+	inFeed := map[string]bool{}
+	for _, v := range feed {
+		inFeed[v.SiteKey+"\x00"+v.ID] = true
+	}
+	var out []model.Vod
+	for key := range active {
+		e, ok := store.GetSiteCrawlEntry(key)
+		if !ok {
+			continue
+		}
+		for _, list := range [][]model.Vod{e.Items, e.Deep} {
+			for _, v := range list {
+				k := v.SiteKey + "\x00" + v.ID
+				if inFeed[k] {
+					continue
+				}
+				inFeed[k] = true
+				out = append(out, v)
+			}
+		}
+	}
+	return out
 }

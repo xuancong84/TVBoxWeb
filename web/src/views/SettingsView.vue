@@ -1043,7 +1043,7 @@ async function clearHistory() {
             <div class="sdiv"></div>
             <div class="srow">
               <span class="srow-title">最近更新条数</span>
-              <span class="srow-val">首页「最近更新」最多显示多少条，0 = 全部（不会超过已抓取的总数）</span>
+              <span class="srow-val">首页榜单（最近更新/最热剧等）最多显示多少条，0 = 全部（不会超过已抓取的总数）</span>
             </div>
             <div class="srow">
               <el-input-number v-model="feedLimitModel" :min="0" :max="5000" :step="10" size="small" />

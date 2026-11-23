@@ -452,7 +452,8 @@ export const api = {
   // 这个调用只是「问一下要不要补跑一轮」：没到间隔、或者已经在跑，
   // started 都是 false，不会真的现抓现等。
   triggerCrawl: () => post<{ started: boolean; running?: boolean }>('/crawl', {}),
-  feed: () => get<{ feed: Vod[]; deadKeys: string[]; summary: string }>('/feed'),
+  // index：各排行指标降序排好的下标，指向 feed 后面接上 pool 的拼接列表（只含提供该指标的站源的影片；没有任何站源提供的指标不出现）
+  feed: () => get<{ feed: Vod[]; pool?: Vod[]; index?: Record<string, number[]>; deadKeys: string[]; summary: string }>('/feed'),
   qualityMaster: (url: string) => post<QLevel[]>('/quality/master', { url }),
 
   // skipA/skipB 用于按剧读写片头片尾设置（点播 site+vodId，网盘 srcId+vodName）。

@@ -237,6 +237,7 @@ func New(opts ...Option) (*Server, error) {
 		return nil, fmt.Errorf("tvbox: 加载数据失败: %w", err)
 	}
 	store.InitSiteCrawlCache(o.DataDir)
+	store.InitFeedPool(o.DataDir)
 	store.InitLiveCrawlCache(o.DataDir)
 	cms.InitDiskCache(o.DataDir)
 
