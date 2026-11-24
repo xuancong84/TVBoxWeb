@@ -680,9 +680,9 @@ func RebuildFromSubscriptions() store.SubResult {
 // 合并结果），要查「这个点播源/直播源是哪条单仓源带来的」只能现查。
 // 现查而不是缓存：订阅数量通常只有几十条，一次全扫是毫秒级，没必要为了
 // 这个纯展示用途多维护一份状态。
-func SiteLiveProvenance() (byAPI map[string][]model.SubRef, byLiveURL map[string][]model.SubRef) {
-	byAPI = map[string][]model.SubRef{}
-	byLiveURL = map[string][]model.SubRef{}
+func SiteLiveProvenance() (refs []model.SubRef, byAPI map[string][]int, byLiveURL map[string][]int) {
+	byAPI = map[string][]int{}
+	byLiveURL = map[string][]int{}
 	for _, s := range store.Subscriptions() {
 		if !s.Enabled || s.Text == "" {
 			continue
@@ -695,19 +695,24 @@ func SiteLiveProvenance() (byAPI map[string][]model.SubRef, byLiveURL map[string
 		if name == "" {
 			name = s.Name
 		}
-		ref := model.SubRef{Name: name, Source: s.Source}
+		ri := len(refs)
+		refs = append(refs, model.SubRef{Name: name, Source: s.Source})
 		for _, site := range cfg.Sites {
 			if site.API == "" {
 				continue
 			}
-			byAPI[site.API] = append(byAPI[site.API], ref)
+			if l := byAPI[site.API]; len(l) == 0 || l[len(l)-1] != ri {
+				byAPI[site.API] = append(l, ri)
+			}
 		}
 		for _, l := range cfg.Lives {
 			u := trim(l.URL)
 			if u == "" {
 				continue
 			}
-			byLiveURL[u] = append(byLiveURL[u], ref)
+			if x := byLiveURL[u]; len(x) == 0 || x[len(x)-1] != ri {
+				byLiveURL[u] = append(x, ri)
+			}
 		}
 	}
 	return

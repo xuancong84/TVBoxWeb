@@ -100,6 +100,10 @@ function healthOf(key: string): string {
 const sortedSites = computed(() =>
   [...sites.value].sort((a, b) => b.count - a.count || a.severity - b.severity)
 )
+// 下拉里站源的颜色：设置里禁用=深红，启用且有内容=亮绿，启用但没内容=灰。
+function siteState(s: { enabled: boolean; count: number }) {
+  return !s.enabled ? 'st-off' : s.count > 0 ? 'st-on' : 'st-empty'
+}
 function refreshAll() {
   void loadHealth()
   load()
@@ -464,8 +468,8 @@ function parseFilters(ext: string, tid: string): FilterGroup[] {
           {{ searching ? '搜索中…' : `搜到 ${(searchResults || []).length} 部` }}
         </span>
         <span v-else-if="page.total > 0" class="total-hint">共 {{ page.total.toLocaleString() }} 部</span>
-        <el-select v-model="siteKey" placeholder="换站" style="width: 200px">
-          <el-option v-for="s in sortedSites" :key="s.key" :label="s.name" :value="s.key" :class="{ 'opt-dead': s.count === 0 }">
+        <el-select v-model="siteKey" placeholder="换站" style="width: 200px" :class="currentSite ? siteState(currentSite) : ''">
+          <el-option v-for="s in sortedSites" :key="s.key" :label="s.name" :value="s.key" :class="siteState(s)">
             <span class="opt-health">
               <span class="health-dot" :style="{ background: HEALTH_COLOR[healthOf(s.key)] }"></span>
               <span>{{ s.name }}</span>
@@ -668,7 +672,10 @@ function parseFilters(ext: string, tid: string): FilterGroup[] {
   font-size: 11px;
   color: var(--dim);
 }
-.opt-dead { opacity: 0.6; }
+.el-select-dropdown__item.st-off, .el-select.st-off :deep(.el-select__selected-item) { color: #a31515; }
+.el-select-dropdown__item.st-on, .el-select.st-on :deep(.el-select__selected-item) { color: #19c037; }
+.el-select-dropdown__item.st-empty, .el-select.st-empty :deep(.el-select__selected-item) { color: #909399; }
+.el-select-dropdown__item.st-off .health-txt, .el-select-dropdown__item.st-on .health-txt, .el-select-dropdown__item.st-empty .health-txt { color: inherit; }
 
 /* 筛选片名输入框去掉 size="small" 后用的是默认尺寸——字号跟随项目
    整体放大过的 --el-font-size-base，高度跟 --el-component-size(38px)

@@ -7,6 +7,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"hash/fnv"
 	"io"
 	"net/http"
 	"net/url"
@@ -101,6 +102,7 @@ func Handler() *http.ServeMux {
 	mux.HandleFunc("/api/upgrade/check", hUpgradeCheck)
 	mux.HandleFunc("/api/upgrade/run", hUpgradeRun)
 	mux.HandleFunc("/api/sites", hSites)
+	mux.HandleFunc("/api/sites/subrefs", hSubRefs)
 	mux.HandleFunc("/api/sites/enabled", hSitesEnabled)
 	mux.HandleFunc("/api/sites/probe", hSitesProbe)
 	mux.HandleFunc("/api/sites/speed", hSitesSpeed)
@@ -208,6 +210,9 @@ func writeJSONWithCache(w http.ResponseWriter, code int, v any, maxAge int, etag
 	}
 	if maxAge > 0 {
 		w.Header().Set("Cache-Control", fmt.Sprintf("max-age=%d, must-revalidate", maxAge))
+	} else if etag != "" {
+		// 每次都向服务端确认（ETag 命中就是 304，几乎零成本），不能被浏览器当成新鲜缓存
+		w.Header().Set("Cache-Control", "no-cache")
 	}
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.WriteHeader(code)
@@ -584,6 +589,16 @@ func hUpgradeRun(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// hSubRefs 返回「单仓源」表：/api/sites 和 /api/live/sources 里的 subIdx 都是
+// 这张表的下标。只有几十条，各站源/直播源只存下标，不重复带名字和地址。
+func hSubRefs(w http.ResponseWriter, r *http.Request) {
+	refs, _, _ := crawler.SiteLiveProvenance()
+	if refs == nil {
+		refs = []model.SubRef{}
+	}
+	ok(w, refs)
+}
+
 func hSites(w http.ResponseWriter, r *http.Request) {
 	if store.TotalSites() == 0 {
 		crawler.Restore()
@@ -591,7 +606,12 @@ func hSites(w http.ResponseWriter, r *http.Request) {
 	// 生成 ETag（基于站源版本号 + 启用列表 + 最近一次内容更新时间，
 	// 最后一项是因为 dead 标记来自内容更新，站源列表本身不变也要能刷新）
 	explicitKeys := store.EnabledKeys()
-	etag := fmt.Sprintf("sites-%d-%d-%d", store.SitesVersion(), len(explicitKeys), store.LastCrawlAt())
+	ekh := fnv.New32a()
+	for _, k := range explicitKeys {
+		ekh.Write([]byte(k))
+		ekh.Write([]byte{0})
+	}
+	etag := fmt.Sprintf("sites-%d-%d-%x-%d", store.SitesVersion(), len(explicitKeys), ekh.Sum32(), store.LastCrawlAt())
 	// 检查 If-None-Match，匹配则返回 304
 	if checkETag(w, r, etag) {
 		return
@@ -611,7 +631,7 @@ func hSites(w http.ResponseWriter, r *http.Request) {
 	sites := store.Sites()
 	out := make([]model.Site, len(sites))
 	copy(out, sites)
-	byAPI, _ := crawler.SiteLiveProvenance()
+	_, byAPI, _ := crawler.SiteLiveProvenance()
 	for i := range out {
 		if useAll {
 			out[i].Enabled = out[i].Usable
@@ -622,10 +642,9 @@ func hSites(w http.ResponseWriter, r *http.Request) {
 		stat := healthMap[out[i].Key]
 		out[i].Count = stat.LastTotal
 		out[i].Severity = siteSeverity(stat, out[i].Count)
-		out[i].Subs = byAPI[out[i].API]
+		out[i].SubIdx = byAPI[out[i].API]
 	}
-	// 设置缓存 5 分钟
-	writeJSONWithCache(w, 200, out, 300, etag)
+	writeJSONWithCache(w, 200, out, 0, etag)
 }
 
 // siteSeverity 给 Count=0 的站源分个「严重程度」，供点播页下拉在数量都是
@@ -697,13 +716,7 @@ func hSitesEnabled(w http.ResponseWriter, r *http.Request) {
 	for _, s := range store.ActiveSites() {
 		active[s.Key] = true
 	}
-	var kept []model.Vod
-	for _, v := range store.Feed() {
-		if active[v.SiteKey] {
-			kept = append(kept, v)
-		}
-	}
-	store.SaveFeed(kept)
+	store.FilterFeedSites(active) // 首页列表和候选池（各排行榜用）都要摘
 	cms.ClearCache()
 	ok(w, map[string]any{"ok": true})
 }
@@ -1384,12 +1397,12 @@ func hLiveSources(w http.ResponseWriter, r *http.Request) {
 		for _, u := range explicit {
 			enabled[u] = true
 		}
-		_, byLiveURL := crawler.SiteLiveProvenance()
+		_, _, byLiveURL := crawler.SiteLiveProvenance()
 		out := make([]model.RawLive, len(list))
 		copy(out, list)
 		for i := range out {
 			out[i].Enabled = useAll || enabled[out[i].URL]
-			out[i].Subs = byLiveURL[out[i].URL]
+			out[i].SubIdx = byLiveURL[out[i].URL]
 		}
 		ok(w, out)
 	case http.MethodPost:
@@ -1738,6 +1751,22 @@ func hCrawl(w http.ResponseWriter, r *http.Request) {
 }
 
 func hFeed(w http.ResponseWriter, r *http.Request) {
+	// 兜底：列表/候选池里若还有已停用站源的旧条目（比如之前版本只摘了列表没摘
+	// 候选池），在这里清掉。
+	active := map[string]bool{}
+	for _, s := range store.ActiveSites() {
+		active[s.Key] = true
+	}
+	stale := false
+	for _, v := range append(append([]model.Vod{}, store.Feed()...), store.FeedPool()...) {
+		if !active[v.SiteKey] {
+			stale = true
+			break
+		}
+	}
+	if stale {
+		store.FilterFeedSites(active)
+	}
 	ok(w, map[string]any{"feed": store.Feed(), "index": store.FeedIndex(), "pool": store.FeedPool(), "deadKeys": store.DeadKeys(), "summary": store.CrawlSummary()})
 }
 

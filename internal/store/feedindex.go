@@ -13,8 +13,16 @@ import (
 	"github.com/xxl6097/TVBoxWeb/internal/model"
 )
 
-// FeedIndexMax 每个排行指标最多保留多少条（去重后）。
-const FeedIndexMax = 1000
+// SiteRankMax 每个站源、每个指标最多保留多少条。
+const SiteRankMax = 150
+
+// SiteRank 是某个站源在某个指标上自己排好序的榜单（降序，只含该指标值>0的影片）。
+// 排序只在站源内部进行：各站源的计数口径、量级完全不同（有的 0~1000 随机数，
+// 有的上万），跨站直接比大小没有意义。多站合并（轮流各取一条）由前端按需做。
+type SiteRank struct {
+	Site string `json:"s"` // SiteKey
+	Idx  []int  `json:"i"` // 下标，指向「feed followed by pool」
+}
 
 // feedMetrics 是首页可按其排序的指标（键名同前端 FEED_SORTS 和 model.Vod 的
 // JSON 字段名）。「站点排序」= 原始顺序，不需要索引，前端直接用 Feed 本身。
@@ -29,17 +37,15 @@ var feedMetrics = map[string]func(v *model.Vod) float64{
 }
 
 // BuildFeedIndex 在「首页列表 feed（原始顺序）+ 候选池 extra（各站源更深的
-// 分页、没进首页的候选）」上，对每个指标算出降序排好的下标。下标指向
-// 「feed followed by 返回的 pool」这一份拼接列表：列表只存一份，各指标只存下标。
+// 分页、没进首页的候选）」上，对每个指标、每个站源各自算出降序排好的下标。
+// 下标指向「feed followed by 返回的 pool」这一份拼接列表：列表只存一份。
 //
-//   - 某个站源只要在这个指标上一条有效值（>0）都没给过（feed+extra 里都没有），
-//     就认为该站源不提供这个指标，它的影片不进这个指标的索引；提供了的站源，
-//     其全部影片都进候选（值为 0 的排最后）。没有任何站源提供的指标不出现。
-//   - 同一部片子（片名+年份，年份为空当通配）在多个站源重复出现时只保留指标
-//     值最高的那一条（同值保留靠前的）。
-//   - 每个指标最多 FeedIndexMax 条。
-//   - 返回的 pool 只包含被某个指标用到的 extra 条目（已重新编号）。
-func BuildFeedIndex(feed, extra []model.Vod) (map[string][]int, []model.Vod) {
+//   - 站源在某指标上没有任何有效值（>0）就不提供该指标，不出现在该指标里；
+//     提供了的站源也只收值>0 的影片（0 视为没有数据）。
+//   - 同一站源内同名同年份的影片只留值最高的一条；跨站去重留给合并时做。
+//   - 每个站源每个指标最多 SiteRankMax 条；站源顺序按其在 feed 中首次出现的先后。
+//   - 返回的 pool 只包含被用到的 extra 条目（已重新编号）。
+func BuildFeedIndex(feed, extra []model.Vod) (map[string][]SiteRank, []model.Vod) {
 	nf := len(feed)
 	n := nf + len(extra)
 	at := func(i int) *model.Vod {
@@ -48,45 +54,57 @@ func BuildFeedIndex(feed, extra []model.Vod) (map[string][]int, []model.Vod) {
 		}
 		return &extra[i-nf]
 	}
-	out := map[string][]int{}
+	var siteOrder []string
+	seenSite := map[string]bool{}
+	for i := 0; i < n; i++ {
+		if k := at(i).SiteKey; !seenSite[k] {
+			seenSite[k] = true
+			siteOrder = append(siteOrder, k)
+		}
+	}
+	bySite := map[string][]int{}
+	for i := 0; i < n; i++ {
+		k := at(i).SiteKey
+		bySite[k] = append(bySite[k], i)
+	}
+	out := map[string][]SiteRank{}
 	usedExtra := map[int]bool{}
 	for key, val := range feedMetrics {
-		has := map[string]bool{}
-		for i := 0; i < n; i++ {
-			if v := at(i); val(v) > 0 {
-				has[v.SiteKey] = true
+		var ranks []SiteRank
+		for _, site := range siteOrder {
+			var cand []int
+			for _, i := range bySite[site] {
+				if val(at(i)) > 0 {
+					cand = append(cand, i)
+				}
 			}
-		}
-		if len(has) == 0 {
-			continue
-		}
-		cand := make([]int, 0, n)
-		for i := 0; i < n; i++ {
-			if has[at(i).SiteKey] {
-				cand = append(cand, i)
-			}
-		}
-		sort.SliceStable(cand, func(a, b int) bool { return val(at(cand[a])) > val(at(cand[b])) })
-		seen, seenAny := map[string]bool{}, map[string]bool{}
-		idx := make([]int, 0, FeedIndexMax)
-		for _, i := range cand {
-			v := at(i)
-			k := v.Name + "|" + v.Year
-			dup := seen[k] || (v.Year == "" && seenAny[v.Name]) || (v.Year != "" && seen[v.Name+"|"])
-			if dup {
+			if len(cand) == 0 {
 				continue
 			}
-			seen[k], seenAny[v.Name] = true, true
-			idx = append(idx, i)
-			if len(idx) >= FeedIndexMax {
-				break
+			sort.SliceStable(cand, func(a, b int) bool { return val(at(cand[a])) > val(at(cand[b])) })
+			seen := map[string]bool{}
+			idx := make([]int, 0, SiteRankMax)
+			for _, i := range cand {
+				v := at(i)
+				k := v.Name + "|" + v.Year
+				if seen[k] {
+					continue
+				}
+				seen[k] = true
+				idx = append(idx, i)
+				if len(idx) >= SiteRankMax {
+					break
+				}
+			}
+			ranks = append(ranks, SiteRank{Site: site, Idx: idx})
+			for _, i := range idx {
+				if i >= nf {
+					usedExtra[i-nf] = true
+				}
 			}
 		}
-		out[key] = idx
-		for _, i := range idx {
-			if i >= nf {
-				usedExtra[i-nf] = true
-			}
+		if len(ranks) > 0 {
+			out[key] = ranks
 		}
 	}
 	// 只保留被用到的候选，并把下标重新编号成紧凑的 pool 位置。
@@ -101,24 +119,28 @@ func BuildFeedIndex(feed, extra []model.Vod) (map[string][]int, []model.Vod) {
 		remap[nf+j] = nf + r
 		pool = append(pool, extra[j])
 	}
-	for _, idx := range out {
-		for p, i := range idx {
-			if i >= nf {
-				idx[p] = remap[i]
+	for _, ranks := range out {
+		for _, sr := range ranks {
+			for p, i := range sr.Idx {
+				if i >= nf {
+					sr.Idx[p] = remap[i]
+				}
 			}
 		}
 	}
 	return out, pool
 }
 
-func feedIndexValid(idx map[string][]int, n int) bool {
+func feedIndexValid(idx map[string][]SiteRank, n int) bool {
 	if idx == nil {
 		return false
 	}
 	for _, l := range idx {
-		for _, i := range l {
-			if i < 0 || i >= n {
-				return false
+		for _, sr := range l {
+			for _, i := range sr.Idx {
+				if i < 0 || i >= n {
+					return false
+				}
 			}
 		}
 	}
@@ -209,7 +231,7 @@ func FilterFeedSites(keep map[string]bool) {
 
 // FeedIndex 返回各指标的排序下标；落盘里没有（旧版本数据）或跟列表对不上时
 // 现算一次并缓存。
-func FeedIndex() map[string][]int {
+func FeedIndex() map[string][]SiteRank {
 	mu.RLock()
 	idx, n := data.FeedIdx, len(data.Feed)+len(feedPool)
 	mu.RUnlock()

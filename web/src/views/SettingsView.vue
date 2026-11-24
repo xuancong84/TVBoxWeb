@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, computed, onMounted } from 'vue'
+import { ref, computed, onMounted, nextTick } from 'vue'
 import { useRouter } from 'vue-router'
 import { api, humanizeApiError, getAuthToken, setAuthToken } from '@/api'
 import { getTheme, setTheme, type ThemeMode } from '@/theme'
@@ -9,7 +9,7 @@ import { feedLimit, setFeedLimit, vodPerPage, setVodPerPage } from '@/itemPrefs'
 import { showClockDate, showClockTime, showClockDow } from '@/clockPrefs'
 import { useAppStore } from '@/stores/app'
 import { authState, logout } from '@/auth'
-import type { Site, Subscription, WebdavSource, RawLive } from '@/types'
+import type { Site, Subscription, WebdavSource, RawLive, SubRef } from '@/types'
 import { invalidateSiteInfo } from '@/siteInfo'
 import TopBar from '@/components/TopBar.vue'
 import UpgradePanel from '@/components/UpgradePanel.vue'
@@ -188,9 +188,11 @@ function goMetrics() {
 onMounted(load)
 
 async function load() {
-  const [st, list, wdList, liveList, subs, roots, p] = await Promise.all([
-    api.status(), api.sites(), api.webdavSources(), api.liveSources(), api.subscriptions(), api.subscriptionRoots(), api.prefs()
+  const [st, list, wdList, liveList, subs, roots, p, refs] = await Promise.all([
+    api.status(), api.sites(), api.webdavSources(), api.liveSources(), api.subscriptions(), api.subscriptionRoots(), api.prefs(),
+    api.subRefs().catch(() => [] as SubRef[])
   ])
+  subRefs.value = refs
   liveScanEnabled.value = p.liveScanEnabled !== false
   subName.value        = st.subName || ''
   subscriptions.value  = subs
@@ -469,6 +471,49 @@ function toggleAllLives() {
   api.setLiveSourcesEnabled([...next])
   invalidateSiteInfo()
 }
+
+// 单仓源表（几十条）；站源/直播源只带下标，hover 时才展开成名字
+const subRefs = ref<SubRef[]>([])
+const subTip = ref<{ names: string[]; head?: string; x: number; y: number; cols: number } | null>(null)
+const subTipEl = ref<HTMLElement | null>(null)
+function hideSubTip() { subTip.value = null }
+// 悬停提示不滚动（鼠标进不了弹层）：完整显示，条数多就分多列，
+// 并在渲染后量一下尺寸，把弹层挪到窗口里面。
+function showSubTip(e: MouseEvent, idx?: number[], head?: string) {
+  const names = (idx || []).map((i) => subRefs.value[i]).filter(Boolean).map((r) => r.name || r.source)
+  const target = e.currentTarget as HTMLElement
+  const r = (target.closest('.vsrc') || target).getBoundingClientRect() // 整个单元格，弹层不能盖住它
+  const lineH = 21
+  const cols = Math.max(1, Math.ceil((names.length * lineH + 40) / (window.innerHeight * 0.85)))
+  subTip.value = { names, head, x: r.left, y: r.bottom + 4, cols }
+  void nextTick(() => {
+    const el = subTipEl.value
+    if (!el || !subTip.value) return
+    const w = el.offsetWidth, h = el.offsetHeight
+    const vw = window.innerWidth, vh = window.innerHeight, g = 4, m = 8
+    const clampX = (x: number) => Math.max(m, Math.min(x, vw - w - m))
+    const clampY = (y: number) => Math.max(m, Math.min(y, vh - h - m))
+    // 优先级：下方 → 上方 → 右侧 → 左侧，都是完全放得下且不压住单元格；
+    // 全都放不下（弹层特别大）就选空间最大的一侧，再往窗口里挪。
+    let x: number, y: number
+    if (r.bottom + g + h <= vh - m) { x = clampX(r.left); y = r.bottom + g }
+    else if (r.top - g - h >= m) { x = clampX(r.left); y = r.top - g - h }
+    else if (r.right + g + w <= vw - m) { x = r.right + g; y = clampY(r.top) }
+    else if (r.left - g - w >= m) { x = r.left - g - w; y = clampY(r.top) }
+    else {
+      const room = { below: vh - r.bottom, above: r.top, right: vw - r.right, left: r.left }
+      const best = Object.entries(room).sort((a, b) => b[1] - a[1])[0][0]
+      if (best === 'below') { x = clampX(r.left); y = r.bottom + g }
+      else if (best === 'above') { x = clampX(r.left); y = r.top - g - h }
+      else if (best === 'right') { x = r.right + g; y = clampY(r.top) }
+      else { x = r.left - g - w; y = clampY(r.top) }
+    }
+    subTip.value = { ...subTip.value, x, y }
+  })
+}
+// 点播源有上千条时一次渲染全部（每条一个开关）会卡，分批显示
+const vodShowN = ref(300)
+const vodRows = computed(() => sites.value.slice(0, vodShowN.value))
 
 function enabledCount() {
   return sites.value.filter((s: Site) => s.usable && enabledKeys.value.has(s.key)).length
@@ -753,22 +798,21 @@ async function clearHistory() {
                 <el-button size="small" text @click="setAllEnabled">全选</el-button>
                 <el-button size="small" text @click="toggleAllSites">全部反选</el-button>
               </div>
-              <div v-for="s in sites" :key="s.key" class="schild schild-src">
-                <el-switch
-                  :model-value="enabledKeys.has(s.key)"
-                  size="small"
-                  :loading="probingKey === s.key"
-                  @change="(v: any) => toggleSite(s, v)"
-                />
-                <div class="schild-main">
-                  <div class="schild-top">
-                    <span class="schild-name">{{ s.name }}</span>
-                    <span class="schild-val">{{ s.usable ? '可用' : '不可用' }}</span>
-                  </div>
-                  <span class="schild-subs" :title="(s.subs || []).map((r) => r.source).join('\n')">
-                    单仓源：{{ s.subs?.length ? s.subs.map((r) => r.name || r.source).join('、') : '未知' }}
-                  </span>
+              <div class="vod-src-grid" @mouseleave="hideSubTip">
+                <div v-for="s in vodRows" :key="s.key" class="vsrc" :class="{ 'vsrc-off': !enabledKeys.has(s.key) }">
+                  <el-switch
+                    :model-value="enabledKeys.has(s.key)"
+                    size="small"
+                    :loading="probingKey === s.key"
+                    @change="(v: any) => toggleSite(s, v)"
+                  />
+                  <span class="vsrc-name" @mouseenter="showSubTip($event, s.subIdx)" @mouseleave="hideSubTip">{{ s.name }}</span>
+                  <span class="vsrc-val" :class="{ bad: !s.usable }">{{ s.usable ? '可用' : '不可用' }}</span>
                 </div>
+              </div>
+              <div v-if="sites.length > vodShowN" class="list-actions list-actions-pad">
+                <el-button size="small" text @click="vodShowN += 200">再显示 200 个（{{ vodShowN }}/{{ sites.length }}）</el-button>
+                <el-button size="small" text @click="vodShowN = sites.length">全部显示</el-button>
               </div>
             </template>
             <div class="sdiv"></div>
@@ -788,19 +832,15 @@ async function clearHistory() {
                 <el-button size="small" text @click="selectAllLives">全选</el-button>
                 <el-button size="small" text @click="toggleAllLives">全部反选</el-button>
               </div>
-              <div v-for="p in liveSources" :key="p.url" class="schild schild-src">
-                <el-switch
-                  :model-value="liveEnabledSet.has(p.url)"
-                  size="small"
-                  :loading="liveBusy[p.url]"
-                  @change="(v: any) => toggleLive(p, v)"
-                />
-                <div class="schild-main">
-                  <span class="schild-name">{{ p.name }}</span>
-                  <span class="schild-val schild-url" :title="p.url">{{ p.url }}</span>
-                  <span class="schild-subs" :title="(p.subs || []).map((r) => r.source).join('\n')">
-                    单仓源：{{ p.subs?.length ? p.subs.map((r) => r.name || r.source).join('、') : '未知' }}
-                  </span>
+              <div class="vod-src-grid" @mouseleave="hideSubTip">
+                <div v-for="p in liveSources" :key="p.url" class="vsrc" :class="{ 'vsrc-off': !liveEnabledSet.has(p.url) }">
+                  <el-switch
+                    :model-value="liveEnabledSet.has(p.url)"
+                    size="small"
+                    :loading="liveBusy[p.url]"
+                    @change="(v: any) => toggleLive(p, v)"
+                  />
+                  <span class="vsrc-name" @mouseenter="showSubTip($event, p.subIdx, p.url)" @mouseleave="hideSubTip">{{ p.name }}</span>
                 </div>
               </div>
             </template>
@@ -1222,9 +1262,37 @@ async function clearHistory() {
       </div>
     </template>
   </el-dialog>
+  <div v-if="subTip" ref="subTipEl" class="sub-tip" :style="{ left: subTip.x + 'px', top: subTip.y + 'px', columnCount: subTip.cols }">
+    <div v-if="subTip.head" class="url">{{ subTip.head }}</div>
+    <div class="hd">单仓源（{{ subTip.names.length || '未知' }}）</div>
+    <div v-for="(n, i) in subTip.names" :key="i" class="nm">{{ n }}</div>
+  </div>
 </template>
 
 <style scoped>
+.vod-src-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(230px, 1fr));
+  gap: 0 8px;
+  padding: 4px 18px 8px 30px;
+}
+.vsrc {
+  display: flex; align-items: center; gap: 8px; min-height: 34px; padding: 2px 6px;
+  content-visibility: auto; contain-intrinsic-size: auto 34px;
+}
+.vsrc:hover { background: rgba(255,255,255,0.06); }
+.vsrc-name { flex: 0 1 auto; min-width: 0; cursor: help; font-size: 14px; color: var(--txt); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.vsrc-off .vsrc-name { color: var(--dim); }
+.vsrc-val { margin-left: auto; font-size: 12px; color: var(--dim); flex-shrink: 0; }
+.vsrc-val.bad { color: var(--warn); }
+.sub-tip {
+  position: fixed; z-index: 3000; max-width: calc(100vw - 16px); width: max-content; column-gap: 20px;
+  background: #222; color: #ddd; border-radius: 6px; padding: 8px 12px; font-size: 12px;
+  line-height: 1.7; box-shadow: 0 4px 16px rgba(0,0,0,0.5); pointer-events: none;
+}
+.sub-tip .hd { color: #fff; margin-bottom: 2px; column-span: all; }
+.sub-tip .url { color: #9cf; word-break: break-all; max-width: 520px; margin-bottom: 4px; column-span: all; }
+.sub-tip .nm { break-inside: avoid; white-space: nowrap; }
 /* ===== 双栏布局 ===== */
 .settings-layout {
   display: flex;

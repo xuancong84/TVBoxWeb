@@ -10,9 +10,9 @@ let pending: Promise<Map<string, Site>> | null = null
 export function siteInfoMap(): Promise<Map<string, Site>> {
   if (cache) return Promise.resolve(cache)
   if (!pending) {
-    pending = api
-      .sites()
-      .then((list) => {
+    pending = Promise.all([api.sites(), api.subRefs().catch(() => [])])
+      .then(([list, refs]) => {
+        for (const s of list) s.subs = (s.subIdx || []).map((i) => refs[i]).filter(Boolean)
         cache = new Map(list.map((s) => [s.key, s]))
         return cache
       })

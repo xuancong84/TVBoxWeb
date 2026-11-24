@@ -33,6 +33,9 @@ export interface Site {
   /** count=0 时的严重程度细分：1=连上了确实空 2=暂时不可用 3=过期/损坏/失联 */
   severity: number
   /** 贡献了这个站源的单仓源列表（GET /api/sites 现查现填） */
+  /** 贡献该站源的单仓源：下标，指向 GET /api/sites/subrefs 的表（体积小） */
+  subIdx?: number[]
+  /** 前端按 subIdx 解析出来的单仓源（siteInfo.ts 填；服务端不返回） */
   subs?: SubRef[]
 }
 
@@ -256,8 +259,8 @@ export interface RawLive {
   url: string
   /** 是否参与直播频道合并（GET /api/live/sources 现查现填，空启停列表=全部启用） */
   enabled?: boolean
-  /** 贡献了这条直播源的单仓源列表 */
-  subs?: SubRef[]
+  /** 贡献了这条直播源的单仓源下标，指向 GET /api/sites/subrefs */
+  subIdx?: number[]
 }
 
 export interface EpgProgram {

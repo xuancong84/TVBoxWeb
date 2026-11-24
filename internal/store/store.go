@@ -50,8 +50,8 @@ type Data struct {
 	// 不受影响，重新打开立刻从断点接着扫。
 	LiveScanOff bool        `json:"liveScanOff"`
 	Feed        []model.Vod `json:"feed"`
-	// FeedIdx：Feed（原始顺序，只存一份）按各排行指标降序排好的下标，见 BuildFeedIndex。
-	FeedIdx       map[string][]int             `json:"feedIdx,omitempty"`
+	// FeedIdx：各排行指标下，每个站源自己排好序的下标（站源之间不混排），见 BuildFeedIndex。
+	FeedIdx       map[string][]SiteRank        `json:"feedRank,omitempty"`
 	CrawlAt       int64                        `json:"crawlAt"`
 	CrawlSummary  string                       `json:"crawlSummary"`
 	DeadKeys      []string                     `json:"deadKeys"`

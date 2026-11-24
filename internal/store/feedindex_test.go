@@ -7,19 +7,30 @@ import (
 	"github.com/xxl6097/TVBoxWeb/internal/model"
 )
 
+func ranks(rs []SiteRank) map[string][]int {
+	m := map[string][]int{}
+	for _, r := range rs {
+		m[r.Site] = r.Idx
+	}
+	return m
+}
+
 func TestBuildFeedIndex(t *testing.T) {
 	feed := []model.Vod{
 		{Name: "a", SiteKey: "A", Hits: 5, Time: 10},
 		{Name: "b", SiteKey: "B", Time: 30},          // B 不提供点击数
 		{Name: "c", SiteKey: "A", Hits: 9, Time: 20}, // A 提供
-		{Name: "d", SiteKey: "A", Time: 5},           // A 提供点击数，但这条是 0 → 排最后
+		{Name: "d", SiteKey: "A", Time: 5},           // 点击为 0 → 不进点击榜
 	}
 	idx, _ := BuildFeedIndex(feed, nil)
-	if got, want := idx["hits"], []int{2, 0, 3}; !reflect.DeepEqual(got, want) {
+	if got, want := ranks(idx["hits"]), map[string][]int{"A": {2, 0}}; !reflect.DeepEqual(got, want) {
 		t.Fatalf("hits = %v, want %v", got, want)
 	}
-	if got, want := idx["ts"], []int{1, 2, 0, 3}; !reflect.DeepEqual(got, want) {
+	if got, want := ranks(idx["ts"]), map[string][]int{"A": {2, 0, 3}, "B": {1}}; !reflect.DeepEqual(got, want) {
 		t.Fatalf("ts = %v, want %v", got, want)
+	}
+	if idx["ts"][0].Site != "A" || idx["ts"][1].Site != "B" {
+		t.Fatal("站源顺序应为 feed 中首次出现的先后")
 	}
 	if _, ok := idx["douban"]; ok {
 		t.Fatal("没有站源提供的指标不应出现")
@@ -29,17 +40,15 @@ func TestBuildFeedIndex(t *testing.T) {
 func TestBuildFeedIndexPool(t *testing.T) {
 	feed := []model.Vod{{Name: "a", SiteKey: "A", Hits: 5}}
 	extra := []model.Vod{
-		{Name: "x", SiteKey: "A", Hits: 1},  // 没进榜单前 → 仍会进（只有 3 条）
-		{Name: "a", SiteKey: "B", Hits: 50}, // 与 feed 里的 a 重名，指标更高 → 取这条
+		{Name: "x", SiteKey: "A", Hits: 1},
+		{Name: "a", SiteKey: "B", Hits: 50}, // 不同站源的同名片各自保留，不跨站去重
 		{Name: "z", SiteKey: "C"},           // C 不提供点击 → 排除
 	}
 	idx, pool := BuildFeedIndex(feed, extra)
-	// 候选按点击降序：extra[1](50) → feed[0](5) → extra[0](1)；重名 a 只留 50 那条
-	// pool 保持候选原有顺序：[x, a(B)]；下标接在 feed（1 条）后面
 	if len(pool) != 2 || pool[0].Name != "x" || pool[1].SiteKey != "B" {
 		t.Fatalf("pool = %+v", pool)
 	}
-	if got, want := idx["hits"], []int{2, 1}; !reflect.DeepEqual(got, want) {
+	if got, want := ranks(idx["hits"]), map[string][]int{"A": {0, 1}, "B": {2}}; !reflect.DeepEqual(got, want) {
 		t.Fatalf("hits = %v, want %v", got, want)
 	}
 }

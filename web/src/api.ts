@@ -5,6 +5,7 @@ import { getMediaToken } from './auth'
 
 import type {
   Site,
+  SubRef,
   SiteHealthStatus,
   Category,
   Vod,
@@ -326,6 +327,7 @@ export const api = {
   status: () => get<any>('/status'),
   metrics: () => get<any>('/metrics'),
   sites: () => get<Site[]>('/sites'),
+  subRefs: () => get<SubRef[]>('/sites/subrefs'),
   setEnabled: (keys: string[]) => post('/sites/enabled', { keys }),
   probeSite: (key: string) => post('/sites/probe', { key }),
   sitesSpeed: () => get<{ key: string; name: string; ms: number; ok: boolean }[]>('/sites/speed'),
@@ -452,8 +454,8 @@ export const api = {
   // 这个调用只是「问一下要不要补跑一轮」：没到间隔、或者已经在跑，
   // started 都是 false，不会真的现抓现等。
   triggerCrawl: () => post<{ started: boolean; running?: boolean }>('/crawl', {}),
-  // index：各排行指标降序排好的下标，指向 feed 后面接上 pool 的拼接列表（只含提供该指标的站源的影片；没有任何站源提供的指标不出现）
-  feed: () => get<{ feed: Vod[]; pool?: Vod[]; index?: Record<string, number[]>; deadKeys: string[]; summary: string }>('/feed'),
+  // index：各排行指标下、每个站源自己降序排好的下标（站源间不混排），指向 feed 后面接上 pool 的拼接列表（不提供该指标的站源不出现）
+  feed: () => get<{ feed: Vod[]; pool?: Vod[]; index?: Record<string, { s: string; i: number[] }[]>; deadKeys: string[]; summary: string }>('/feed'),
   qualityMaster: (url: string) => post<QLevel[]>('/quality/master', { url }),
 
   // skipA/skipB 用于按剧读写片头片尾设置（点播 site+vodId，网盘 srcId+vodName）。

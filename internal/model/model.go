@@ -82,7 +82,7 @@ type RawLive struct {
 	//   Enabled 是否参与直播频道合并（store.EnabledLiveURLs，空=全部启用）
 	//   Subs    贡献了这条直播源的「单仓源」列表，判断该不该拉黑用
 	Enabled bool     `json:"enabled"`
-	Subs    []SubRef `json:"subs,omitempty"`
+	SubIdx  []int `json:"subIdx,omitempty"` // 下标，指向 GET /api/sites/subrefs 的单仓源表
 }
 
 type RawConfig struct {
@@ -167,10 +167,12 @@ type Site struct {
 	//   2 = 这次没连上，但 24 小时内成功过，可能只是暂时不可用
 	//   3 = 24 小时内没成功过（或从没成功过）：更像过期/损坏/完全失联
 	Severity int `json:"severity"`
-	// Subs 是贡献了这个站源的「单仓源」（展开后的叶子订阅）列表，用来
+	// SubIdx 是贡献了这个站源的「单仓源」（展开后的叶子订阅）列表，用来
 	// 帮用户判断这个站源该不该拉黑——同一个站源可能被多条订阅重复收录。
 	// 按需现查现填，不落盘。
-	Subs []SubRef `json:"subs,omitempty"`
+	// 存的是单仓源表（GET /api/sites/subrefs）的下标：一个站源可能被几百条订阅
+	// 收录，把名字/地址整个带上 /api/sites 会有几十 MB，设置页展开就卡。
+	SubIdx []int `json:"subIdx,omitempty"`
 }
 
 // SubRef 标识一条「单仓源」（crawler.SyncSubscriptionRoots 展开后的叶子

@@ -1,0 +1,1 @@
+import{b as a}from"./index-d1724812.js";let n=null,t=null;function s(){return n?Promise.resolve(n):(t||(t=Promise.all([a.sites(),a.subRefs().catch(()=>[])]).then(([l,r])=>{for(const e of l)e.subs=(e.subIdx||[]).map(i=>r[i]).filter(Boolean);return n=new Map(l.map(e=>[e.key,e])),n}).catch(()=>(t=null,new Map))),t)}function u(){n=null,t=null}export{u as i,s};

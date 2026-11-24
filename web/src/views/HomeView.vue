@@ -17,17 +17,40 @@ const app = useAppStore()
 const history = ref<HistItem[]>([])
 const feed = ref<Vod[]>([])
 const feedSummary = ref('')
-// 排序下标由后端算好（各指标一份，只存下标）；不提供该指标的站源的影片不在索引里。
+// 各指标下每个站源自己排好序的下标由后端算好（只存下标，站源之间不混排：各站计数
+// 口径不同，跨站比大小没意义）。这里按名次轮流从每个站源各取一条合并：
+// 外层循环名次，内层循环站源。站源不提供的指标不会出现在对应列表里。
 // 'orig'（站点排序）直接用原始顺序。后端没给 index（旧缓存）时退回原始顺序。
-const feedIndex = ref<Record<string, number[]> | undefined>()
+type SiteRank = { s: string; i: number[] }
+const feedIndex = ref<Record<string, SiteRank[]> | undefined>()
 const feedPool = ref<Vod[]>([]) // 各榜单用到、但不在首页轮转列表里的候选，下标接在 feed 后面
 const feedSorted = computed<Vod[]>(() => {
   const k = feedSort.value
   if (k === 'orig' || !feedIndex.value) return feed.value
-  const idx = feedIndex.value[k]
-  if (!idx) return []
+  const ranks = feedIndex.value[k]
+  if (!ranks) return []
   const nf = feed.value.length
-  return idx.map((i) => (i < nf ? feed.value[i] : feedPool.value[i - nf])).filter(Boolean)
+  const lim = feedLimit.value
+  const out: Vod[] = []
+  const seen = new Set<string>()
+  const seenName = new Set<string>()
+  const depth = Math.max(0, ...ranks.map((r) => (Array.isArray(r?.i) ? r.i.length : 0)))
+  for (let d = 0; d < depth; d++) {
+    for (const r of ranks) {
+      const i = r?.i?.[d]
+      if (i === undefined) continue
+      const v = i < nf ? feed.value[i] : feedPool.value[i - nf]
+      if (!v) continue
+      const key = v.name + '|' + (v.year || '')
+      // 跨站同名同年（年份缺省当通配）只留先到的那条
+      if (seen.has(key) || (!v.year && seenName.has(v.name)) || (v.year && seen.has(v.name + '|'))) continue
+      seen.add(key)
+      seenName.add(v.name)
+      out.push(v)
+      if (lim > 0 && out.length >= lim) return out
+    }
+  }
+  return out
 })
 const feedShown = computed(() => (feedLimit.value > 0 ? feedSorted.value.slice(0, feedLimit.value) : feedSorted.value))
 const feedTitle = computed(() => FEED_SORTS.find((s) => s.k === feedSort.value)?.title || '最近更新')
