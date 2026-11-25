@@ -317,6 +317,9 @@ func (c *Cms) Categories() ([]model.Category, error) {
 
 // CategoriesCtx 与 Categories 相同，ctx 可取消。
 func (c *Cms) CategoriesCtx(ctx context.Context) ([]model.Category, error) {
+	if c.isPy() {
+		return c.pyCategories(ctx)
+	}
 	txt, err := fetchCtx(ctx, c.u("ac=list"), ttlCat, 15*time.Second)
 	if err != nil {
 		return nil, err
@@ -377,6 +380,9 @@ func (c *Cms) List(tid string, page int) (model.VodPage, error) {
 
 // ListCtx 与 List 相同，ctx 可取消。
 func (c *Cms) ListCtx(ctx context.Context, tid string, page int) (model.VodPage, error) {
+	if c.isPy() {
+		return c.pyList(ctx, tid, page)
+	}
 	q := "ac=videolist&t=" + urlEncode(tid) + "&pg=" + strconv.Itoa(page) + c.extra
 	txt, err := fetchCtx(ctx, c.u(q), ttlList, 18*time.Second)
 	if err != nil {
@@ -448,6 +454,9 @@ func (c *Cms) Detail(id string) (model.Vod, error) {
 
 // DetailCtx 与 Detail 相同，ctx 可取消。
 func (c *Cms) DetailCtx(ctx context.Context, id string) (model.Vod, error) {
+	if c.isPy() {
+		return c.pyDetail(ctx, id)
+	}
 	q := "ac=detail&ids=" + urlEncode(id)
 	txt, err := fetchCtx(ctx, c.u(q), ttlDetail, 18*time.Second)
 	if err != nil {
@@ -474,6 +483,9 @@ func (c *Cms) Search(kw string) []model.Vod {
 
 // SearchCtx 与 Search 相同，ctx 可取消（第一级被取消后不再发起第二级请求）。
 func (c *Cms) SearchCtx(ctx context.Context, kw string) []model.Vod {
+	if c.isPy() {
+		return c.pySearch(ctx, kw)
+	}
 	// 搜索本质上也是在拉 ac=videolist（只是多个 wd= 关键词过滤），跟片单
 	// 翻页是同一类「全量列表」请求，一样要缓存，不能因为它走的是另一个
 	// 方法就被漏掉——首页多站搜索一敲关键词就是几十个站并发打一轮，不缓存

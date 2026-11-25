@@ -403,6 +403,17 @@ func ResetCrawlAt() {
 	flush()
 }
 
+// 由上层注入（store 不能反向依赖 pyspider）：判断 Python 站源、判断 Python 能力是否可用。
+var (
+	spiderKind   func(typ int, api, ext string) string // 返回 "py" / "js" / ""
+	spiderReason func(kind string) string              // 该类站源不可用的原因，可用返回 ""
+)
+
+// SetSpiders 注入脚本类站源（Python/JS）的判定函数，须在首次 BuildSites 之前调用。
+func SetSpiders(kind func(typ int, api, ext string) string, reason func(kind string) string) {
+	spiderKind, spiderReason = kind, reason
+}
+
 func BuildSites(cfg model.RawConfig) {
 	mu.Lock()
 	defer mu.Unlock()
@@ -431,7 +442,15 @@ func BuildSites(cfg model.RawConfig) {
 			b, _ := json.Marshal(e)
 			s.Ext = string(b)
 		}
+		s.Base = r.Base
 		switch {
+		case s.Type == 3 && spiderKind != nil && spiderKind(s.Type, s.API, s.Ext) != "":
+			s.Kind = spiderKind(s.Type, s.API, s.Ext)
+			if reason := spiderReason(s.Kind); reason == "" {
+				s.Usable = true
+			} else {
+				s.Reason = reason
+			}
 		case s.Type == 3:
 			s.Usable = false
 			s.Reason = "需爬虫运行时（Java/JS），Web 无法执行"
@@ -1447,6 +1466,12 @@ func isSpace(b byte) bool {
 }
 
 // ---------- 站源健康度 ----------
+
+// RecordSiteScan 同 RecordSiteCrawl，但立即落盘（手动扫描单个站源用）。
+func RecordSiteScan(siteKey string, ok bool, total int) {
+	RecordSiteCrawl(siteKey, ok, total)
+	flush()
+}
 
 // RecordSiteCrawl 记录站源最近一次内容更新抓取的结果：ok 表示有没有成功
 // 拿到响应并解析出来（哪怕报告 0 条也算 ok=true；网络错误/解析失败才是

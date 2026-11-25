@@ -330,6 +330,7 @@ export const api = {
   subRefs: () => get<SubRef[]>('/sites/subrefs'),
   setEnabled: (keys: string[]) => post('/sites/enabled', { keys }),
   probeSite: (key: string) => post('/sites/probe', { key }),
+  scanSite: (key: string) => post<{ ok: boolean; count: number; categories?: number; exact?: boolean; error?: string }>('/sites/scan', { key }),
   sitesSpeed: () => get<{ key: string; name: string; ms: number; ok: boolean }[]>('/sites/speed'),
   sitesHealth: () =>
     get<{ statuses: SiteHealthStatus[]; time: number }>('/sites/health').catch(() => ({ statuses: [], time: 0 })),

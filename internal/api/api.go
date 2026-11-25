@@ -18,6 +18,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/xxl6097/TVBoxWeb/internal/cms"
@@ -105,6 +106,7 @@ func Handler() *http.ServeMux {
 	mux.HandleFunc("/api/sites/subrefs", hSubRefs)
 	mux.HandleFunc("/api/sites/enabled", hSitesEnabled)
 	mux.HandleFunc("/api/sites/probe", hSitesProbe)
+	mux.HandleFunc("/api/sites/scan", hSitesScan)
 	mux.HandleFunc("/api/sites/speed", hSitesSpeed)
 	mux.HandleFunc("/api/sites/health", hSitesHealth)
 	mux.HandleFunc("/api/config", hConfig)
@@ -611,7 +613,7 @@ func hSites(w http.ResponseWriter, r *http.Request) {
 		ekh.Write([]byte(k))
 		ekh.Write([]byte{0})
 	}
-	etag := fmt.Sprintf("sites-%d-%d-%x-%d", store.SitesVersion(), len(explicitKeys), ekh.Sum32(), store.LastCrawlAt())
+	etag := fmt.Sprintf("sites-%d-%d-%x-%d-%d", store.SitesVersion(), len(explicitKeys), ekh.Sum32(), store.LastCrawlAt(), siteScanSeq.Load())
 	// 检查 If-None-Match，匹配则返回 304
 	if checkETag(w, r, etag) {
 		return
@@ -682,7 +684,7 @@ func hSitesProbe(w http.ResponseWriter, r *http.Request) {
 		fail(w, 400, "站源不存在")
 		return
 	}
-	if !strings.HasPrefix(site.API, "http") {
+	if !strings.HasPrefix(site.API, "http") && site.Kind == "" {
 		fail(w, 400, "接口地址不是 HTTP，无法使用")
 		return
 	}
@@ -698,6 +700,58 @@ func hSitesProbe(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	ok(w, map[string]any{"ok": true, "categories": len(cats)})
+}
+
+// siteScanSeq 每次手动扫描站源后加一，混进 /api/sites 的 ETag，
+// 否则影片数变了但 ETag 没变，前端会一直拿到 304 的旧数字。
+var siteScanSeq atomic.Int64
+
+// hSitesScan 启用站源时的后台扫描：连一次站源，取分类和影片总数，
+// 记进站源健康统计（设置页显示的数量就来自这里）。
+// 只访问站源自己的接口，不涉及 SSH。
+func hSitesScan(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Key string `json:"key"`
+	}
+	if err := body(r, &req); err != nil {
+		fail(w, 400, "参数错误")
+		return
+	}
+	site := store.Site(req.Key)
+	if site == nil {
+		fail(w, 400, "站源不存在")
+		return
+	}
+	if !strings.HasPrefix(site.API, "http") && site.Kind == "" {
+		fail(w, 400, "接口地址不是 HTTP，无法使用")
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 60*time.Second)
+	defer cancel()
+	c := cms.New(*site)
+	cats, err := c.CategoriesCtx(ctx)
+	if err != nil {
+		store.RecordSiteScan(site.Key, false, 0)
+		siteScanSeq.Add(1)
+		ok(w, map[string]any{"ok": false, "count": 0, "error": err.Error()})
+		return
+	}
+	// 总数：标准 CMS 接口的 total；脚本站源没有总数，退而取第一页条数
+	tid := ""
+	if site.Kind != "" && len(cats) > 0 {
+		tid = cats[0].ID
+	}
+	count := 0
+	if pg, err := c.ListCtx(ctx, tid, 1); err == nil {
+		count = len(pg.Items)
+		// 脚本站源的 total 常是规则里写死的占位值（drpy 默认 999），不可信
+		if site.Kind == "" && pg.Total > count {
+			count = pg.Total
+		}
+	}
+	store.RecordSiteScan(site.Key, true, count)
+	siteScanSeq.Add(1)
+	ok(w, map[string]any{"ok": true, "count": count, "categories": len(cats), "exact": site.Kind == ""})
 }
 
 func hSitesEnabled(w http.ResponseWriter, r *http.Request) {
@@ -729,7 +783,12 @@ func hSitesSpeed(w http.ResponseWriter, r *http.Request) {
 		MS   int    `json:"ms"`
 		OK   bool   `json:"ok"`
 	}
-	sites := store.UsableSites()
+	var sites []model.Site
+	for _, s := range store.UsableSites() {
+		if s.Kind == "" { // 脚本类站源没有可测速的 HTTP 接口
+			sites = append(sites, s)
+		}
+	}
 	var mu sync.Mutex
 	var out []item
 	var wg sync.WaitGroup
@@ -1150,6 +1209,10 @@ func hResolve(w http.ResponseWriter, r *http.Request) {
 	}
 	if err := body(r, &req); err != nil {
 		fail(w, 400, "参数错误")
+		return
+	}
+	if strings.HasPrefix(req.URL, "pyplay:") {
+		ok(w, resolvePyPlay(r.Context(), req.URL))
 		return
 	}
 	ok(w, resolve.ResolveCtx(r.Context(), req.URL, store.Parses()))
@@ -2173,6 +2236,10 @@ func hProxy(w http.ResponseWriter, r *http.Request) {
 		fail(w, http.StatusBadRequest, "缺少 url 参数")
 		return
 	}
+	if strings.HasPrefix(target, "pyproxy:") {
+		servePyProxy(w, r, target)
+		return
+	}
 	if !strings.HasPrefix(target, "http://") && !strings.HasPrefix(target, "https://") {
 		fail(w, http.StatusBadRequest, "url 必须以 http:// 或 https:// 开头")
 		return
@@ -2359,7 +2426,7 @@ func rewriteM3u8(body, base, auth, token string) string {
 	lines := strings.Split(strings.ReplaceAll(strings.ReplaceAll(body, "\r\n", "\n"), "\r", "\n"), "\n")
 	proxyOf := func(uri string) string {
 		u := strings.TrimSpace(uri)
-		if !strings.HasPrefix(u, "http://") && !strings.HasPrefix(u, "https://") {
+		if !strings.HasPrefix(u, "http://") && !strings.HasPrefix(u, "https://") && !strings.HasPrefix(u, "pyproxy:") {
 			u = absURL(base, u)
 		}
 		out := "/api/proxy?url=" + url.QueryEscape(u) + proxyAuth(auth)

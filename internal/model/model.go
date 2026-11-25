@@ -61,6 +61,8 @@ type RawSite struct {
 	Filterable  FlexInt `json:"filterable"`
 	Ext         any     `json:"ext"` // 可能是字符串或对象
 	Jar         string  `json:"jar"`
+	// Base 是这个站源所在配置的地址（仅内存里用）：api/ext 里的相对路径（./py/x.py）相对它解析。
+	Base string `json:"-"`
 }
 
 type RawParse struct {
@@ -151,7 +153,11 @@ type Site struct {
 	Searchable  bool   `json:"searchable"`
 	QuickSearch bool   `json:"quickSearch"`
 	Ext         string `json:"ext"`
-	Usable      bool   `json:"usable"`
+	// Kind 非空表示不是标准 CMS 接口：目前只有 "py"（Python 站源，由 internal/pyspider 驱动）。
+	Kind string `json:"kind,omitempty"`
+	// Base 同 RawSite.Base，仅内存里用，不落盘不下发。
+	Base   string `json:"-"`
+	Usable bool   `json:"usable"`
 	Reason      string `json:"reason"`
 	Enabled     bool   `json:"enabled"`
 	// Dead 不是「站源不可用」，而是最近一次内容更新时该站源 ac=list 返回了

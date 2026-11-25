@@ -606,7 +606,21 @@ const {
 
 // ===== 倍速播放 =====
 const playbackRate = ref(1.0)
-const PLAYBACK_RATES = [0.5, 0.75, 1, 1.25, 1.5, 2]
+const PLAYBACK_RATES = [0.5, 0.75, 1, 1.25, 1.5, 2, 3, 4]
+// 浏览器普遍支持的范围（Firefox 0.25~5，超出会静音）
+const RATE_MIN = 0.25
+const RATE_MAX = 5
+const showSpeed = ref(false)
+const customRate = ref('')
+function openSpeedMenu() {
+  customRate.value = PLAYBACK_RATES.includes(playbackRate.value) ? '' : String(playbackRate.value)
+  showSpeed.value = !showSpeed.value
+}
+function applyCustomRate() {
+  const v = parseFloat(customRate.value)
+  if (!isFinite(v)) { app.showTip(`请输入 ${RATE_MIN}~${RATE_MAX} 之间的数字`); return }
+  setPlaybackRate(v)
+}
 // 1 → "1"，1.25 → "1.25"（不要显示成 1.0x 那种多余小数）
 const rateLabel = computed(() => String(playbackRate.value))
 
@@ -694,6 +708,8 @@ const isFullscreen = ref(false)
 // 浏览器自己的边缘触发区（比如边缘唤出任务栏/手势返回）离得稍微远一点，
 // 避免手滑碰到边就把界面收了。
 const EDGE_HIDE_PX = 24
+// 鼠标当前是否停在左右边缘：停在边缘时用方向键快进/快退不应把界面唤出来
+let mouseAtEdge = false
 // 全屏时如果界面被隐藏，鼠标指针也跟着隐藏（见 hideUI）；非全屏时这个
 // 标记不生效（有系统标题栏/任务栏，隐藏指针意义不大，模板里额外判断了
 // isFullscreen 才应用对应 CSS 类）。
@@ -789,11 +805,8 @@ onMounted(async () => {
   skipOwn.value = !!prefs.skipOwn
   globalIntroSkip.value = prefs.introSkip || 0
   globalOutroSkip.value = prefs.outroSkip || 0
-  // 应用倍速偏好（持久化）
-  const sp = prefs.speedPref || 1
-  if (PLAYBACK_RATES.includes(sp)) {
-    playbackRate.value = sp
-  }
+  // 倍速不跨片保留：每次进入播放页（换了一部片/一个频道）都从 1x 开始；
+  // 同一部剧换集走的是本组件内的 switchEpisode，不会重新挂载，倍速自然保留。
   // 应用音量偏好（持久化，0=未设置用 1.0）
   volume.value = Math.min(1, Math.max(0, prefs.volumePref || 1))
   syncEpLabel()
@@ -1871,10 +1884,12 @@ function onMouseMove(e: MouseEvent) {
     const rect = el.getBoundingClientRect()
     const x = e.clientX - rect.left
     if (x <= EDGE_HIDE_PX || x >= rect.width - EDGE_HIDE_PX) {
+      mouseAtEdge = true
       hideUI()
       return
     }
   }
+  mouseAtEdge = false
   cursorHidden.value = false
   if (!osdShown.value && prepared.value) popOsd()
 }
@@ -2084,14 +2099,14 @@ function applySeek(t: number) {
     vid.addEventListener('loadedmetadata', () => {
       if (wasPlaying) vid.play().catch(() => {})
     }, { once: true })
-    popOsd()
+    if (!mouseAtEdge) popOsd()
     app.showTip('正在跳转…')
     return
   }
   const wasPlaying = playing.value
   vid.currentTime = t
   curMs.value = t * 1000
-  popOsd()
+  if (!mouseAtEdge) popOsd()
   // mpegts.js（点播 FLV/裸 TS）seek 时会把 <video> 内部置成暂停，不会像
   // 原生 progressive 文件那样自动续播在原地卡住；这里补一次 play() 续上。
   // 对原生 <video>/hls.js 路径无害——本来就在播，play() 是空操作。
@@ -2103,21 +2118,14 @@ function applySeek(t: number) {
 function setPlaybackRate(rate: number) {
   const vid = videoEl.value
   if (!vid || !prepared.value) return
-  if (!PLAYBACK_RATES.includes(rate)) return
+  if (!isFinite(rate)) return
+  rate = Math.round(Math.min(RATE_MAX, Math.max(RATE_MIN, rate)) * 100) / 100
   playbackRate.value = rate
+  customRate.value = PLAYBACK_RATES.includes(rate) ? '' : String(rate)
   vid.playbackRate = rate
   // 同步到 HLS 配置（防止切换线路时重置）
   if (hls) hls.config.playbackRate = rate
-  // 持久化倍速偏好
-  api.setPrefs({ speedPref: rate }).catch(() => {})
   app.showTip(`${rate}x 倍速播放`)
-}
-
-// 循环切换倍速（0.5x → 0.75x → 1x → 1.25x → 1.5x → 2x → 0.5x）
-function togglePlaySpeed() {
-  const idx = PLAYBACK_RATES.indexOf(playbackRate.value)
-  const nextIdx = (idx + 1) % PLAYBACK_RATES.length
-  setPlaybackRate(PLAYBACK_RATES[nextIdx])
 }
 
 // ===== 移动端手势（usePlayerGestures 组合式函数）=====
@@ -2821,7 +2829,7 @@ onUnmounted(() => {
           <div class="vol-slider" @pointerdown="onVolDown">
             <div class="vol-track"><div class="vol-fill" :style="{ width: (muted ? 0 : volume * 100) + '%' }"></div></div>
           </div>
-          <button class="ctl" @click="togglePlaySpeed" :title="`当前 ${rateLabel}x，点击切换倍速`">{{ rateLabel }}x</button>
+          <button class="ctl" @click="openSpeedMenu" :title="`当前 ${rateLabel}x，点击选择倍速`">{{ rateLabel }}x</button>
           <button class="ctl" @click="showQ = !showQ" :title="qTitle">{{ isLive ? '选择线路' : qLabel }}</button>
           <button v-if="!isLive && player.count > 1" class="ctl" @click="showEps = true">选集</button>
           <!-- 自动连播开关：原来只有移动端有，桌面端播完只好被动连播，
@@ -2843,6 +2851,21 @@ onUnmounted(() => {
         </div>
         <span class="time">{{ durMs > 0 ? fmtMs(durMs) : (isLive ? '直播' : '') }}</span>
         <span v-if="showVol" class="vol">{{ volPct }}</span>
+      </div>
+    </div>
+
+    <!-- 倍速菜单：常用倍速 + 任意数值（桌面/移动、点播/直播共用） -->
+    <div v-if="showSpeed" class="speed-mask" @click.stop="showSpeed = false" @pointerdown.stop @touchstart.stop @dblclick.stop>
+      <div class="speed-menu" @click.stop>
+        <div class="speed-title">播放速度（当前 {{ rateLabel }}x）</div>
+        <div class="speed-grid">
+          <button v-for="r in PLAYBACK_RATES" :key="r" class="speed-opt" :class="{ on: playbackRate === r }" @click="setPlaybackRate(r); showSpeed = false">{{ r }}x</button>
+        </div>
+        <form class="speed-custom" @submit.prevent="applyCustomRate(); showSpeed = false">
+          <input v-model="customRate" type="number" inputmode="decimal" :min="RATE_MIN" :max="RATE_MAX" step="0.01" placeholder="自定义，如 1.23" @keydown.stop />
+          <button type="submit" class="speed-opt on">确定</button>
+        </form>
+        <div class="speed-hint">范围 {{ RATE_MIN }} ~ {{ RATE_MAX }}</div>
       </div>
     </div>
 
@@ -3052,7 +3075,7 @@ onUnmounted(() => {
           <span class="m-aux-icon">{{ autoPlayNext ? '▶' : '⏸' }}</span>
           <span>{{ autoPlayNext ? '自动连播' : '手动切集' }}</span>
         </button>
-        <button class="m-aux-btn" @click="togglePlaySpeed">
+        <button class="m-aux-btn" @click="openSpeedMenu">
           <span class="m-aux-icon">{{ rateLabel }}x</span>
           <span>倍速</span>
         </button>
@@ -3726,4 +3749,15 @@ onUnmounted(() => {
   z-index: 5;
   transition: opacity 0.1s;
 }
+
+.speed-mask { position: fixed; inset: 0; z-index: 3500; display: flex; align-items: center; justify-content: center; background: rgba(0,0,0,.35); }
+.speed-menu { background: rgba(28,28,32,.96); color: #fff; border-radius: 12px; padding: 14px 16px; width: min(320px, calc(100vw - 32px)); box-shadow: 0 8px 30px rgba(0,0,0,.5); }
+.speed-title { font-size: 14px; margin-bottom: 10px; opacity: .9; }
+.speed-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; }
+.speed-opt { border: 1px solid rgba(255,255,255,.25); background: transparent; color: #fff; border-radius: 8px; padding: 8px 0; font-size: 14px; cursor: pointer; }
+.speed-opt.on { background: #409eff; border-color: #409eff; }
+.speed-custom { display: flex; gap: 8px; margin-top: 12px; }
+.speed-custom input { flex: 1; min-width: 0; padding: 8px 10px; border-radius: 8px; border: 1px solid rgba(255,255,255,.3); background: rgba(255,255,255,.08); color: #fff; font-size: 14px; }
+.speed-custom .speed-opt { padding: 8px 14px; }
+.speed-hint { margin-top: 8px; font-size: 12px; opacity: .55; }
 </style>

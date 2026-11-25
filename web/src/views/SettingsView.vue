@@ -11,6 +11,7 @@ import { useAppStore } from '@/stores/app'
 import { authState, logout } from '@/auth'
 import type { Site, Subscription, WebdavSource, RawLive, SubRef } from '@/types'
 import { invalidateSiteInfo } from '@/siteInfo'
+import { ElMessageBox } from 'element-plus'
 import TopBar from '@/components/TopBar.vue'
 import UpgradePanel from '@/components/UpgradePanel.vue'
 
@@ -382,6 +383,48 @@ async function toggleSite(s: Site, val: boolean | string | number) {
     return
   }
   invalidateSiteInfo()
+  if (on) scanSiteAfterEnable(s)
+}
+
+// 扫描失败：弹窗给出完整的错误信息（站源名、接口地址、类型、原因），方便排查。
+function showScanError(s: Site, err: string) {
+  const kind = (s as any).kind ? `脚本站源（${(s as any).kind}）` : '标准 CMS 接口'
+  const text = [
+    `站源：${s.name}`,
+    `标识：${s.key}`,
+    `类型：${kind}`,
+    `接口：${s.api}`,
+    s.usable ? '' : `此前状态：不可用（${s.reason || '未知原因'}）`,
+    '',
+    `错误详情：${err}`
+  ].filter((x, i, a) => x !== '' || (i > 0 && a[i - 1] !== '')).join('\n')
+  app.showTip(`「${s.name}」扫描失败`)
+  ElMessageBox.alert(text, '站源扫描失败', {
+    confirmButtonText: '知道了',
+    customStyle: { whiteSpace: 'pre-wrap', wordBreak: 'break-all' }
+  }).catch(() => {})
+}
+
+// 启用站源后让后端扫一遍（取分类和影片总数），结果用 toast 告知，并刷新表格里的数字。
+async function scanSiteAfterEnable(s: Site) {
+  probingKey.value = s.key
+  try {
+    const r = await api.scanSite(s.key)
+    if (!r.ok) {
+      showScanError(s, r.error || '连不上站源')
+      return
+    }
+    s.count = r.count
+    invalidateSiteInfo()
+    const n = r.exact === false ? `首页约 ${r.count} 部` : `${r.count} 部`
+    app.showTip(r.count > 0
+      ? `「${s.name}」扫描完成：${n}影片，${r.categories ?? 0} 个分类`
+      : `「${s.name}」扫描完成：连上了，但没有影片（${r.categories ?? 0} 个分类）`)
+  } catch (e: any) {
+    showScanError(s, humanizeApiError(e))
+  } finally {
+    if (probingKey.value === s.key) probingKey.value = ''
+  }
 }
 
 function setAllEnabled() {
@@ -807,7 +850,7 @@ async function clearHistory() {
                     @change="(v: any) => toggleSite(s, v)"
                   />
                   <span class="vsrc-name" @mouseenter="showSubTip($event, s.subIdx)" @mouseleave="hideSubTip">{{ s.name }}</span>
-                  <span class="vsrc-val" :class="{ bad: !s.usable }">{{ s.usable ? '可用' : '不可用' }}</span>
+                  <span class="vsrc-val" :class="{ bad: !s.usable }">{{ s.usable ? s.count : '不可用' }}</span>
                 </div>
               </div>
               <div v-if="sites.length > vodShowN" class="list-actions list-actions-pad">

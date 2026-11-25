@@ -10,6 +10,7 @@ release/
 /fanren-*
 /yezhen-*
 /tvboxweb
+/miniconda3
 
 # Node
 web/node_modules/

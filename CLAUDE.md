@@ -35,6 +35,7 @@ There is no linter configured.
 - `live`, `liveprobe` — live channels, EPG, availability probing; `api/livescan.go`
 - `api/remux.go` — media remuxing (ffmpeg-style process mgmt; `procgroup_*.go`, `priority_*.go` are OS-specific)
 - `httpc`, `netguard` — outbound HTTP client and SSRF/private-network guarding (the `/api/proxy` video proxy rewrites m3u8 segment URLs to bypass CORS)
+- `pyspider` — Python 站源（type=3 且 api 指向 `.py`）：Go 常驻一个 Python worker（`pyfiles/worker.py`、`pyfiles/base/spider.py` 内嵌在二进制里，启动时释放到 `data/pyspider/`），stdin/stdout 行 JSON 协议调用站源的 home/category/detail/search/play/localProxy。`cms.Cms` 对 `site.Kind=="py"` 走 `cms/pyadapter.go`；播放用令牌 `pyplay:`（`/api/resolve` → `api/pyresolve.go` 调 playerContent）和 `pyproxy:`（`/api/proxy` 调 localProxy，m3u8 里的本地代理地址会被换成令牌）。需要 Python 3 + `requests pycryptodome lxml beautifulsoup4 pyquery`（`PYSPIDER_PYTHON` 指定解释器，默认依次找 `~/miniconda3/bin/python`、`python3`）；缺依赖则这些站源保持不可用。站源默认不启用，需在设置里手动打开。
 - `webdav` — WebDAV/网盘 aggregation with auth; `ws` — WebSocket hub; `metrics`, `imgcache`, `pinyin` (search), `quality`, `upgrade` (self-update)
 - Platform-specific files use build-tag suffixes (`_linux`, `_other`, `_unix`, `_windows`).
 

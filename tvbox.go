@@ -35,6 +35,8 @@ import (
 	"github.com/xxl6097/TVBoxWeb/internal/api"
 	"github.com/xxl6097/TVBoxWeb/internal/cms"
 	"github.com/xxl6097/TVBoxWeb/internal/crawler"
+	"github.com/xxl6097/TVBoxWeb/internal/jsspider"
+	"github.com/xxl6097/TVBoxWeb/internal/pyspider"
 	"github.com/xxl6097/TVBoxWeb/internal/store"
 	"github.com/xxl6097/TVBoxWeb/internal/upgrade"
 	"github.com/xxl6097/TVBoxWeb/internal/ws"
@@ -240,6 +242,44 @@ func New(opts ...Option) (*Server, error) {
 	store.InitFeedPool(o.DataDir)
 	store.InitLiveCrawlCache(o.DataDir)
 	cms.InitDiskCache(o.DataDir)
+
+	// Python 站源：必须在首次构建站源列表（下面的 Restore）之前就绪。
+	relay := crawler.StartSpiderRelay()
+	pyspider.RelayURL, jsspider.RelayURL = relay, relay
+	pyspider.Init(o.DataDir)
+	pyspider.Fetch = crawler.FetchScript
+	jsspider.Init(o.DataDir)
+	jsspider.Fetch = crawler.FetchScript
+	store.SetSpiders(
+		func(typ int, api, ext string) string {
+			switch {
+			case pyspider.IsPySite(typ, api, ext):
+				return "py"
+			case jsspider.IsJSSite(typ, api, ext):
+				return "js"
+			}
+			return ""
+		},
+		func(kind string) string {
+			if kind == "js" {
+				if !jsspider.Available() {
+					return "JS 站源：" + jsspider.Reason()
+				}
+			} else if !pyspider.Available() {
+				return "Python 站源：" + pyspider.Reason()
+			}
+			return ""
+		})
+	if pyspider.Available() {
+		o.Logger.Printf("Python 站源已启用")
+	} else {
+		o.Logger.Printf("Python 站源未启用：%s", pyspider.Reason())
+	}
+	if jsspider.Available() {
+		o.Logger.Printf("JS 站源已启用")
+	} else {
+		o.Logger.Printf("JS 站源未启用：%s", jsspider.Reason())
+	}
 
 	// 启动时恢复缓存站点列表
 	if store.TotalSites() == 0 {

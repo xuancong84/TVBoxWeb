@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, computed, onMounted, onUnmounted, nextTick } from 'vue'
+import { ref, computed, watch, onMounted, onUnmounted, nextTick } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { api, humanizeApiError, imgUrl } from '@/api'
 import { useAppStore } from '@/stores/app'
@@ -83,7 +83,26 @@ async function loadDetail() {
     // loading 翻成 false 之后 .content 才会真正渲染出来（骨架屏切真实
     // 内容），必须等这一轮 DOM 更新完才能量得到准确的 scrollHeight。
     nextTick(checkOverflow)
+    nextTick(fitEps)
   }
+}
+
+// 剧集区最小高度 220px；视口还有更多空间时一直撑到页面底部，
+// 这样集数很多（几百集）时不用先滚页面再滚剧集区。
+const epsEl = ref<HTMLElement | null>(null)
+const epsMaxH = ref(0)
+const EPS_MIN_H = 220
+function fitEps() {
+  const el = epsEl.value
+  if (!el) return
+  const docTop = el.getBoundingClientRect().top + window.scrollY
+  // 剧集区下面还有 .lines 和 .page 各自的 padding-bottom，一并留出来，
+  // 否则整页会比视口多出这几十像素，外层窗口也跟着出现滚动条。
+  let below = 0
+  for (let n: HTMLElement | null = el.parentElement; n && n !== document.body; n = n.parentElement) {
+    below += parseFloat(getComputedStyle(n).paddingBottom) || 0
+  }
+  epsMaxH.value = Math.max(EPS_MIN_H, Math.floor(window.innerHeight - docTop - below))
 }
 
 onMounted(async () => {
@@ -106,10 +125,14 @@ onMounted(async () => {
     /* ignore */
   }
   window.addEventListener('resize', checkOverflow)
+  window.addEventListener('resize', fitEps)
+  nextTick(fitEps)
 })
 onUnmounted(() => {
   window.removeEventListener('resize', checkOverflow)
+  window.removeEventListener('resize', fitEps)
 })
+watch([curLine, () => lines.value.length], () => nextTick(fitEps))
 
 const eps = computed(() => {
   if (!lines.value.length) return []
@@ -282,7 +305,7 @@ function resumePlay() {
         <span v-if="watchedEps.size" class="eps-seen">· 已看 {{ watchedEps.size }} 集</span>
         <span class="eps-order" @click="reverse = !reverse">{{ reverse ? '正序' : '倒序' }}</span>
       </div>
-      <div class="eps">
+      <div ref="epsEl" class="eps" :style="epsMaxH ? { maxHeight: epsMaxH + 'px' } : undefined">
         <span
           v-for="(ep, i) in eps"
           :key="i"

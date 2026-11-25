@@ -12,6 +12,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/xxl6097/TVBoxWeb/internal/cms"
 	"github.com/xxl6097/TVBoxWeb/internal/httpc"
@@ -192,4 +193,19 @@ func (l *limitWriter) Write(p []byte) (int, error) {
 		return 0, errors.New("超出大小限制")
 	}
 	return l.w.Write(p)
+}
+
+// FetchScript 下载站源脚本/规则这类小文本：先直连，直连失败且值得换出口 IP 时再走
+// SSH_CMDS_GEO_BLOCK 跳板（只搬 ≤2MB 的小文件）。
+func FetchScript(ctx context.Context, u string) (string, error) {
+	txt, err := httpc.TextCtx(ctx, u, nil, 25*time.Second)
+	if err == nil {
+		return txt, nil
+	}
+	if hasHTTP(u) && worthGeoRelay(err) {
+		if b, rerr := FetchSmallViaGeoRelay(ctx, u, 2<<20); rerr == nil {
+			return string(b), nil
+		}
+	}
+	return "", err
 }

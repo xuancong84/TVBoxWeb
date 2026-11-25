@@ -15,7 +15,9 @@ import (
 
 	"github.com/xxl6097/TVBoxWeb/internal/cms"
 	"github.com/xxl6097/TVBoxWeb/internal/httpc"
+	"github.com/xxl6097/TVBoxWeb/internal/jsspider"
 	"github.com/xxl6097/TVBoxWeb/internal/model"
+	"github.com/xxl6097/TVBoxWeb/internal/pyspider"
 	"github.com/xxl6097/TVBoxWeb/internal/store"
 )
 
@@ -477,6 +479,9 @@ func LoadConfigCtx(ctx context.Context, source string) (int, error) {
 	if len(cfg.Sites) == 0 {
 		return 0, errNoSites
 	}
+	for i := range cfg.Sites {
+		cfg.Sites[i].Base = source
+	}
 	store.BuildSites(cfg)
 	store.BuildParses(cfg)
 	store.SetCfg(text, source)
@@ -489,6 +494,11 @@ func LoadConfigCtx(ctx context.Context, source string) (int, error) {
 // extractUsableConfigText 的注释）能解出站点/直播源就直接用；拉不到可用内容、且
 // source 是一个 http(s) 地址时，再依次尝试 SSH_CMDS_GEO_BLOCK 里配置的跳板。
 func fetchConfigText(ctx context.Context, source string) (string, error) {
+	return fetchWithGeoFallback(ctx, source)
+}
+
+// FetchText 供其它包下载配置/脚本类小文件：直连失败时按需走地区限制跳板。
+func FetchText(ctx context.Context, source string) (string, error) {
 	return fetchWithGeoFallback(ctx, source)
 }
 
@@ -563,7 +573,18 @@ func mergeConfigs(cfgs []model.RawConfig) model.RawConfig {
 			if key == "" {
 				key = "site_" + itoa(i)
 			}
-			newKey, keep := dedupKey(seenSites, key, s.API)
+			uniq := s.API
+			if s.Base != "" {
+				// Python 站源的 api 常是相对路径（./py/x.py），不同订阅里同名的相对路径
+				// 指向的是不同文件，去重要用解析后的完整地址。
+				ext, _ := s.Ext.(string)
+				if u, _, ok := pyspider.Spec(s.API, ext, s.Base); ok {
+					uniq = u
+				} else if u, _, ok := jsspider.Spec(s.API, ext, s.Base); ok {
+					uniq = u
+				}
+			}
+			newKey, keep := dedupKey(seenSites, key, uniq)
 			if !keep {
 				continue
 			}
@@ -618,6 +639,9 @@ func RebuildFromSubscriptions() store.SubResult {
 		cfg, err := parseConfig(s.Text)
 		if err != nil {
 			continue
+		}
+		for i := range cfg.Sites {
+			cfg.Sites[i].Base = s.Source
 		}
 		cfgs = append(cfgs, cfg)
 		name := cfg.Name
