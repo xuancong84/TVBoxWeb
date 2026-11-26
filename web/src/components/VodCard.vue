@@ -116,7 +116,10 @@ const subsTitle = computed(() => {
 }
 .poster {
   position: relative;
-  aspect-ratio: 2 / 3;
+  /* 不用 aspect-ratio：旧电视浏览器（旧 webOS/Chromium<88）不支持，
+     容器高度会塌成 0、图片看不见。padding-bottom 150% = 2:3，处处可用 */
+  height: 0;
+  padding-bottom: 150%;
   border-radius: var(--radius);
   overflow: hidden;
   background: var(--card);
@@ -127,6 +130,11 @@ const subsTitle = computed(() => {
   border-color: #fff;
 }
 .poster img {
+  /* 绝对定位铺满：不依赖「aspect-ratio 盒子里 height:100% 能解析」，
+     部分浏览器（旧 Safari/WebView）解析不了，图片会按原始尺寸撑开卡片 */
+  position: absolute;
+  left: 0;
+  top: 0;
   width: 100%;
   height: 100%;
   object-fit: cover;
@@ -134,6 +142,10 @@ const subsTitle = computed(() => {
   border-radius: var(--radius);
 }
 .placeholder {
+  position: absolute;
+  left: 0;
+  top: 0;
+  box-sizing: border-box;
   width: 100%;
   height: 100%;
   display: flex;

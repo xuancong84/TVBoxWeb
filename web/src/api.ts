@@ -324,6 +324,11 @@ export const api = {
   post,
   del,
 
+  systemGet: () => get<any>('/system'),
+  systemSave: (m: Record<string, unknown>) => request<any>('/system', { method: 'PUT', body: JSON.stringify(m) }),
+  systemReset: () => del<any>('/system'),
+  systemRestart: () => post<any>('/system/restart'),
+  systemSshTest: (jump: string) => post<any>('/system/ssh-test', { jump }),
   status: () => get<any>('/status'),
   metrics: () => get<any>('/metrics'),
   sites: () => get<Site[]>('/sites'),

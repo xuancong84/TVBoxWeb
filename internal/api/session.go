@@ -17,6 +17,7 @@ import (
 	"crypto/subtle"
 	"encoding/base64"
 	"fmt"
+	"github.com/xxl6097/TVBoxWeb/internal/sysconf"
 	"net"
 	"net/http"
 	"strconv"
@@ -27,14 +28,15 @@ import (
 
 const (
 	sessionCookieName = "yz_session"
-	sessionTTL        = 7 * 24 * time.Hour
 
 	// 登录失败限流：同一 IP 累计失败这么多次就锁一段时间。
 	// 阈值刻意放宽到 20——家用/内网部署所有设备共用一个出口 IP，
 	// 太紧会把正常用户一起锁死（见 tooManyFails 的说明）。
-	loginMaxFails   = 20
-	loginFailWindow = 15 * time.Minute
+	loginMaxFails = 20
 )
+
+func sessionTTL() time.Duration      { return sysconf.Dur("ca.session") }
+func loginFailWindow() time.Duration { return sysconf.Dur("ca.login_fail") }
 
 var sessionKey = func() []byte {
 	b := make([]byte, 32)
@@ -139,7 +141,7 @@ func tooManyFails(ip string) bool {
 	if !ok {
 		return false
 	}
-	if time.Since(rec.first) > loginFailWindow {
+	if time.Since(rec.first) > loginFailWindow() {
 		delete(fails, ip)
 		return false
 	}
@@ -152,7 +154,7 @@ func failCooldown(ip string) time.Duration {
 	failMu.Lock()
 	defer failMu.Unlock()
 	rec, ok := fails[ip]
-	if !ok || time.Since(rec.first) > loginFailWindow {
+	if !ok || time.Since(rec.first) > loginFailWindow() {
 		return 0
 	}
 	// 前 3 次不设冷却：正常输错应该能马上重试。
@@ -181,7 +183,7 @@ func recordFail(ip string) {
 	defer failMu.Unlock()
 	now := time.Now()
 	rec, ok := fails[ip]
-	if !ok || now.Sub(rec.first) > loginFailWindow {
+	if !ok || now.Sub(rec.first) > loginFailWindow() {
 		fails[ip] = &failRecord{count: 1, first: now, last: now}
 		return
 	}
@@ -190,7 +192,7 @@ func recordFail(ip string) {
 	// 简单容量控制，避免被大量来源灌满
 	if len(fails) > 4096 {
 		for k, v := range fails {
-			if now.Sub(v.first) > loginFailWindow {
+			if now.Sub(v.first) > loginFailWindow() {
 				delete(fails, k)
 			}
 		}
@@ -258,13 +260,13 @@ func hLogin(w http.ResponseWriter, r *http.Request) {
 	}
 	clearFails(ip)
 
-	exp := time.Now().Add(sessionTTL)
+	exp := time.Now().Add(sessionTTL())
 	http.SetCookie(w, &http.Cookie{
 		Name:     sessionCookieName,
 		Value:    signSession(sec.LoginUser, exp),
 		Path:     "/",
 		Expires:  exp,
-		MaxAge:   int(sessionTTL.Seconds()),
+		MaxAge:   int(sessionTTL().Seconds()),
 		HttpOnly: true,
 		Secure:   cookieSecure(r),
 		SameSite: http.SameSiteLaxMode,
@@ -288,7 +290,7 @@ func mediaToken() string {
 	if !loginEnabled() {
 		return ""
 	}
-	return signSession(sec.LoginUser, time.Now().Add(sessionTTL))
+	return signSession(sec.LoginUser, time.Now().Add(sessionTTL()))
 }
 
 // cookieSecure 决定会话 Cookie 是否带 Secure（只在 HTTPS 下发送）。

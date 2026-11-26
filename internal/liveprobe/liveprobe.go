@@ -11,10 +11,10 @@ import (
 )
 
 const (
-	Sample    = 3
-	StreamMS  = 3000 * time.Millisecond
-	ListMS    = 8000 * time.Millisecond
-	GuardMS   = 10000 * time.Millisecond
+	Sample   = 3
+	StreamMS = 3000 * time.Millisecond
+	ListMS   = 8000 * time.Millisecond
+	GuardMS  = 10000 * time.Millisecond
 )
 
 type LiveScore struct {
@@ -180,7 +180,7 @@ func RankAllConcurrent(items []LiveScore, workers int, timeout time.Duration, on
 	for i := range items {
 		out[i] = LiveScore{Name: items[i].Name, URL: items[i].URL, MS: -1}
 	}
-	
+
 	// 创建任务通道
 	type task struct {
 		idx  int
@@ -191,7 +191,7 @@ func RankAllConcurrent(items []LiveScore, workers int, timeout time.Duration, on
 		tasks <- task{idx: i, item: it}
 	}
 	close(tasks)
-	
+
 	// 启动 worker pool
 	var wg sync.WaitGroup
 	done := make(chan struct{})
@@ -213,7 +213,7 @@ func RankAllConcurrent(items []LiveScore, workers int, timeout time.Duration, on
 			}
 		}()
 	}
-	
+
 	// 超时控制
 	if timeout > 0 {
 		go func() {
@@ -221,7 +221,7 @@ func RankAllConcurrent(items []LiveScore, workers int, timeout time.Duration, on
 			close(done)
 		}()
 	}
-	
+
 	wg.Wait()
 	return out
 }

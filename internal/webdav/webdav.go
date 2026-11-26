@@ -6,12 +6,12 @@ import (
 	"encoding/base64"
 	"encoding/xml"
 	"fmt"
+	"github.com/xxl6097/TVBoxWeb/internal/sysconf"
 	"net/url"
 	"regexp"
 	"sort"
 	"strconv"
 	"strings"
-	"time"
 
 	"github.com/xxl6097/TVBoxWeb/internal/httpc"
 	"github.com/xxl6097/TVBoxWeb/internal/model"
@@ -130,7 +130,7 @@ func List(src model.WebdavSource, path string) ([]model.WebdavEntry, error) {
 func ListCtx(ctx context.Context, src model.WebdavSource, path string) ([]model.WebdavEntry, error) {
 	origin := OriginOf(src.URL)
 	u := origin + path
-	xmlStr, err := httpc.PropfindCtx(ctx, u, AuthHeader(src), 15*time.Second)
+	xmlStr, err := httpc.PropfindCtx(ctx, u, AuthHeader(src), sysconf.Dur("to.webdav"))
 	if err != nil {
 		return nil, err
 	}

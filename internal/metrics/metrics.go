@@ -15,7 +15,7 @@ type Metrics struct {
 	startTime time.Time
 
 	// 请求统计
-	totalRequests int64
+	totalRequests  int64
 	requestsByPath map[string]int64
 
 	// 响应时间
@@ -106,24 +106,24 @@ func Snapshot() map[string]any {
 	}
 
 	return map[string]any{
-		"uptime":    int64(time.Since(global.startTime).Seconds()),
+		"uptime": int64(time.Since(global.startTime).Seconds()),
 		"requests": map[string]any{
-			"total":   global.totalRequests,
-			"errors":  global.totalErrors,
-			"avgMs":   avgMs,
-			"p50Ms":   p50,
-			"p95Ms":   p95,
+			"total":  global.totalRequests,
+			"errors": global.totalErrors,
+			"avgMs":  avgMs,
+			"p50Ms":  p50,
+			"p95Ms":  p95,
 		},
 		"cache": map[string]any{
-			"hits":     global.cacheHits,
-			"hitRate":  cacheRate,
+			"hits":    global.cacheHits,
+			"hitRate": cacheRate,
 		},
 		"memory": map[string]any{
-			"allocMb":       int64(mem.Alloc / 1024 / 1024),
-			"totalAllocMb":  int64(mem.TotalAlloc / 1024 / 1024),
-			"sysMb":         int64(mem.Sys / 1024 / 1024),
-			"heapObjects":   int64(mem.HeapObjects),
-			"gcCycles":      int64(mem.NumGC),
+			"allocMb":      int64(mem.Alloc / 1024 / 1024),
+			"totalAllocMb": int64(mem.TotalAlloc / 1024 / 1024),
+			"sysMb":        int64(mem.Sys / 1024 / 1024),
+			"heapObjects":  int64(mem.HeapObjects),
+			"gcCycles":     int64(mem.NumGC),
 		},
 		"runtime": map[string]any{
 			"goroutines": runtime.NumGoroutine(),

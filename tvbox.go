@@ -20,9 +20,13 @@ package tvbox
 import (
 	"context"
 	"embed"
+	"errors"
 	"fmt"
+	"github.com/xxl6097/TVBoxWeb/internal/httpc"
+	"github.com/xxl6097/TVBoxWeb/internal/sysconf"
 	"io/fs"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -208,6 +212,13 @@ func New(opts ...Option) (*Server, error) {
 		}
 	}
 
+	if !sysconf.Loaded() {
+		if err := sysconf.Init(""); err != nil {
+			o.Logger.Printf("读取 config.json 失败，使用默认参数: %v", err)
+		}
+	}
+	httpc.Apply()
+
 	if err := ensureInit(); err != nil {
 		return nil, err
 	}
@@ -339,20 +350,77 @@ func (s *Server) Handler() http.Handler {
 	return api.CORS(s.mux)
 }
 
+// ParseListenAddrs 解析 -addr：逗号 / 分号分隔的 host:port 列表，如
+// "127.0.0.1:8090,192.168.1.10:9000"（不同 IP 可用不同端口）、"0.0.0.0:8090,0.0.0.0:8091"、":8090"。
+// 只写端口号（"8090"）视为 ":8090"。
+func ParseListenAddrs(addr string) ([]string, error) {
+	out, err := sysconf.ParseAddrs(addr)
+	if err != nil {
+		return nil, err
+	}
+	if len(out) == 0 {
+		return nil, errors.New("监听地址为空")
+	}
+	return out, nil
+}
+
+// listenAll 依次监听全部地址；任何一个失败则关闭已开的并返回错误。
+func listenAll(addrs []string) ([]net.Listener, error) {
+	var lns []net.Listener
+	for _, a := range addrs {
+		ln, err := net.Listen("tcp", a)
+		if err != nil {
+			for _, l := range lns {
+				_ = l.Close()
+			}
+			return nil, fmt.Errorf("监听 %s 失败: %w", a, err)
+		}
+		lns = append(lns, ln)
+	}
+	return lns, nil
+}
+
 // ListenAndServe 在指定地址启动服务并阻塞，直到出错或服务关闭。
 //
-//	addr 形如 ":8090"、"127.0.0.1:9000"。
+//	addr 形如 ":8090"、"127.0.0.1:9000"，也可以是逗号分隔的列表
+//	"127.0.0.1:8090,192.168.1.10:8090"、"0.0.0.0:8090,0.0.0.0:8091"。
+//	addr 为空时用系统设置（config.json 的 srv.addr）；这种情况下
+//	若按配置监听失败（例如填了本机没有的 IP），退回「配置里用到的各端口监听全部网卡」，避免改坏配置后起不来。
 func (s *Server) ListenAndServe(addr string) error {
+	var lns []net.Listener
+	var addrs []string
+	if strings.TrimSpace(addr) == "" {
+		addrs = sysconf.ListenAddrs()
+		var err error
+		if lns, err = listenAll(addrs); err != nil {
+			fb := sysconf.FallbackAddrs()
+			s.opts.Logger.Printf("按系统设置监听失败（%v），退回 %v", err, fb)
+			addrs = fb
+			if lns, err = listenAll(addrs); err != nil {
+				return err
+			}
+		}
+	} else {
+		var err error
+		if addrs, err = ParseListenAddrs(addr); err != nil {
+			return err
+		}
+		if lns, err = listenAll(addrs); err != nil {
+			return err
+		}
+	}
+	sysconf.SetListening(addrs)
+
 	// 后台定时抓取：启动先跑一轮，之后按 CrawlInterval 常驻调度
 	s.startScheduler()
+	api.RestartFn = s.restart
 
 	srv := &http.Server{
-		Addr:              addr,
 		Handler:           s.Handler(),
-		ReadHeaderTimeout: 10 * time.Second,
-		ReadTimeout:       30 * time.Second,
+		ReadHeaderTimeout: sysconf.Dur("srv.read_header"),
+		ReadTimeout:       sysconf.Dur("srv.read"),
 		// 视频流为长连接，不设整体 WriteTimeout；用 IdleTimeout 兜底
-		IdleTimeout:    120 * time.Second,
+		IdleTimeout:    sysconf.Dur("srv.idle"),
 		MaxHeaderBytes: 1 << 20,
 	}
 
@@ -368,13 +436,47 @@ func (s *Server) ListenAndServe(addr string) error {
 		_ = srv.Shutdown(ctx)
 	}()
 
-	s.opts.Logger.Printf("夜帧影视 Web 服务已启动：http://localhost%s", addr)
-	err := srv.ListenAndServe()
+	errc := make(chan error, len(lns))
+	for i, ln := range lns {
+		s.opts.Logger.Printf("夜帧影视 Web 服务已启动：http://%s", displayAddr(addrs[i]))
+		go func(ln net.Listener) { errc <- srv.Serve(ln) }(ln)
+	}
+	// 任何一个监听出错 / 服务被 Shutdown 就整体退出
+	err := <-errc
 	if err == http.ErrServerClosed {
 		err = nil
 	}
+	_ = srv.Close()
 	_ = s.Close()
 	return err
+}
+
+func displayAddr(a string) string {
+	host, port, err := net.SplitHostPort(a)
+	if err != nil {
+		return a
+	}
+	if host == "" || host == "0.0.0.0" || host == "::" {
+		host = "localhost"
+	}
+	return net.JoinHostPort(host, port)
+}
+
+// restart 用同样的命令行参数原地重启本进程（先落盘缓存）。
+// 在 systemd / docker / while 循环下同样适用：进程 PID 不变，不依赖外部拉起。
+func (s *Server) restart() error {
+	exe, err := os.Executable()
+	if err != nil {
+		return err
+	}
+	go func() {
+		time.Sleep(400 * time.Millisecond) // 让 HTTP 响应先发出去
+		_ = s.Close()
+		if err := reexec(exe, os.Args); err != nil {
+			s.opts.Logger.Printf("重启失败: %v", err)
+		}
+	}()
+	return nil
 }
 
 // startScheduler 常驻定时抓取：修复原先「只在启动时检查一次」的问题。
@@ -383,7 +485,7 @@ func (s *Server) startScheduler() {
 		if store.TotalSites() > 0 {
 			crawler.MaybeRun()
 		}
-		t := time.NewTicker(crawler.CrawlInterval)
+		t := time.NewTicker(crawler.CrawlInterval())
 		defer t.Stop()
 		for {
 			select {

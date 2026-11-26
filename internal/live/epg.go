@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/xml"
 	"fmt"
+	"github.com/xxl6097/TVBoxWeb/internal/sysconf"
 	"sort"
 	"strings"
 	"sync"
@@ -54,7 +55,7 @@ var (
 	epgCache = map[string]epgCacheItem{}
 )
 
-const epgTTL = 30 * time.Minute
+func epgTTL() time.Duration { return sysconf.Dur("ca.epg") }
 
 // FetchEPG 拉取并解析节目单，按频道名做宽松匹配（忽略大小写、空格、常见清晰度后缀）。
 func FetchEPG(epgURL, channel string) (EpgResult, error) {
@@ -131,14 +132,14 @@ func FetchEPGCtx(ctx context.Context, epgURL, channel string) (EpgResult, error)
 // fetchEPGBody 同一地址 30 分钟内复用，避免每次切台都重新下载整份 EPG。
 func fetchEPGBody(ctx context.Context, u string) (string, error) {
 	epgMu.Lock()
-	if c, ok := epgCache[u]; ok && time.Since(c.at) < epgTTL {
+	if c, ok := epgCache[u]; ok && time.Since(c.at) < epgTTL() {
 		body := c.body
 		epgMu.Unlock()
 		return body, nil
 	}
 	epgMu.Unlock()
 
-	body, err := httpc.TextCtx(ctx, u, nil, 20*time.Second)
+	body, err := httpc.TextCtx(ctx, u, nil, sysconf.Dur("to.epg"))
 	if err != nil {
 		return "", err
 	}

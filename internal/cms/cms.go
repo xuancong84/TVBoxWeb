@@ -8,6 +8,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"github.com/xxl6097/TVBoxWeb/internal/sysconf"
 	"io"
 	"log"
 	"net/url"
@@ -47,9 +48,6 @@ const (
 	// 敲关键词搜索），之前只缓存几十秒到几分钟，相当于没怎么缓存，
 	// 站源那边看到的是「同一个 IP 短时间内一直在高频扫全站」，正是最
 	// 容易被封的访问模式。
-	ttlDefault = 24 * time.Hour
-	ttlCat     = ttlDefault
-	ttlList    = ttlDefault
 	// ttlDetail 详情接口单独给一个短得多的缓存期：它是唯一一个响应里带
 	// 的播放地址（PlayURL）真的会被拿去播放的接口（片单/搜索里附带的
 	// playUrl 只用来在卡片上数集数，从不会被直接播放——点播放一定会重新
@@ -57,8 +55,12 @@ const (
 	// 会把已经失效的播放地址发给用户，表现成「点了播不出来」。详情接口
 	// 本身也是「点开这一部才会拉一次」，不是翻页那种高频扫描，被封的风险
 	// 小得多，所以这里没有跟着默认值走到一天，留一小时做个折中。
-	ttlDetail = time.Hour
+	// （ttlDetail 即系统设置 ca.cms_detail）
 )
+
+func ttlCat() time.Duration    { return sysconf.Dur("ca.cms") }
+func ttlList() time.Duration   { return sysconf.Dur("ca.cms") }
+func ttlDetail() time.Duration { return sysconf.Dur("ca.cms_detail") }
 
 var (
 	cacheMu    sync.Mutex
@@ -136,7 +138,7 @@ const cacheFileName = "cms_cache.json.gz"
 // 文件不存在/损坏都当成「空缓存」处理，不影响正常启动。
 func InitDiskCache(dataDir string) {
 	cacheMu.Lock()
-	cachePath = filepath.Join(dataDir, cacheFileName)
+	cachePath = sysconf.CacheFile("sites", cacheFileName, filepath.Join(dataDir, cacheFileName))
 	cacheMu.Unlock()
 
 	f, err := os.Open(cachePath)
@@ -259,6 +261,8 @@ func fetchCtx(ctx context.Context, url string, ttl time.Duration, ms time.Durati
 
 // RelayFetch / RelayWorthy 由 crawler 包在 init 里注入（crawler 依赖 cms，
 // cms 不能反过来 import crawler），指向 SSH 跳板抓取。
+func relayCooldown() time.Duration { return sysconf.Dur("ca.relay_cooldown") }
+
 var (
 	RelayFetch  func(ctx context.Context, url string, maxBytes int) ([]byte, error)
 	RelayWorthy func(err error) bool
@@ -266,7 +270,6 @@ var (
 
 const (
 	relayMaxBytes = 8 << 20
-	relayCooldown = 5 * time.Minute
 )
 
 // relayFailed 记录各主机最近一次跳板也失败的时间：真正挂掉的站源在冷却期内
@@ -281,7 +284,7 @@ func relayFetch(ctx context.Context, rawURL string, ferr error) (string, error) 
 	if u, err := url.Parse(rawURL); err == nil {
 		host = u.Host
 	}
-	if t, ok := relayFailed.Load(host); ok && time.Since(t.(time.Time)) < relayCooldown {
+	if t, ok := relayFailed.Load(host); ok && time.Since(t.(time.Time)) < relayCooldown() {
 		return "", ferr
 	}
 	b, err := RelayFetch(ctx, rawURL, relayMaxBytes)
@@ -320,7 +323,7 @@ func (c *Cms) CategoriesCtx(ctx context.Context) ([]model.Category, error) {
 	if c.isPy() {
 		return c.pyCategories(ctx)
 	}
-	txt, err := fetchCtx(ctx, c.u("ac=list"), ttlCat, 15*time.Second)
+	txt, err := fetchCtx(ctx, c.u("ac=list"), ttlCat(), sysconf.Dur("to.cms_cat"))
 	if err != nil {
 		return nil, err
 	}
@@ -384,7 +387,7 @@ func (c *Cms) ListCtx(ctx context.Context, tid string, page int) (model.VodPage,
 		return c.pyList(ctx, tid, page)
 	}
 	q := "ac=videolist&t=" + urlEncode(tid) + "&pg=" + strconv.Itoa(page) + c.extra
-	txt, err := fetchCtx(ctx, c.u(q), ttlList, 18*time.Second)
+	txt, err := fetchCtx(ctx, c.u(q), ttlList(), sysconf.Dur("to.cms_list"))
 	if err != nil {
 		return model.VodPage{}, err
 	}
@@ -458,7 +461,7 @@ func (c *Cms) DetailCtx(ctx context.Context, id string) (model.Vod, error) {
 		return c.pyDetail(ctx, id)
 	}
 	q := "ac=detail&ids=" + urlEncode(id)
-	txt, err := fetchCtx(ctx, c.u(q), ttlDetail, 18*time.Second)
+	txt, err := fetchCtx(ctx, c.u(q), ttlDetail(), sysconf.Dur("to.cms_detail"))
 	if err != nil {
 		return model.Vod{}, err
 	}
@@ -492,14 +495,14 @@ func (c *Cms) SearchCtx(ctx context.Context, kw string) []model.Vod {
 	// 的话是这里面风险最大的一类。
 	e := urlEncode(kw)
 	var items []model.Vod
-	if txt, err := fetchCtx(ctx, c.u("ac=videolist&wd="+e), ttlList, 12*time.Second); err == nil {
+	if txt, err := fetchCtx(ctx, c.u("ac=videolist&wd="+e), ttlList(), sysconf.Dur("to.cms_search")); err == nil {
 		items = c.pickList(txt)
 	}
 	if len(items) == 0 {
 		if ctx.Err() != nil {
 			return items
 		}
-		if txt2, err := fetchCtx(ctx, c.u("wd="+e), ttlList, 12*time.Second); err == nil {
+		if txt2, err := fetchCtx(ctx, c.u("wd="+e), ttlList(), sysconf.Dur("to.cms_search")); err == nil {
 			items = c.pickList(txt2)
 		}
 	}

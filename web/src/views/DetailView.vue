@@ -120,6 +120,9 @@ onMounted(async () => {
       watchedEp.value = h.epIndex
       watchedEps.value = new Set(h.watchedEps?.length ? h.watchedEps : [h.epIndex])
       histPos.value = h.pos || 0
+      // 预选上次播放的线路（按线路名匹配），不用再手动切线路
+      const li = h.from ? lines.value.findIndex((l) => l.name === h.from) : -1
+      if (li >= 0) curLine.value = li
     }
   } catch {
     /* ignore */
@@ -185,6 +188,7 @@ function play(epIndex: number, resume = false) {
     false,
     false
   )
+  player.setLines(lines.value, curLine.value)
   // 续播：播放上次看到的集时，从上次进度继续
   if (resume && realIndex === watchedEp.value && histPos.value > 0) {
     player.seek = histPos.value

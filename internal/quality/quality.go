@@ -3,6 +3,7 @@ package quality
 
 import (
 	"context"
+	"crypto/tls"
 	"io"
 	"net/http"
 	"sort"
@@ -224,7 +225,7 @@ func MeasureCtx(ctx context.Context, url string, ms time.Duration, limit int) QS
 	req.Header.Set("User-Agent", httpc.UA)
 	req.Header.Set("Accept", "*/*")
 	req.Header.Set("Range", "bytes=0-"+strconv.Itoa(limit-1))
-	client := &http.Client{Transport: &http.Transport{DisableCompression: true}}
+	client := &http.Client{Transport: &http.Transport{DisableCompression: true, TLSClientConfig: &tls.Config{InsecureSkipVerify: true}}}
 	t0 := time.Now()
 	res, err := client.Do(req)
 	if err != nil {

@@ -7,6 +7,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"github.com/xxl6097/TVBoxWeb/internal/sysconf"
 	"hash/fnv"
 	"io"
 	"net/http"
@@ -91,6 +92,7 @@ func SetUpgrader(u upgrade.Upgrader) {
 
 // Handler 返回根路由。
 func Handler() *http.ServeMux {
+	go crossVerifyLoop()
 	mux := http.NewServeMux()
 	mux.HandleFunc("/api/health", hHealth)
 	// 登录（账号密码由上层库通过 tvbox.WithLogin 注入）
@@ -168,6 +170,9 @@ func Handler() *http.ServeMux {
 	mux.HandleFunc("/api/crawl", hCrawl)
 	mux.HandleFunc("/api/feed", hFeed)
 	mux.HandleFunc("/api/quality/master", hQualityMaster)
+	mux.HandleFunc("/api/system", hSystem)
+	mux.HandleFunc("/api/system/ssh-test", hSystemSSHTest)
+	mux.HandleFunc("/api/system/restart", hSystemRestart)
 	mux.HandleFunc("/api/prefs", hPrefs)
 	mux.HandleFunc("/api/prefs/skip", hPrefsSkip)
 
@@ -646,6 +651,7 @@ func hSites(w http.ResponseWriter, r *http.Request) {
 		out[i].Severity = siteSeverity(stat, out[i].Count)
 		out[i].SubIdx = byAPI[out[i].API]
 	}
+	markSiteDups(out)
 	writeJSONWithCache(w, 200, out, 0, etag)
 }
 
@@ -792,7 +798,7 @@ func hSitesSpeed(w http.ResponseWriter, r *http.Request) {
 	var mu sync.Mutex
 	var out []item
 	var wg sync.WaitGroup
-	sem := make(chan struct{}, 4)
+	sem := make(chan struct{}, sysconf.Int("cc.speed"))
 	for _, s := range sites {
 		wg.Add(1)
 		sem <- struct{}{}
@@ -988,6 +994,12 @@ func hCategories(w http.ResponseWriter, r *http.Request) {
 	cats, err := c.CategoriesCtx(r.Context())
 	ms := int(time.Since(t0).Milliseconds())
 	store.RecordSiteRequest(siteKey, err == nil, ms)
+	for _, alt := range altSiteKeys(siteKey) {
+		if err == nil || r.Context().Err() != nil {
+			break
+		}
+		cats, err = cms.New(alt).CategoriesCtx(r.Context())
+	}
 	if err != nil {
 		fail(w, 500, err.Error())
 		return
@@ -1031,6 +1043,26 @@ func hVod(w http.ResponseWriter, r *http.Request) {
 	}
 	ms := int(time.Since(t0).Milliseconds())
 	store.RecordSiteRequest(siteKey, err == nil, ms)
+	for _, alt := range altSiteKeys(siteKey) {
+		if err == nil || r.Context().Err() != nil {
+			break
+		}
+		ac := cms.New(alt)
+		if ext := q(r, "ext"); ext != "" {
+			ac.SetExtra(ext)
+		}
+		if children := q(r, "children"); children != "" {
+			ids := []string{tid}
+			for _, id := range strings.Split(children, ",") {
+				if id = strings.TrimSpace(id); id != "" {
+					ids = append(ids, id)
+				}
+			}
+			pg, err = ac.ListMergedCtx(r.Context(), ids, page)
+		} else {
+			pg, err = ac.ListCtx(r.Context(), tid, page)
+		}
+	}
 	if err != nil {
 		fail(w, 500, err.Error())
 		return
@@ -1051,6 +1083,12 @@ func hVodDetail(w http.ResponseWriter, r *http.Request) {
 	v, err := c.DetailCtx(r.Context(), id)
 	ms := int(time.Since(t0).Milliseconds())
 	store.RecordSiteRequest(siteKey, err == nil, ms)
+	for _, alt := range altSiteKeys(siteKey) {
+		if err == nil || r.Context().Err() != nil {
+			break
+		}
+		v, err = cms.New(alt).DetailCtx(r.Context(), id)
+	}
 	if err != nil {
 		fail(w, 500, err.Error())
 		return
@@ -1089,7 +1127,7 @@ func hSearch(w http.ResponseWriter, r *http.Request) {
 		ok(w, map[string]any{"list": []model.Vod{}, "sites": 0})
 		return
 	}
-	sites := store.ActiveSites()
+	sites := dedupSites(store.ActiveSites())
 	var searchable []model.Site
 	for _, s := range sites {
 		if s.Searchable {
@@ -1104,7 +1142,7 @@ func hSearch(w http.ResponseWriter, r *http.Request) {
 		vods []model.Vod
 	}
 	ch := make(chan result, len(searchable))
-	sem := make(chan struct{}, 6)
+	sem := make(chan struct{}, sysconf.Int("cc.search"))
 	for _, s := range searchable {
 		sem <- struct{}{}
 		go func(s model.Site) {
@@ -1575,7 +1613,7 @@ func hLiveChannels(w http.ResponseWriter, r *http.Request) {
 		if !guardSourceURL(w, u) {
 			return
 		}
-		groups, err := live.LoadCtx(r.Context(), u, 25*time.Second)
+		groups, err := live.LoadCtx(r.Context(), u, sysconf.Dur("to.live_load"))
 		if err != nil {
 			fail(w, 500, err.Error())
 			return
@@ -1708,7 +1746,7 @@ func hLiveLinesProbe(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	results := live.ProbeLinesCtx(r.Context(), req.URLs, 4*time.Second)
+	results := live.ProbeLinesCtx(r.Context(), req.URLs, sysconf.Dur("to.live_probe"))
 	// 播放页每隔几秒就会轮询一次这个接口，顺手把每条线路的结果记进可靠度
 	// 分数——这是比后台扫描更频繁、更贴近"用户这会儿实际在看"的信号，
 	// 下次这个频道下发线路列表时排序会更准。
@@ -1743,7 +1781,7 @@ func hLiveRank(w http.ResponseWriter, r *http.Request) {
 	}
 	workers := req.Workers
 	if workers <= 0 {
-		workers = 8
+		workers = sysconf.Int("cc.live_probe")
 	}
 	timeout := time.Duration(req.Timeout) * time.Second
 	if timeout == 0 {
@@ -1801,6 +1839,16 @@ func hCrawl(w http.ResponseWriter, r *http.Request) {
 		// 「更新」也好）只决定「要不要在后台补跑一轮」，从不在这次请求里等
 		// 它跑完，也从不因为点了一下就把当前列表清空：GET /api/feed 永远
 		// 立刻原样返回当前缓存的列表，新结果等后台这轮抓完了自然替换上去。
+		// ?retry_dead=1：清掉所有「无响应」标记和失败缓存，立刻强制重抓一轮（让之前因
+		// 网络/证书等原因判死的站源重新被测试）。
+		if r.URL.Query().Get("retry_dead") == "1" && !crawler.IsRunning() {
+			n := store.ClearFailedSiteCrawl()
+			store.SaveDeadKeys(nil)
+			store.FlushSiteCrawlCache()
+			go crawler.Run(true)
+			ok(w, map[string]any{"started": true, "cleared": n})
+			return
+		}
 		switch {
 		case crawler.IsRunning():
 			ok(w, map[string]any{"started": false, "running": true})

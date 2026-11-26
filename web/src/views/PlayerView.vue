@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, computed, onMounted, onUnmounted, onBeforeUnmount } from 'vue'
+import { ref, computed, onMounted, onUnmounted, onBeforeUnmount, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { historyMode, localHistoryUpdate } from '@/historyPrefs'
 import { api, proxied, remuxed, humanizeApiError } from '@/api'
@@ -1868,11 +1868,26 @@ function togglePlay() {
 
 // 点画面：控制条收着时先唤出，再点才切播放/暂停。
 function onSurfaceClick() {
+  // 点弹窗外面关掉选集：这一下 click 会冒泡到画面上，不能当成播放/暂停
+  if (showEps.value || Date.now() - epsClosedAt < 400) return
   if (!osdShown.value) {
     popOsd()
     return
   }
   togglePlay()
+}
+
+// 鼠标一动界面就会弹出来，紧接着的那一下点击如果照常处理，就会误点到
+// 刚冒出来的按钮、或者把视频暂停/继续。所以「界面刚被鼠标移动唤出」的
+// 一小段时间内，点击只当作「保持界面显示」，不往下传。
+const REVEAL_GUARD_MS = 600
+let osdRevealedAt = 0
+function onRevealGuard(e: MouseEvent) {
+  if (Date.now() - osdRevealedAt < REVEAL_GUARD_MS) {
+    e.stopPropagation()
+    e.preventDefault()
+    popOsd()
+  }
 }
 
 function onMouseMove(e: MouseEvent) {
@@ -1891,7 +1906,10 @@ function onMouseMove(e: MouseEvent) {
   }
   mouseAtEdge = false
   cursorHidden.value = false
-  if (!osdShown.value && prepared.value) popOsd()
+  if (!osdShown.value && prepared.value) {
+    osdRevealedAt = Date.now()
+    popOsd()
+  }
 }
 
 // ---------- 进度条拖动定位 ----------
@@ -2176,6 +2194,8 @@ function toggleMute() {
 
 // ===== 选集抽屉 =====
 const showEps = ref(false)
+let epsClosedAt = 0
+watch(showEps, (v) => { if (!v) epsClosedAt = Date.now() })
 let autoplayTimer = 0
 let castHandlers: { onConnect: () => void; onDisconnect: () => void } | null = null
 
@@ -2215,6 +2235,19 @@ async function jumpToEpisode(i: number) {
   showEps.value = false
   if (i === player.idx) return
   await switchEpisode(i - player.idx)
+}
+
+// 点播换线路（播放源）：同一集序号，从当前进度续播
+async function switchVodLine(i: number) {
+  if (isLive || i === player.lineIdx) { if (i === player.lineIdx) app.showTip('已经是当前线路'); return }
+  const pos = realPosMs()
+  const name = player.lines[i]?.name || ''
+  if (!player.switchVodLine(i)) return
+  directMode = player.lines[i].direct
+  showQ.value = false
+  app.showTip(`切换到线路：${name}`)
+  if (pos > 0) player.seek = pos
+  await switchEpisode(0)
 }
 
 async function switchEpisode(delta: number) {
@@ -2466,7 +2499,7 @@ function savePos() {
       epName: player.current?.name || '',
       epIndex: player.idx,
       epCount: player.count,
-      from: '',
+      from: player.lines[player.lineIdx]?.name || '',
       pos: Math.floor(pos),
       dur: durMs.value > 0 ? Math.floor(durMs.value) : 0,
       time: Date.now()
@@ -2516,7 +2549,7 @@ function savePosBeacon() {
       epName: player.current?.name || '',
       epIndex: player.idx,
       epCount: player.count,
-      from: '',
+      from: player.lines[player.lineIdx]?.name || '',
       pos: Math.floor(pos),
       dur,
       time: Date.now()
@@ -2681,6 +2714,11 @@ function onKey(e: KeyboardEvent) {
   } else if (e.key === 'ArrowDown') {
     e.preventDefault()
     changeVolume(-0.05)
+  } else if ((e.key === '<' || e.key === '>' || e.key === ',' || e.key === '.') && !isLive) {
+    // < / > 每次 ∓5%，限制在 0.5~2 倍
+    e.preventDefault()
+    const d = e.key === '<' || e.key === ',' ? -0.05 : 0.05
+    setPlaybackRate(Math.min(2, Math.max(0.5, playbackRate.value + d)))
   } else if (k === 'm') toggleMute()
   else if (k === 'f') toggleFullscreen()
   else if (k === 'p') {
@@ -2722,6 +2760,7 @@ onUnmounted(() => {
     class="player"
     :class="{ 'cursor-hidden': cursorHidden && isFullscreen }"
     @mousemove="onMouseMove"
+    @click.capture="onRevealGuard"
     @click="onSurfaceClick"
     @dblclick="toggleFullscreen"
   >
@@ -2830,7 +2869,7 @@ onUnmounted(() => {
             <div class="vol-track"><div class="vol-fill" :style="{ width: (muted ? 0 : volume * 100) + '%' }"></div></div>
           </div>
           <button class="ctl" @click="openSpeedMenu" :title="`当前 ${rateLabel}x，点击选择倍速`">{{ rateLabel }}x</button>
-          <button class="ctl" @click="showQ = !showQ" :title="qTitle">{{ isLive ? '选择线路' : qLabel }}</button>
+          <button class="ctl" @click="showQ = !showQ" :title="qTitle">选择线路</button>
           <button v-if="!isLive && player.count > 1" class="ctl" @click="showEps = true">选集</button>
           <!-- 自动连播开关：原来只有移动端有，桌面端播完只好被动连播，
                想逐集看完再停下也没法设置。 -->
@@ -2878,6 +2917,8 @@ onUnmounted(() => {
       :q-cap="qCap"
       :level-idx="levelIdx"
       :lines="player.current?.urls || []"
+      :vod-lines="player.lines"
+      :vod-line-idx="player.lineIdx"
       :line-quality="lineQuality"
       :raw-url="rawUrl"
       :sub-delay="subDelay"
@@ -2896,6 +2937,7 @@ onUnmounted(() => {
       :auto-switch="autoLineSwitch"
       @choose-level="chooseLevel"
       @switch-line="switchLine"
+      @switch-vod-line="switchVodLine"
       @update:auto-switch="autoLineSwitch = $event"
       @sub-file="onSubFile"
       @sub-url="promptSubUrl"
@@ -3081,7 +3123,7 @@ onUnmounted(() => {
         </button>
         <button class="m-aux-btn" @click="showQ = !showQ" :title="qTitle">
           <span class="m-aux-icon">⚙</span>
-          <span>{{ isLive ? '选择线路' : qLabel }}</span>
+          <span>选择线路</span>
         </button>
         <button v-if="!isLive && player.count > 1" class="m-aux-btn" @click="showEps = true">
           <span class="m-aux-icon">☷</span>
@@ -3115,6 +3157,8 @@ onUnmounted(() => {
       :q-cap="qCap"
       :level-idx="levelIdx"
       :lines="player.current?.urls || []"
+      :vod-lines="player.lines"
+      :vod-line-idx="player.lineIdx"
       :line-quality="lineQuality"
       :raw-url="rawUrl"
       :sub-delay="subDelay"
@@ -3133,6 +3177,7 @@ onUnmounted(() => {
       :auto-switch="autoLineSwitch"
       @choose-level="chooseLevel"
       @switch-line="switchLine"
+      @switch-vod-line="switchVodLine"
       @update:auto-switch="autoLineSwitch = $event"
       @sub-file="onSubFile"
       @sub-url="promptSubUrl"

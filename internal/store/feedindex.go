@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"compress/gzip"
 	"encoding/json"
+	"github.com/xxl6097/TVBoxWeb/internal/sysconf"
 	"io"
 	"log"
 	"os"
@@ -160,7 +161,7 @@ var (
 
 // InitFeedPool 在 store.Init 之后调用一次，加载磁盘上的榜单候选池。
 func InitFeedPool(dataDir string) {
-	p := filepath.Join(dataDir, feedPoolFileName)
+	p := sysconf.CacheFile("lists", feedPoolFileName, filepath.Join(dataDir, feedPoolFileName))
 	var list []model.Vod
 	if f, err := os.Open(p); err == nil {
 		defer f.Close()

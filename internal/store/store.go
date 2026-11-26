@@ -613,7 +613,11 @@ func UpdateHistoryPos(h HistItem) {
 	i, found := histIdx[histKey(h.SiteKey, h.VodID)]
 	if found && i >= 0 && i < len(data.Hist) {
 		it := &data.Hist[i]
-		it.Pos, it.Dur, it.EpName, it.EpIndex, it.EpCount, it.From, it.Time = h.Pos, h.Dur, h.EpName, h.EpIndex, h.EpCount, h.From, time.Now().UnixMilli()
+		it.Pos, it.Dur, it.EpName, it.EpIndex, it.EpCount, it.Time = h.Pos, h.Dur, h.EpName, h.EpIndex, h.EpCount, time.Now().UnixMilli()
+		// From = 上次播放的线路名；播放页没带线路信息（如刷新后）时保留旧值
+		if h.From != "" {
+			it.From = h.From
+		}
 		// 补更新影片名/封面（早期记录可能为空）
 		if h.Name != "" {
 			it.Name = h.Name

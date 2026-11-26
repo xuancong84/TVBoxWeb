@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/xxl6097/TVBoxWeb/internal/sysconf"
 	"sort"
 	"strings"
 	"sync"
@@ -34,7 +35,7 @@ func fetchText(source string) (string, error) {
 func fetchTextCtx(ctx context.Context, source string) (string, error) {
 	src := strings.TrimSpace(source)
 	if strings.HasPrefix(src, "http://") || strings.HasPrefix(src, "https://") {
-		return httpc.TextCtx(ctx, src, nil, 20*time.Second)
+		return httpc.TextCtx(ctx, src, nil, sysconf.Dur("to.subscription"))
 	}
 	if src != "" {
 		return src, nil
@@ -73,19 +74,23 @@ func itoa(n int) string {
 	return string(b)
 }
 
+// CrawlInterval 两次「全站抓取」之间的最短间隔（系统设置 ca.crawl_interval，默认 24 小时）。
+func CrawlInterval() time.Duration { return sysconf.Dur("ca.crawl_interval") }
+
+// SiteCacheMaxAge 单个站源抓取缓存的最长可信年龄（系统设置 ca.site_cache，默认 24 小时）。
+func SiteCacheMaxAge() time.Duration { return sysconf.Dur("ca.site_cache") }
+
 const (
-	// CrawlInterval 两次「全站抓取」之间的最短间隔：抓取是预先在后台按这个
+	// （原 CrawlInterval 说明）两次「全站抓取」之间的最短间隔：抓取是预先在后台按这个
 	// 周期跑的（见 tvbox.go startScheduler），不是用户一点首页/点一下
 	// 「更新」就现抓现等。用户在这个间隔内点「更新」只是看看而已，不会
 	// 真的再去敲一遍全站——这里改成一个可调参数，按需调大调小即可。
-	CrawlInterval = 24 * time.Hour
-	// SiteCacheMaxAge 单个站源「抓列表」缓存结果的最长可信年龄：没超过这个
+	// （原 SiteCacheMaxAge 说明）单个站源「抓列表」缓存结果的最长可信年龄：没超过这个
 	// 岁数就直接用 store.SiteCrawlEntry 缓存，不重新联网抓。跟 CrawlInterval
 	// 是两个不同的旋钮——CrawlInterval 决定「这一轮该不该跑」，这个决定
 	// 「跑的时候这一个站源要不要真的联网」。这样无论是定时轮询还是服务
 	// 重启触发的那一轮，绝大多数没过期的站源都是缓存秒出，只有真正过期
 	// （或从没抓过）的那一小撮才会被放进这一轮要联网的子集。
-	SiteCacheMaxAge = 24 * time.Hour
 	// SitePool 每个站源实际抓取/缓存的候选条数——组装首页时按站源分组，
 	// 组内保留这个候选池原始顺序（即该站自己返回的新旧/热度顺序），轮转
 	// 组装时去重撞车了就换这个池子里的下一条候选继续凑。站源自己一页
@@ -236,7 +241,7 @@ func Run(force bool) CrawlResult {
 	var staleSites []model.Site
 	for _, s := range sites {
 		entry, ok := store.GetSiteCrawlEntry(s.Key)
-		if ok && entry.V >= siteCacheVer && now.Sub(time.UnixMilli(entry.At)) < SiteCacheMaxAge {
+		if ok && entry.V >= siteCacheVer && now.Sub(time.UnixMilli(entry.At)) < SiteCacheMaxAge() {
 			apply(s, entry.Items)
 			continue
 		}
@@ -441,7 +446,7 @@ func filterKeys(keys []string, keep map[string]bool) []string {
 // 要不要配合 IsRunning() 一起判断。
 func DueForRefresh() bool {
 	last := store.LastCrawlAt()
-	return last == 0 || time.Now().UnixMilli()-last >= CrawlInterval.Milliseconds()
+	return last == 0 || time.Now().UnixMilli()-last >= CrawlInterval().Milliseconds()
 }
 
 // MaybeRun 到期才跑；没到期返回 nil。

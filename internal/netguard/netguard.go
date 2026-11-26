@@ -19,6 +19,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/xxl6097/TVBoxWeb/internal/dnscache"
 )
 
 // Config 是全局安全配置，由 api.SetSecurity 注入。
@@ -144,18 +146,19 @@ func check(raw string, allowPrivate bool) error {
 }
 
 func checkResolved(ctx context.Context, host string) error {
-	ctx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	// 先缓存、再系统 DNS、再 SSH 跳板（SSH 较慢，给足时间）
+	ctx, cancel := context.WithTimeout(ctx, 20*time.Second)
 	defer cancel()
-	addrs, err := net.DefaultResolver.LookupIPAddr(ctx, host)
+	ips, err := dnscache.Lookup(ctx, host)
 	if err != nil {
 		return fmt.Errorf("解析域名 %s 失败：%v", host, err)
 	}
-	if len(addrs) == 0 {
+	if len(ips) == 0 {
 		return fmt.Errorf("域名 %s 没有解析结果", host)
 	}
-	for _, a := range addrs {
-		if !IsPublic(a.IP) {
-			return fmt.Errorf("目标 %s 解析到内网/保留地址 %s，已拒绝", host, a.IP)
+	for _, ip := range ips {
+		if !IsPublic(ip) {
+			return fmt.Errorf("目标 %s 解析到内网/保留地址 %s，已拒绝", host, ip)
 		}
 	}
 	return nil

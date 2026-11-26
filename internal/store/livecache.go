@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"compress/gzip"
 	"encoding/json"
+	"github.com/xxl6097/TVBoxWeb/internal/sysconf"
 	"io"
 	"log"
 	"os"
@@ -40,7 +41,7 @@ type ChannelProbe struct {
 // ChannelFailMaxAge 「播不通」结论的最长可信期：超过这个岁数，后台扫描
 // 会把这个频道当成「没测过」重新探测一次。只对 OK=false 生效，OK=true
 // 永久有效。
-const ChannelFailMaxAge = 24 * time.Hour
+func ChannelFailMaxAge() time.Duration { return sysconf.Dur("ca.channel_fail") }
 
 var (
 	liveCacheMu    sync.RWMutex
@@ -68,7 +69,7 @@ type liveCacheFile struct {
 func InitLiveCrawlCache(dataDir string) {
 	liveCacheMu.Lock()
 	defer liveCacheMu.Unlock()
-	liveCachePath = filepath.Join(dataDir, liveCacheFileName)
+	liveCachePath = sysconf.CacheFile("lists", liveCacheFileName, filepath.Join(dataDir, liveCacheFileName))
 	liveCache = map[string]LiveCacheEntry{}
 	channelStatus = map[string]ChannelProbe{}
 	lineScores = map[string]LineScore{}
@@ -149,7 +150,7 @@ func GetChannelStatus(name string) (ok bool, known bool) {
 	if !exists {
 		return false, false
 	}
-	if !p.OK && time.Since(time.UnixMilli(p.At)) > ChannelFailMaxAge {
+	if !p.OK && time.Since(time.UnixMilli(p.At)) > ChannelFailMaxAge() {
 		return false, false
 	}
 	return p.OK, true

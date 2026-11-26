@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"github.com/xxl6097/TVBoxWeb/internal/sysconf"
 	"net/http"
 	"sort"
 	"sync"
@@ -28,7 +29,6 @@ const (
 	// 没缓存、每次都要重新合并全部直播源）那样隔很久才查一次——缩短这个
 	// 间隔也让「清空重测」（hLiveScanReset）之类的场景不用等到 5 分钟才
 	// 被这个循环发现有活干。
-	liveScanIdle = 30 * time.Second
 	// liveScanParallel 后台扫描的并发探测数：纯后台任务，不阻塞任何用户
 	// 请求，可以比前台「检测」按钮（4）给得更高。合并全部直播源后去重
 	// 去重出来的频道名常常是十万量级（大量源之间同一个台改头换面叫不
@@ -77,7 +77,7 @@ func StartLiveScan() {
 				// 的 enabled 检查短间隔轮询接住，重新打开后几秒内就能接着扫，
 				// 而不是要等满一整个 liveScanIdle（5 分钟）。
 				if runLiveScanPass() {
-					time.Sleep(liveScanIdle)
+					time.Sleep(liveScanIdle())
 				}
 			}
 		}()
@@ -121,7 +121,8 @@ func runLiveScanPass() bool {
 // 每 liveScanFlushEvery 秒落一次盘（而不是整轮测完才落一次）：候选频道
 // 常有几万条，一轮可能跑好几个小时，万一中途断电，至少不会把这期间测到
 // 的结果全部丢光。
-const liveScanFlushEvery = 30 * time.Second
+func liveScanFlushEvery() time.Duration { return sysconf.Dur("ca.scan_flush") }
+func liveScanIdle() time.Duration       { return sysconf.Dur("ca.scan_idle") }
 
 func scanChannelsLowPriority(chs []model.Channel) (completed bool) {
 	tasks := make(chan model.Channel)
@@ -151,7 +152,7 @@ func scanChannelsLowPriority(chs []model.Channel) (completed bool) {
 
 	flushDone := make(chan struct{})
 	go func() {
-		t := time.NewTicker(liveScanFlushEvery)
+		t := time.NewTicker(liveScanFlushEvery())
 		defer t.Stop()
 		for {
 			select {

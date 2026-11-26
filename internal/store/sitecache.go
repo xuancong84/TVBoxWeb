@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"compress/gzip"
 	"encoding/json"
+	"github.com/xxl6097/TVBoxWeb/internal/sysconf"
 	"io"
 	"log"
 	"os"
@@ -50,7 +51,7 @@ var (
 func InitSiteCrawlCache(dataDir string) {
 	siteCacheMu.Lock()
 	defer siteCacheMu.Unlock()
-	siteCachePath = filepath.Join(dataDir, siteCacheFileName)
+	siteCachePath = sysconf.CacheFile("sites", siteCacheFileName, filepath.Join(dataDir, siteCacheFileName))
 	siteCache = map[string]SiteCrawlEntry{}
 	siteCacheDirty = false
 
@@ -107,6 +108,24 @@ func PruneSiteCrawlCache(keep map[string]bool) {
 			siteCacheDirty = true
 		}
 	}
+}
+
+// ClearFailedSiteCrawl 删掉所有「上次抓取失败」的缓存条目，让这些站源下一轮重新联网重试
+// （失败结果在缓存可信期内会被直接沿用，不重试）。返回删掉的条数。
+func ClearFailedSiteCrawl() int {
+	siteCacheMu.Lock()
+	defer siteCacheMu.Unlock()
+	n := 0
+	for k, v := range siteCache {
+		if !v.OK {
+			delete(siteCache, k)
+			n++
+		}
+	}
+	if n > 0 {
+		siteCacheDirty = true
+	}
+	return n
 }
 
 // FlushSiteCrawlCache 把站源抓取缓存压缩落盘；没有脏数据时直接跳过。

@@ -83,7 +83,7 @@ type RawLive struct {
 	// 配置文本里从来不会有这两个字段（二者只在应用层有意义）：
 	//   Enabled 是否参与直播频道合并（store.EnabledLiveURLs，空=全部启用）
 	//   Subs    贡献了这条直播源的「单仓源」列表，判断该不该拉黑用
-	Enabled bool     `json:"enabled"`
+	Enabled bool  `json:"enabled"`
 	SubIdx  []int `json:"subIdx,omitempty"` // 下标，指向 GET /api/sites/subrefs 的单仓源表
 }
 
@@ -156,10 +156,10 @@ type Site struct {
 	// Kind 非空表示不是标准 CMS 接口：目前只有 "py"（Python 站源，由 internal/pyspider 驱动）。
 	Kind string `json:"kind,omitempty"`
 	// Base 同 RawSite.Base，仅内存里用，不落盘不下发。
-	Base   string `json:"-"`
-	Usable bool   `json:"usable"`
-	Reason      string `json:"reason"`
-	Enabled     bool   `json:"enabled"`
+	Base    string `json:"-"`
+	Usable  bool   `json:"usable"`
+	Reason  string `json:"reason"`
+	Enabled bool   `json:"enabled"`
 	// Dead 不是「站源不可用」，而是最近一次内容更新时该站源 ac=list 返回了
 	// 0 条（域名过期被停放/返回空列表等），数据来自 store.DeadKeys()。
 	Dead bool `json:"dead"`
@@ -179,6 +179,10 @@ type Site struct {
 	// 存的是单仓源表（GET /api/sites/subrefs）的下标：一个站源可能被几百条订阅
 	// 收录，把名字/地址整个带上 /api/sites 会有几十 MB，设置页展开就卡。
 	SubIdx []int `json:"subIdx,omitempty"`
+	// Alts / DupOf：指向同一个 CMS 接口的重复站源。代表站源带 Alts（其余成员），
+	// 其余成员带 DupOf（代表的 key）。点播下拉只显示代表，失败时后端换 Alts 重试。
+	Alts  []string `json:"alts,omitempty"`
+	DupOf string   `json:"dupOf,omitempty"`
 }
 
 // SubRef 标识一条「单仓源」（crawler.SyncSubscriptionRoots 展开后的叶子

@@ -21,3 +21,6 @@ web/dist/
 
 # IDE
 .idea/
+/config.json
+/dns-cache.json
+/cache/

@@ -58,6 +58,7 @@ export function localHistoryUpdate(k: Kind, h: any): void {
         ...h,
         name: h.name || old.name,
         pic: h.pic || old.pic,
+        from: h.from || old.from || '',
         siteName: h.siteName || old.siteName,
         time: Date.now()
       }

@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"github.com/xxl6097/TVBoxWeb/internal/sysconf"
 	"net/http"
 	"sync"
 	"time"
@@ -15,12 +16,6 @@ import (
 // 只能逐个分类取第一页看 total。这件事慢（每个分类一次上游请求），所以
 // 绝不能挡住用户：首次访问只触发后台探测并立刻返回 ready=false（前端照常
 // 显示全部分类），探测完成后结果缓存起来，之后再进来的请求直接命中。
-
-const (
-	catProbeTTL         = 6 * time.Hour
-	catProbeConcurrency = 4
-	catProbeTimeout     = 25 * time.Second
-)
 
 type catProbeEntry struct {
 	empty   []string // 确认为空的分类 id
@@ -50,7 +45,7 @@ func hCategoriesEmpty(w http.ResponseWriter, r *http.Request) {
 	ver := store.SitesVersion()
 	catProbeMu.Lock()
 	e := catProbeCache[siteKey]
-	fresh := e != nil && e.version == ver && time.Since(e.at) < catProbeTTL
+	fresh := e != nil && e.version == ver && time.Since(e.at) < sysconf.Dur("ca.cat_probe")
 	if fresh {
 		catProbeMu.Unlock()
 		ok(w, catEmptyResp{Ready: true, Empty: e.empty})
@@ -94,14 +89,14 @@ func probeEmptyCategories(siteKey string, site model.Site, ver int64) {
 	}
 	var mu sync.Mutex
 	var wg sync.WaitGroup
-	sem := make(chan struct{}, catProbeConcurrency)
+	sem := make(chan struct{}, sysconf.Int("cc.cat_probe"))
 	for _, id := range ids {
 		wg.Add(1)
 		sem <- struct{}{}
 		go func(id string) {
 			defer wg.Done()
 			defer func() { <-sem }()
-			cctx, ccancel := context.WithTimeout(ctx, catProbeTimeout)
+			cctx, ccancel := context.WithTimeout(ctx, sysconf.Dur("to.cms_list"))
 			defer ccancel()
 			pg, err := c.ListCtx(cctx, id, 1)
 			// 出错 = 状态未知，不能当成空分类藏起来

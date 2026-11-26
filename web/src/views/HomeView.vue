@@ -438,7 +438,10 @@ function refresh() {
 }
 .continue-item .poster {
   position: relative;
-  aspect-ratio: 16 / 9;
+  /* 横版 16:9；用 padding-bottom 而不是 aspect-ratio，
+     旧电视浏览器不支持后者 */
+  height: 0;
+  padding-bottom: 56.25%;
   border-radius: var(--radius);
   overflow: hidden;
   background: var(--card);
@@ -448,6 +451,9 @@ function refresh() {
   border-color: #fff;
 }
 .poster img {
+  position: absolute;
+  left: 0;
+  top: 0;
   width: 100%;
   height: 100%;
   object-fit: cover;
@@ -455,7 +461,10 @@ function refresh() {
 /* 网盘记录没有封面：给个居中图标占位 */
 .poster-ph {
   position: absolute;
-  inset: 0;
+  left: 0;
+  top: 0;
+  right: 0;
+  bottom: 0;
   display: flex;
   align-items: center;
   justify-content: center;

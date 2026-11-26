@@ -98,11 +98,17 @@ function healthOf(key: string): string {
 // 再按 severity 从小到大排——「连上了确实空」比「这次压根没连上」靠前，
 // 「这次没连上但 24 小时内成功过」又比「长期没成功过/已过期/完全失联」靠前。
 const sortedSites = computed(() =>
-  [...sites.value].sort((a, b) => b.count - a.count || a.severity - b.severity)
+  sites.value
+    .filter((s) => !s.dupOf || s.key === siteKey.value)
+    .sort((a, b) => b.count - a.count || a.severity - b.severity)
 )
 // 下拉里站源的颜色：设置里禁用=深红，启用且有内容=亮绿，启用但没内容=灰。
 function siteState(s: { enabled: boolean; count: number }) {
   return !s.enabled ? 'st-off' : s.count > 0 ? 'st-on' : 'st-empty'
+}
+function altList(s: Site): Site[] {
+  const m = new Map(sites.value.map((x) => [x.key, x]))
+  return (s.alts || []).map((k) => m.get(k)).filter((x): x is Site => !!x)
 }
 function refreshAll() {
   void loadHealth()
@@ -470,11 +476,23 @@ function parseFilters(ext: string, tid: string): FilterGroup[] {
         <span v-else-if="page.total > 0" class="total-hint">共 {{ page.total.toLocaleString() }} 部</span>
         <el-select v-model="siteKey" placeholder="换站" style="width: 200px" :class="currentSite ? siteState(currentSite) : ''">
           <el-option v-for="s in sortedSites" :key="s.key" :label="s.name" :value="s.key" :class="siteState(s)">
-            <span class="opt-health">
-              <span class="health-dot" :style="{ background: HEALTH_COLOR[healthOf(s.key)] }"></span>
-              <span>{{ s.name }}</span>
-              <span class="health-txt">{{ s.count }}</span>
-            </span>
+            <el-tooltip placement="right" :disabled="!s.alts?.length" :show-after="200" effect="dark">
+              <template #content>
+                <div style="max-width: 420px; line-height: 1.5; font-size: 12px">
+                  <div>设置 → 点播源 里搜索以下名称：</div>
+                  <div v-for="a in altList(s)" :key="a.key" style="margin-top: 6px">
+                    <b>{{ a.name }}</b>
+                    <span style="opacity: .7">{{ a.enabled ? '' : '（未启用）' }}{{ a.dead ? '（已标死）' : '' }}</span>
+                    <div style="opacity: .7; word-break: break-all">{{ a.api }}</div>
+                  </div>
+                </div>
+              </template>
+              <span class="opt-health">
+                <span class="health-dot" :style="{ background: HEALTH_COLOR[healthOf(s.key)] }"></span>
+                <span>{{ s.name }}</span>
+                <span class="health-txt">{{ s.count }}<template v-if="s.alts?.length"> · +{{ s.alts.length }}备用</template></span>
+              </span>
+            </el-tooltip>
           </el-option>
         </el-select>
         <el-button @click="refreshAll">刷新</el-button>

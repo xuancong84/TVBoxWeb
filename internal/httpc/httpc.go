@@ -4,6 +4,7 @@ package httpc
 
 import (
 	"context"
+	"crypto/tls"
 	"fmt"
 	"io"
 	"net"
@@ -12,7 +13,9 @@ import (
 	"strings"
 	"time"
 
+	"github.com/xxl6097/TVBoxWeb/internal/dnscache"
 	"github.com/xxl6097/TVBoxWeb/internal/netguard"
+	"github.com/xxl6097/TVBoxWeb/internal/sysconf"
 )
 
 const UA = "Mozilla/5.0 (Linux; HarmonyOS; SmartScreen) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
@@ -27,6 +30,8 @@ const maxTextBody = 8 << 20 // 8MB
 
 // sharedTransport 供文本类请求复用连接池，避免每次 new(http.Client) 造成握手浪费。
 var sharedTransport = &http.Transport{
+	// 按需求：一律不校验 TLS 证书（过期/自签/域名不符的源也照常连接）
+	TLSClientConfig:       &tls.Config{InsecureSkipVerify: true},
 	Proxy:                 http.ProxyFromEnvironment,
 	MaxIdleConns:          100,
 	MaxIdleConnsPerHost:   8,
@@ -41,6 +46,7 @@ var sharedTransport = &http.Transport{
 // 只在握手阶段（拨号 / TLS / 响应头）设超时，避免单个请求永久挂起。
 var StreamClient = &http.Client{
 	Transport: &http.Transport{
+		TLSClientConfig:       &tls.Config{InsecureSkipVerify: true}, // 不校验证书
 		Proxy:                 http.ProxyFromEnvironment,
 		DisableCompression:    true, // 视频已是压缩格式，且需要透传 Content-Length/Range
 		MaxIdleConns:          200,
@@ -62,6 +68,26 @@ var StreamClient = &http.Client{
 		}
 		return netguard.Check(req.URL.String())
 	},
+}
+
+// Apply 把系统设置里的网络参数（net.*）套到两个传输层。启动时调用一次，
+// 修改后需重启生效（Transport 一旦使用就不应再改字段）。
+func Apply() {
+	d := func(k string) time.Duration { return sysconf.Dur(k) }
+	dialer := &net.Dialer{Timeout: d("net.dial"), KeepAlive: 30 * time.Second}
+	dnscache.Start()
+	dial := dnscache.NewDialContext(dialer)
+	sharedTransport.IdleConnTimeout = d("net.idle")
+	sharedTransport.TLSHandshakeTimeout = d("net.tls")
+	sharedTransport.ResponseHeaderTimeout = d("net.header")
+	sharedTransport.DialContext = dial
+	if t, ok := StreamClient.Transport.(*http.Transport); ok {
+		t.IdleConnTimeout = d("net.idle")
+		t.TLSHandshakeTimeout = d("net.tls")
+		t.ResponseHeaderTimeout = d("net.stream_header")
+		t.MaxConnsPerHost = sysconf.Int("net.stream_max_conns")
+		t.DialContext = dial
+	}
 }
 
 // Text 拉取文本，自动跟随最多 3 次重定向，4xx 给出中文提示。

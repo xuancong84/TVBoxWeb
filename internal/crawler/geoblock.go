@@ -7,12 +7,11 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"errors"
-	"os"
+	"github.com/xxl6097/TVBoxWeb/internal/sysconf"
 	"os/exec"
 	"regexp"
 	"strconv"
 	"strings"
-	"time"
 
 	"github.com/xxl6097/TVBoxWeb/internal/cms"
 	"github.com/xxl6097/TVBoxWeb/internal/httpc"
@@ -95,7 +94,7 @@ func worthGeoRelay(ferr error) bool {
 // 解出嵌入的 base64 配置块）为止，用来绕开「只对特定地区 IP 返回正常内容」
 // 的订阅源。没配这个环境变量时直接报错，调用方会把原始错误原样抛给用户。
 func fetchViaGeoBlockRelays(ctx context.Context, url string) (string, error) {
-	raw := strings.TrimSpace(os.Getenv("SSH_CMDS_GEO_BLOCK"))
+	raw := strings.TrimSpace(sysconf.Str("ssh.jump"))
 	if raw == "" {
 		return "", errors.New("未配置 SSH_CMDS_GEO_BLOCK，无法尝试跳板中转")
 	}
@@ -154,7 +153,7 @@ func WorthGeoRelay(ferr error) bool { return worthGeoRelay(ferr) }
 // AES 密钥）。只给 /api/proxy 在直连被地区封锁时兜底用：返回内容超过 maxBytes 会被
 // 丢弃并报错，所以即使调用方误传了视频分片地址，也不会通过 SSH 搬运视频主体数据。
 func FetchSmallViaGeoRelay(ctx context.Context, url string, maxBytes int) ([]byte, error) {
-	raw := strings.TrimSpace(os.Getenv("SSH_CMDS_GEO_BLOCK"))
+	raw := strings.TrimSpace(sysconf.Str("ssh.jump"))
 	if raw == "" {
 		return nil, errors.New("未配置 SSH_CMDS_GEO_BLOCK")
 	}
@@ -198,7 +197,7 @@ func (l *limitWriter) Write(p []byte) (int, error) {
 // FetchScript 下载站源脚本/规则这类小文本：先直连，直连失败且值得换出口 IP 时再走
 // SSH_CMDS_GEO_BLOCK 跳板（只搬 ≤2MB 的小文件）。
 func FetchScript(ctx context.Context, u string) (string, error) {
-	txt, err := httpc.TextCtx(ctx, u, nil, 25*time.Second)
+	txt, err := httpc.TextCtx(ctx, u, nil, sysconf.Dur("to.geo_file"))
 	if err == nil {
 		return txt, nil
 	}

@@ -4,6 +4,7 @@ package live
 import (
 	"context"
 	"fmt"
+	"github.com/xxl6097/TVBoxWeb/internal/sysconf"
 	"net/url"
 	"strings"
 	"sync"
@@ -243,7 +244,7 @@ func ProbeLineCtx(ctx context.Context, url string, timeout time.Duration) LineQu
 func ProbeLinesCtx(ctx context.Context, urls []string, timeout time.Duration) []LineQuality {
 	out := make([]LineQuality, len(urls))
 	var wg sync.WaitGroup
-	sem := make(chan struct{}, 6)
+	sem := make(chan struct{}, sysconf.Int("cc.live_probe"))
 	for i, u := range urls {
 		wg.Add(1)
 		go func(i int, u string) {
@@ -265,7 +266,7 @@ func Load(url string, timeout time.Duration) ([]model.ChannelGroup, error) {
 // LoadCtx 与 Load 相同，ctx 可取消。
 func LoadCtx(ctx context.Context, url string, timeout time.Duration) ([]model.ChannelGroup, error) {
 	if timeout <= 0 {
-		timeout = 25 * time.Second
+		timeout = sysconf.Dur("to.live_load")
 	}
 	txt, err := httpc.TextCtx(ctx, url, nil, timeout)
 	if err != nil || strings.TrimSpace(txt) == "" {

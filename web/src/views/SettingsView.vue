@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, computed, onMounted, nextTick } from 'vue'
+import { ref, computed, watch, onMounted, nextTick } from 'vue'
 import { useRouter } from 'vue-router'
 import { api, humanizeApiError, getAuthToken, setAuthToken } from '@/api'
 import { getTheme, setTheme, type ThemeMode } from '@/theme'
@@ -108,17 +108,130 @@ async function resetAll() {
 }
 
 // ===== 导航 =====
-type NavKey = 'source' | 'update' | 'webdav' | 'sites' | 'data' | 'display' | 'about'
+type NavKey = 'source' | 'update' | 'webdav' | 'data' | 'display' | 'system' | 'about'
 const navKey = ref<NavKey>('source')
 const navItems: { key: NavKey; label: string }[] = [
   { key: 'source', label: '播放源' },
   { key: 'update', label: '内容更新' },
   { key: 'webdav', label: '网盘' },
-  { key: 'sites',  label: '站源' },
   { key: 'data',   label: '数据' },
   { key: 'display', label: '界面' },
+  { key: 'system', label: '系统' },
   { key: 'about',  label: '关于' }
 ]
+
+// ===== 系统（超时 / 连接 / 并发 / 缓存 / SSH 跳板 / 解释器）=====
+// 参数定义由后端 /api/system 给出（键、分组、单位、范围、是否需重启），
+// 保存后写入项目根目录 config.json。
+interface SysItem {
+  key: string; group: string; label: string; desc?: string; kind: 'int' | 'text' | 'bool'
+  secret?: boolean
+  unit?: string; def: number; min?: number; max?: number; env?: string; restart?: boolean
+}
+const sysSchema = ref<SysItem[]>([])
+const sysVals = ref<Record<string, any>>({})
+const sysSaved = ref<Record<string, any>>({})
+const sysListening = ref<string[]>([])
+const sysOverrides = ref<string[]>([])
+const sysRestarting = ref(false)
+const sysPath = ref('')
+const sysLoading = ref(false)
+const sysSaving = ref(false)
+const sysTest = ref<{ cmd: string; ok: boolean; ms: number; error?: string }[] | null>(null)
+const sysTesting = ref(false)
+
+const sysGroups = computed(() => {
+  const order: string[] = []
+  const m = new Map<string, SysItem[]>()
+  for (const it of sysSchema.value) {
+    if (!m.has(it.group)) { m.set(it.group, []); order.push(it.group) }
+    m.get(it.group)!.push(it)
+  }
+  return order.map((g) => ({ name: g, items: m.get(g)! }))
+})
+const LAUNCH = '启动参数'
+const sysMainGroups = computed(() => sysGroups.value.filter((g) => g.name !== LAUNCH))
+const sysLaunchItems = computed(() => sysGroups.value.find((g) => g.name === LAUNCH)?.items ?? [])
+const sysDirtyKeys = computed(() =>
+  sysSchema.value.filter((it) => sysVals.value[it.key] !== sysSaved.value[it.key]).map((it) => it.key))
+const sysNeedRestart = computed(() =>
+  sysSchema.value.some((it) => it.restart && sysDirtyKeys.value.includes(it.key)))
+
+function applySys(d: any) {
+  if (d.schema) sysSchema.value = d.schema
+  if (d.listening) sysListening.value = d.listening
+  if (d.overrides) sysOverrides.value = d.overrides
+  if (d.path) sysPath.value = d.path
+  sysVals.value = { ...d.values }
+  sysSaved.value = { ...d.values }
+}
+async function loadSystem() {
+  sysLoading.value = true
+  try { applySys(await api.systemGet()) }
+  catch (e: any) { app.showTip('读取系统参数失败：' + humanizeApiError(e)) }
+  finally { sysLoading.value = false }
+}
+async function saveSystem() {
+  const body: Record<string, any> = {}
+  for (const k of sysDirtyKeys.value) body[k] = sysVals.value[k]
+  if (!Object.keys(body).length) return
+  for (const it of sysSchema.value) {
+    if (it.kind !== 'int' || !(it.key in body)) continue
+    const n = Number(body[it.key])
+    if (!Number.isFinite(n) || n < (it.min ?? 0) || (it.max && n > it.max)) {
+      app.showTip(`「${it.label}」取值范围 ${it.min ?? 0}–${it.max}`)
+      return
+    }
+    body[it.key] = Math.round(n)
+  }
+  sysSaving.value = true
+  try {
+    const needRestart = sysNeedRestart.value
+    await api.systemSave(body)
+    await loadSystem()
+    app.showTip(needRestart ? '已保存到 config.json；标注「需重启」的项重启后生效' : '已保存到 config.json，立即生效')
+  } catch (e: any) { app.showTip('保存失败：' + humanizeApiError(e)) }
+  finally { sysSaving.value = false }
+}
+async function resetSystem() {
+  try {
+    await ElMessageBox.confirm('把全部系统参数恢复为默认值？（SSH 跳板会清空，回落环境变量）', '恢复默认', { type: 'warning' })
+  } catch { return }
+  try { await api.systemReset(); await loadSystem(); app.showTip('已恢复默认值') }
+  catch (e: any) { app.showTip('恢复失败：' + humanizeApiError(e)) }
+}
+async function restartBackend() {
+  try {
+    await ElMessageBox.confirm('重启后端？页面会短暂断开，服务恢复后自动刷新。', '重启', { type: 'warning' })
+  } catch { return }
+  if (sysDirtyKeys.value.length) {
+    await saveSystem()
+    if (sysDirtyKeys.value.length) return // 保存失败，不重启
+  }
+  sysRestarting.value = true
+  try { await api.systemRestart() }
+  catch (e: any) { sysRestarting.value = false; app.showTip('重启失败：' + humanizeApiError(e)); return }
+  // 等服务下线再等它回来（最多约 60 秒），回来后整页刷新
+  const t0 = Date.now()
+  let wentDown = false
+  while (Date.now() - t0 < 60000) {
+    await new Promise((r) => setTimeout(r, 1000))
+    try {
+      const r = await fetch('/api/status', { cache: 'no-store' })
+      if (r.ok && (wentDown || Date.now() - t0 > 4000)) { location.reload(); return }
+    } catch { wentDown = true }
+  }
+  sysRestarting.value = false
+  app.showTip('等待后端恢复超时，请手动检查')
+}
+async function testJump() {
+  sysTesting.value = true
+  sysTest.value = null
+  try { sysTest.value = (await api.systemSshTest(sysVals.value['ssh.jump'] || '')).results || [] }
+  catch (e: any) { app.showTip('测试失败：' + humanizeApiError(e)) }
+  finally { sysTesting.value = false }
+}
+watch(navKey, (k) => { if (k === 'system' && !sysSchema.value.length) loadSystem() })
 
 // ===== 播放源 =====
 // subRootsText 是「订阅」文本框的原始内容（一行一个根地址，可以是普通订阅
@@ -746,9 +859,6 @@ async function clearHistory() {
         >
           <span class="nav-bar"></span>
           <span class="nav-label">{{ n.label }}</span>
-          <span v-if="n.key === 'sites' && totalSites > 0" class="nav-badge">
-            {{ enabledCount() }}/{{ totalSites }}
-          </span>
         </div>
       </nav>
 
@@ -966,69 +1076,6 @@ async function clearHistory() {
           </div>
         </template>
 
-        <!-- ========== 站源 ========== -->
-        <template v-else-if="navKey === 'sites'">
-          <div class="section-label">站源</div>
-          <div class="card">
-            <div class="srow srow-clickable" @click="showSites = !showSites">
-              <div class="srow-left">
-                <span class="srow-title">站源列表</span>
-                <span class="srow-dim">{{ sites.length }} 个 · 已启用 {{ enabledCount() }} · {{ showSites ? '收起' : '展开' }}</span>
-              </div>
-              <span class="arrow">›</span>
-            </div>
-            <div class="sdiv"></div>
-            <div class="srow srow-clickable" @click="speedTest">
-              <span class="srow-title">{{ testing ? '正在测速…' : '测速排行' }}</span>
-              <span class="arrow">›</span>
-            </div>
-            <template v-if="speedTested">
-              <div class="sdiv"></div>
-              <div class="srow srow-clickable" @click="enableFastest5">
-                <span class="srow-title">启用最快的 5 个</span>
-                <span class="arrow">›</span>
-              </div>
-              <div class="sdiv"></div>
-              <div class="srow srow-clickable" @click="setAllEnabled">
-                <span class="srow-title">全部启用</span>
-                <span class="arrow">›</span>
-              </div>
-            </template>
-            <div class="sdiv"></div>
-            <div class="srow srow-clickable" @click="showAll = !showAll; load()">
-              <div class="srow-left">
-                <span class="srow-title">站源筛选</span>
-                <span class="srow-dim">{{ showAll ? '全部' : '仅可用' }}</span>
-              </div>
-              <span class="arrow">›</span>
-            </div>
-            <!-- 站源详细列表 -->
-            <template v-if="showSites">
-              <div class="sdiv"></div>
-              <p v-if="!sites.length" class="note" style="padding:12px 18px 16px">暂无站点配置，可以去「播放源 → 点播配置」导入。</p>
-              <div v-if="sites.length" class="list-actions list-actions-pad">
-                <el-button size="small" text @click="setAllEnabled">全选</el-button>
-                <el-button size="small" text @click="toggleAllSites">全部反选</el-button>
-              </div>
-              <div v-for="s in sites" :key="s.key" class="site-row">
-                <div class="site-bar">
-                  <el-switch :model-value="enabledKeys.has(s.key)" :loading="probingKey === s.key" @change="(v: any) => toggleSite(s, v)" />
-                </div>
-                <div class="site-info">
-                  <div class="site-name">
-                    {{ s.name }}
-                    <span v-if="speedResults[s.key]" class="speed-tag" :class="{ ok: speedOk(s.key) === true, fail: speedOk(s.key) === false }">
-                      {{ speedText(s.key) }}
-                    </span>
-                  </div>
-                  <div class="site-meta" :class="{ warn: !s.usable }">{{ s.usable ? s.api : s.reason }}</div>
-                </div>
-                <span v-if="!s.usable" class="unusable-tag">不可用</span>
-              </div>
-            </template>
-          </div>
-        </template>
-
         <!-- ========== 数据 ========== -->
         <template v-else-if="navKey === 'data'">
           <div class="section-label">数据</div>
@@ -1162,6 +1209,75 @@ async function clearHistory() {
         </template>
 
         <!-- ========== 关于 ========== -->
+        <template v-else-if="navKey === 'system'">
+          <div class="section-label">系统</div>
+          <div class="card sys-card" v-if="sysLoading && !sysSchema.length"><div class="srow"><span class="srow-dim">加载中…</span></div></div>
+          <template v-else>
+            <div class="sys-bar">
+              <span class="srow-dim">保存位置：{{ sysPath }}</span>
+              <span class="sys-bar-btns">
+                <span class="chip" @click="resetSystem">恢复默认</span>
+                <span class="chip" :class="{ active: sysDirtyKeys.length }" @click="saveSystem">{{ sysSaving ? '保存中…' : sysDirtyKeys.length ? `保存（${sysDirtyKeys.length} 项）` : '已保存' }}</span>
+              </span>
+            </div>
+            <div v-if="sysNeedRestart" class="sys-warn">含需重启生效的项：保存后请重启后端。</div>
+            <div v-for="g in sysMainGroups" :key="g.name" class="card sys-card">
+              <div class="sys-group">{{ g.name }}</div>
+              <div v-for="it in g.items" :key="it.key" class="sys-item">
+                <div class="sys-item-head">
+                  <span class="srow-title">{{ it.label }}<span v-if="it.restart" class="sys-tag">需重启</span><span v-if="sysOverrides.includes(it.key)" class="sys-tag over">命令行已指定，覆盖此项</span></span>
+                  <span v-if="it.kind === 'int'" class="sys-input">
+                    <input type="number" v-model.number="sysVals[it.key]" :min="it.min" :max="it.max"
+                      :class="{ dirty: sysVals[it.key] !== sysSaved[it.key] }" />
+                    <span class="srow-dim">{{ it.unit }}</span>
+                    <span v-if="sysVals[it.key] !== it.def" class="sys-def" @click="sysVals[it.key] = it.def">默认 {{ it.def }}</span>
+                  </span>
+                  <span v-else-if="it.kind === 'bool'" class="sys-input">
+                    <input type="checkbox" v-model="sysVals[it.key]" />
+                  </span>
+                </div>
+                <input v-if="it.kind === 'text' && it.secret" v-model="sysVals[it.key]" class="sys-text sys-line" type="password" autocomplete="new-password" placeholder="留空表示不设置" />
+                <input v-else-if="it.kind === 'text' && it.key === 'launch.data'" v-model="sysVals[it.key]" class="sys-text sys-line" spellcheck="false" placeholder="data" />
+                <textarea v-else-if="it.kind === 'text'" v-model="sysVals[it.key]" class="sys-text" rows="3" spellcheck="false"
+                  :placeholder="it.env ? `留空使用环境变量 ${it.env}` : it.key === 'srv.addr' ? '留空 = :8090；例如 127.0.0.1:8090, 192.168.1.10:9000' : '留空使用自动查找'"></textarea>
+                <div v-if="it.desc" class="srow-dim sys-desc">{{ it.desc }}</div>
+                <div v-if="it.key === 'ssh.jump'" class="sys-test">
+                  <span class="chip" @click="testJump">{{ sysTesting ? '测试中…' : '测试连通' }}</span>
+                  <div v-for="r in sysTest || []" :key="r.cmd" class="sys-test-row" :class="r.ok ? 'ok' : 'bad'">
+                    {{ r.ok ? '✓' : '✗' }} {{ r.cmd }} · {{ r.ms }}ms<span v-if="r.error"> · {{ r.error }}</span>
+                  </div>
+                </div>
+              </div>
+            </div>
+            <div class="card sys-card">
+              <div class="sys-group sys-group-bar">
+                <span>启动参数（需重启后端生效）</span>
+                <span class="chip" :class="{ active: !sysRestarting }" @click="!sysRestarting && restartBackend()">{{ sysRestarting ? '重启中…' : '重启后端' }}</span>
+              </div>
+              <div v-if="sysListening.length" class="sys-item"><span class="srow-dim">当前实际监听：{{ sysListening.join('，') }}</span></div>
+              <div v-for="it in sysLaunchItems" :key="it.key" class="sys-item">
+                <div class="sys-item-head">
+                  <span class="srow-title">{{ it.label }}<span v-if="it.restart" class="sys-tag">需重启</span><span v-if="sysOverrides.includes(it.key)" class="sys-tag over">命令行已指定，覆盖此项</span></span>
+                  <span v-if="it.kind === 'int'" class="sys-input">
+                    <input type="number" v-model.number="sysVals[it.key]" :min="it.min" :max="it.max"
+                      :class="{ dirty: sysVals[it.key] !== sysSaved[it.key] }" />
+                    <span class="srow-dim">{{ it.unit }}</span>
+                    <span v-if="sysVals[it.key] !== it.def" class="sys-def" @click="sysVals[it.key] = it.def">默认 {{ it.def }}</span>
+                  </span>
+                  <span v-else-if="it.kind === 'bool'" class="sys-input">
+                    <input type="checkbox" v-model="sysVals[it.key]" />
+                  </span>
+                </div>
+                <input v-if="it.kind === 'text' && it.secret" v-model="sysVals[it.key]" class="sys-text sys-line" type="password" autocomplete="new-password" placeholder="留空表示不设置" />
+                <input v-else-if="it.kind === 'text' && it.key === 'launch.data'" v-model="sysVals[it.key]" class="sys-text sys-line" spellcheck="false" placeholder="data" />
+                <textarea v-else-if="it.kind === 'text'" v-model="sysVals[it.key]" class="sys-text" rows="3" spellcheck="false"
+                  :placeholder="it.env ? `留空使用环境变量 ${it.env}` : it.key === 'srv.addr' ? '留空 = :8090；例如 127.0.0.1:8090, 192.168.1.10:9000' : '留空使用自动查找'"></textarea>
+                <div v-if="it.desc" class="srow-dim sys-desc">{{ it.desc }}</div>
+              </div>
+            </div>
+          </template>
+        </template>
+
         <template v-else-if="navKey === 'about'">
           <div class="section-label">关于</div>
           <div class="card">
@@ -1837,4 +1953,25 @@ async function clearHistory() {
 .theme-chips { display: flex; gap: 6px; flex-wrap: wrap; }
 .theme-chips .chip { cursor: pointer; }
 .theme-chips .chip.active { background: var(--selected); color: #000; }
+.sys-bar { display:flex; justify-content:space-between; align-items:center; gap:12px; flex-wrap:wrap; margin: 0 0 10px; }
+.sys-bar-btns { display:flex; gap:8px; }
+.sys-warn { color: var(--warn); font-size: 13px; margin: 0 0 10px; }
+.sys-card { margin-bottom: 14px; }
+.sys-group { padding: 12px 18px 4px; font-size: 13px; color: var(--selected); }
+.sys-item { padding: 10px 18px; border-top: 1px solid rgba(255,255,255,0.08); }
+.sys-item-head { display:flex; justify-content:space-between; align-items:center; gap:12px; }
+.sys-tag { margin-left: 8px; font-size: 11px; color: var(--warn); border: 1px solid var(--warn); border-radius: 4px; padding: 0 4px; }
+.sys-input { display:flex; align-items:center; gap:6px; }
+.sys-input input { width: 88px; padding: 4px 8px; border-radius: 6px; border: 1px solid rgba(255,255,255,0.25); background: rgba(255,255,255,0.06); color: inherit; text-align: right; }
+.sys-input input.dirty { border-color: var(--selected); }
+.sys-tag.over { color: var(--selected); border-color: var(--selected); }
+.sys-group-bar { display:flex; justify-content:space-between; align-items:center; padding-bottom: 8px; }
+.sys-line { font-family: inherit; }
+.sys-def { font-size: 12px; color: var(--dim); cursor: pointer; text-decoration: underline; }
+.sys-text { width: 100%; box-sizing: border-box; margin-top: 8px; padding: 8px; border-radius: 6px; border: 1px solid rgba(255,255,255,0.25); background: rgba(255,255,255,0.06); color: inherit; font-family: monospace; font-size: 13px; }
+.sys-desc { margin-top: 4px; line-height: 1.5; }
+.sys-test { margin-top: 8px; display:flex; flex-direction:column; gap:4px; align-items:flex-start; }
+.sys-test-row { font-size: 12px; font-family: monospace; word-break: break-all; }
+.sys-test-row.ok { color: #4caf50; }
+.sys-test-row.bad { color: #e57373; }
 </style>

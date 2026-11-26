@@ -17,6 +17,8 @@ export interface SubRef {
 
 export interface Site {
   key: string
+  alts?: string[]
+  dupOf?: string
   name: string
   type: number
   api: string

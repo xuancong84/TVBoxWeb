@@ -9,6 +9,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"github.com/xxl6097/TVBoxWeb/internal/sysconf"
 	"net/http"
 	"strings"
 	"sync"
@@ -22,7 +23,7 @@ import (
 
 // searchSessionTTL 超过这么久没人来轮询就清掉，避免用户搜一下就切走、
 // 会话一直占内存。
-const searchSessionTTL = 3 * time.Minute
+func searchSessionTTL() time.Duration { return sysconf.Dur("ca.search_session") }
 
 type searchSession struct {
 	mu        sync.Mutex
@@ -57,7 +58,7 @@ func newSearchSessionID() string {
 
 // sweepSearchSessions 清掉超过 TTL 没人轮询的会话。
 func sweepSearchSessions() {
-	cutoff := time.Now().Add(-searchSessionTTL)
+	cutoff := time.Now().Add(-searchSessionTTL())
 	searchSessMu.Lock()
 	defer searchSessMu.Unlock()
 	for id, s := range searchSess {
@@ -81,7 +82,7 @@ func hSearchStart(w http.ResponseWriter, r *http.Request) {
 	}
 	kw := strings.TrimSpace(req.Kw)
 
-	sites := store.ActiveSites()
+	sites := dedupSites(store.ActiveSites())
 	var searchable []model.Site
 	for _, s := range sites {
 		if s.Searchable {
@@ -116,7 +117,7 @@ func hSearchStart(w http.ResponseWriter, r *http.Request) {
 	// 搜索要在一次次轮询请求之间存活，不能绑定发起 /start 这一次 HTTP 请求的
 	// ctx——那个 ctx 在这个 handler 返回时就会被取消，后台 goroutine 还没跑完。
 	ctx := context.Background()
-	sem := make(chan struct{}, 6)
+	sem := make(chan struct{}, sysconf.Int("cc.search"))
 	var wg sync.WaitGroup
 	for _, s := range searchable {
 		wg.Add(1)

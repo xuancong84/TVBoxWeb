@@ -2,6 +2,7 @@ package live
 
 import (
 	"context"
+	"github.com/xxl6097/TVBoxWeb/internal/sysconf"
 	"regexp"
 	"sort"
 	"sync"
@@ -14,12 +15,9 @@ import (
 // CacheMaxAge 单个直播源缓存结果的最长可信年龄，跟 crawler.SiteCacheMaxAge
 // 对点播站源的设计完全一致：没超龄直接用磁盘缓存，服务重启/首次打开直播页
 // 不必把几十个源全部重新联网拉一遍。
-const CacheMaxAge = 24 * time.Hour
+func CacheMaxAge() time.Duration { return sysconf.Dur("ca.live") }
 
-const (
-	liveConc         = 6
-	liveFetchTimeout = 20 * time.Second
-)
+const ()
 
 var refreshState struct {
 	mu      sync.Mutex
@@ -40,7 +38,7 @@ var mergeCache struct {
 	at     time.Time
 }
 
-const mergeCacheTTL = 20 * time.Second
+func mergeCacheTTL() time.Duration { return sysconf.Dur("ca.live_merge") }
 
 // Channels 返回「当前已知最好」的合并频道目录：永远不等网络，直接用磁盘
 // 缓存拼出结果（哪怕某些源的缓存已经过期甚至从没抓过都没关系），缺失/
@@ -55,7 +53,7 @@ const mergeCacheTTL = 20 * time.Second
 func Channels(sources []model.RawLive, force bool) (groups []model.ChannelGroup, errs map[string]string) {
 	if !force {
 		mergeCache.mu.Lock()
-		if !mergeCache.at.IsZero() && time.Since(mergeCache.at) < mergeCacheTTL {
+		if !mergeCache.at.IsZero() && time.Since(mergeCache.at) < mergeCacheTTL() {
 			groups, errs = cloneGroups(mergeCache.groups), mergeCache.errs
 			mergeCache.mu.Unlock()
 			go refreshStale(sources, force)
@@ -136,7 +134,7 @@ func refreshStale(sources []model.RawLive, force bool) {
 			continue
 		}
 		e, ok := store.GetLiveCacheEntry(s.URL)
-		if !force && ok && now.Sub(time.UnixMilli(e.At)) < CacheMaxAge {
+		if !force && ok && now.Sub(time.UnixMilli(e.At)) < CacheMaxAge() {
 			continue
 		}
 		stale = append(stale, s)
@@ -146,14 +144,14 @@ func refreshStale(sources []model.RawLive, force bool) {
 	}
 
 	var wg sync.WaitGroup
-	sem := make(chan struct{}, liveConc)
+	sem := make(chan struct{}, sysconf.Int("cc.live"))
 	for _, s := range stale {
 		wg.Add(1)
 		go func(s model.RawLive) {
 			defer wg.Done()
 			sem <- struct{}{}
 			defer func() { <-sem }()
-			gs, err := LoadCtx(context.Background(), s.URL, liveFetchTimeout)
+			gs, err := LoadCtx(context.Background(), s.URL, sysconf.Dur("to.live"))
 			store.SetLiveCacheEntry(s.URL, store.LiveCacheEntry{
 				At: time.Now().UnixMilli(), OK: err == nil, Groups: gs,
 			})

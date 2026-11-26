@@ -9,6 +9,7 @@ import (
 	"crypto/sha1"
 	"encoding/hex"
 	"fmt"
+	"github.com/xxl6097/TVBoxWeb/internal/sysconf"
 	"io"
 	"net/http"
 	"os"
@@ -26,7 +27,6 @@ const (
 	// maxImageBytes 单张图片上限：封面图正常几百 KB，封顶避免个别异常大图
 	// 把缓存空间占爆。
 	maxImageBytes = 6 << 20
-	fetchTimeout  = 15 * time.Second
 	// fullThreshold/evictTarget：缓存所在文件系统（一般是 /dev/shm，即内存）
 	// 用量超过 95% 才开始清，一次性清到 85% 为止，避免每次写入都卡在临界点
 	// 反复触发清理。
@@ -53,15 +53,15 @@ var (
 // Dir 返回缓存目录，首次调用时决定好之后固定不变。
 func Dir() string {
 	dirOnce.Do(func() {
-		for _, cand := range []string{"/dev/shm", os.TempDir()} {
-			if cand == "" {
-				continue
-			}
-			d := filepath.Join(cand, "tvboxweb-imgcache")
-			if err := os.MkdirAll(d, 0o700); err == nil {
-				dir = d
-				return
-			}
+		d := sysconf.CacheDir("img")
+		if st, err := os.Stat(d); err == nil && st.IsDir() {
+			dir = d
+			return
+		}
+		// 缓存目录不可写：退回系统临时目录
+		d = filepath.Join(os.TempDir(), "tvboxweb-imgcache")
+		if err := os.MkdirAll(d, 0o700); err == nil {
+			dir = d
 		}
 	})
 	return dir
@@ -131,7 +131,7 @@ func retryInBackground(key, dir, path, url string) {
 }
 
 func fetch(ctx context.Context, url string) ([]byte, error) {
-	ctx, cancel := context.WithTimeout(ctx, fetchTimeout)
+	ctx, cancel := context.WithTimeout(ctx, sysconf.Dur("to.img"))
 	defer cancel()
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {

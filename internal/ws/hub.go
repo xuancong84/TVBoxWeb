@@ -15,12 +15,12 @@ type Message struct {
 
 // HealthUpdate 是站源健康度实时更新。
 type HealthUpdate struct {
-	SiteKey    string  `json:"siteKey"`
-	Health     string  `json:"health"`      // "healthy" | "slow" | "dead"
-	ErrorRate  float64 `json:"errorRate"`   // 0~1
-	AvgMs      int     `json:"avgMs"`       // 平均响应时间
-	LastCheck  int64   `json:"lastCheck"`   // Unix 毫秒
-	LastSuccess int64  `json:"lastSuccess"` // Unix 毫秒
+	SiteKey     string  `json:"siteKey"`
+	Health      string  `json:"health"`      // "healthy" | "slow" | "dead"
+	ErrorRate   float64 `json:"errorRate"`   // 0~1
+	AvgMs       int     `json:"avgMs"`       // 平均响应时间
+	LastCheck   int64   `json:"lastCheck"`   // Unix 毫秒
+	LastSuccess int64   `json:"lastSuccess"` // Unix 毫秒
 }
 
 // Client 代表一个连接的 WebSocket 客户端。

@@ -19,6 +19,9 @@ const props = withDefaults(defineProps<{
   rawUrl: string
   /** 各条线路的轻量测速结果（url -> {ok, ms, kbps}），没测过的线路取不到值 */
   lineQuality?: Record<string, { ok: boolean; ms: number; kbps: number }>
+  /** 点播的全部线路（播放源）；多于 1 条时可在面板里切换 */
+  vodLines?: { name: string }[]
+  vodLineIdx?: number
   /** 自动选线开关：关掉后，当前线路失败时原地无限重试，不切线路/不退出 */
   autoSwitch: boolean
   subDelay: number
@@ -42,6 +45,8 @@ const props = withDefaults(defineProps<{
   globalOutroSkip?: number
 }>(), {
   subTracks: () => [],
+  vodLines: () => [],
+  vodLineIdx: 0,
   lineQuality: () => ({}),
   subTrackIdx: -1,
   skipOwn: false,
@@ -53,6 +58,7 @@ const emit = defineEmits<{
   (e: 'update:modelValue', v: boolean): void
   (e: 'choose-level', cap: number): void
   (e: 'switch-line', url: string): void
+  (e: 'switch-vod-line', idx: number): void
   (e: 'update:autoSwitch', v: boolean): void
   (e: 'sub-file', ev: Event): void
   (e: 'sub-url'): void
@@ -121,6 +127,19 @@ function delayLabel(d: number) {
         >{{ labelOfLevel(lv) }}</span>
       </div>
       <div v-if="!props.levels.length" class="q-hint">源只提供这一档清晰度。</div>
+
+      <template v-if="!props.isLive && props.vodLines.length > 1">
+        <div class="q-section">线路（{{ props.vodLines.length }} 条）</div>
+        <div class="q-chips">
+          <span
+            v-for="(l, i) in props.vodLines"
+            :key="'vl' + i"
+            class="chip"
+            :class="{ active: i === props.vodLineIdx }"
+            @click="emit('switch-vod-line', i)"
+          >{{ l.name }}</span>
+        </div>
+      </template>
 
       <template v-if="props.isLive">
         <div class="q-section">线路</div>
@@ -260,6 +279,19 @@ function delayLabel(d: number) {
           @click="emit('choose-level', levelCap(lv))"
         >{{ labelOfLevel(lv) }}</span>
       </div>
+
+      <template v-if="!props.isLive && props.vodLines.length > 1">
+        <div class="m-q-section">线路（{{ props.vodLines.length }} 条）</div>
+        <div class="m-q-chips">
+          <span
+            v-for="(l, i) in props.vodLines"
+            :key="'vl' + i"
+            class="chip"
+            :class="{ active: i === props.vodLineIdx }"
+            @click="emit('switch-vod-line', i)"
+          >{{ l.name }}</span>
+        </div>
+      </template>
 
       <template v-if="props.isLive">
         <div class="m-q-section">线路</div>
