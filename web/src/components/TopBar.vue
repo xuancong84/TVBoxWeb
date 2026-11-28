@@ -51,6 +51,7 @@ const navs = [
   { name: 'search', label: '搜索', path: '/search' },
   { name: 'collect', label: '收藏', path: '/collect' },
   { name: 'history', label: '历史', path: '/history' },
+  { name: 'downloads', label: '下载', path: '/downloads' },
   { name: 'webdav', label: '网盘', path: '/webdav' },
   { name: 'settings', label: '设置', path: '/settings' }
 ]

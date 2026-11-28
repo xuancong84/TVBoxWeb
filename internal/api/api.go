@@ -129,6 +129,8 @@ func Handler() *http.ServeMux {
 	mux.HandleFunc("/api/search/poll", hSearchPoll)
 	mux.HandleFunc("/api/suggest", hSuggest)
 	mux.HandleFunc("/api/resolve", hResolve)
+	mux.HandleFunc("/api/m3u8cache/status", hM3u8Status)
+	mux.HandleFunc("/api/m3u8cache/drop", hM3u8Drop)
 	mux.HandleFunc("/api/pinyin/abbr", hPinyinAbbr)
 
 	mux.HandleFunc("/api/history", hHistory)
@@ -196,6 +198,14 @@ func Handler() *http.ServeMux {
 	mux.HandleFunc("/api/img", hImg)
 	// MKV 等浏览器不支持的容器：服务端实时转封装成 fMP4
 	mux.HandleFunc("/api/remux", hRemux)
+	mux.HandleFunc("/api/download", hDownload)
+	mux.HandleFunc("/api/downloads", hDownloads)
+	mux.HandleFunc("/api/download/local", hDownloadLocal)
+	mux.HandleFunc("/api/download/local-status", hDownloadLocalStatus)
+	mux.HandleFunc("/api/download/convert", hDownloadConvert)
+	mux.HandleFunc("/api/dlfile/", hDownloadFile)
+	mux.HandleFunc("/api/download/cancel", hDownloadCtl)
+	mux.HandleFunc("/api/download/remove", hDownloadCtl)
 	// 用源 id 换播放所需的 Basic Auth（列表接口的密码是掩码，不能直接用）
 	mux.HandleFunc("/api/webdav/auth", hWdAuth)
 	return mux
@@ -1249,11 +1259,18 @@ func hResolve(w http.ResponseWriter, r *http.Request) {
 		fail(w, 400, "参数错误")
 		return
 	}
-	if strings.HasPrefix(req.URL, "pyplay:") {
-		ok(w, resolvePyPlay(r.Context(), req.URL))
+	if cr, hit := resolveGet(req.URL); hit {
+		ok(w, cr)
 		return
 	}
-	ok(w, resolve.ResolveCtx(r.Context(), req.URL, store.Parses()))
+	var res resolve.Resolved
+	if strings.HasPrefix(req.URL, "pyplay:") {
+		res = resolvePyPlay(r.Context(), req.URL)
+	} else {
+		res = resolve.ResolveCtx(r.Context(), req.URL, store.Parses())
+	}
+	resolvePut(req.URL, res)
+	ok(w, res)
 }
 
 func hPinyinAbbr(w http.ResponseWriter, r *http.Request) {
@@ -2296,6 +2313,21 @@ func hProxy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	auth := q(r, "auth")
+	// 点播 m3u8 缓存命中：不再请求上游，直接用缓存原文现场改写（改写依赖当次 token）。
+	if r.Header.Get("Range") == "" {
+		if ce := m3u8Get(target, auth); ce != nil {
+			if o := r.Header.Get("Origin"); OriginAllowed(o, r.Host) {
+				w.Header().Set("Access-Control-Allow-Origin", o)
+				w.Header().Set("Vary", "Origin")
+			}
+			w.Header().Set("Access-Control-Expose-Headers", "Content-Length, Content-Range, Accept-Ranges")
+			w.Header().Set("Content-Type", ce.CT)
+			w.Header().Set("X-M3U8-Cache", "hit")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(rewriteM3u8(ce.Data, ce.Base, auth, tokenFrom(r))))
+			return
+		}
+	}
 	req, err := http.NewRequestWithContext(r.Context(), http.MethodGet, target, nil)
 	if err != nil {
 		fail(w, http.StatusBadRequest, err.Error())
@@ -2318,6 +2350,10 @@ func hProxy(w http.ResponseWriter, r *http.Request) {
 			if data, rerr := crawler.FetchSmallViaGeoRelay(r.Context(), target, relayMaxBytes); rerr == nil {
 				if err == nil {
 					res.Body.Close()
+				}
+				if bytes.HasPrefix(bytes.TrimSpace(data), []byte("#EXTM3U")) {
+					// 跳板取回的点播 m3u8 同样缓存（否则被封地区的片源永远是「未缓存」）
+					m3u8Store(target, target, auth, "", string(data), q(r, "vod") == "1")
 				}
 				serveRelayed(w, r, target, auth, data)
 				return
@@ -2369,6 +2405,9 @@ func hProxy(w http.ResponseWriter, r *http.Request) {
 		base := target
 		if res.Request != nil && res.Request.URL != nil {
 			base = res.Request.URL.String()
+		}
+		if rng == "" && res.StatusCode == http.StatusOK {
+			m3u8Store(target, base, auth, ct, string(data), q(r, "vod") == "1")
 		}
 		rewritten := rewriteM3u8(string(data), base, auth, tokenFrom(r))
 		for _, h := range []string{"Content-Type", "Cache-Control", "ETag", "Last-Modified"} {

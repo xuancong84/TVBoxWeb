@@ -48,6 +48,7 @@ const (
 	gConc  = "并发"
 	gCache = "缓存与间隔"
 	gRT    = "解释器"
+	gDL    = "下载"
 )
 
 func sec(key, group, label, desc string, def int, restart bool) Item {
@@ -121,6 +122,9 @@ var items = []Item{
 	min_("ca.channel_fail", "频道「播不通」结论可信期", "", 24*60),
 	{Key: "cache.dir", Group: gCache, Label: "缓存目录", Kind: "text", Restart: true,
 		Desc: "所有缓存（站源/榜单/直播列表、DNS、封面图）按类别放在此目录的子文件夹：sites、lists、dns、img。留空为 ./cache（相对运行目录）；修改后重启生效，旧位置的文件会自动搬迁。"},
+	{Key: "download.dir", Group: gDL, Label: "视频下载文件夹", Kind: "text",
+		Desc: "详情页「下载」保存视频的位置，剧集放在 <文件夹>/<片名>/ 下。留空为 ./downloads（相对运行目录）；修改后对新任务立即生效。"},
+	{Key: "download.conc", Group: gDL, Label: "下载分片并发数", Desc: "单个视频同时下载的 m3u8 分片数", Kind: "int", Unit: "个", Def: 6, Min: 1, Max: 32},
 	sec("ca.live_merge", gCache, "直播合并结果缓存", "", 20, false),
 	sec("ca.scan_idle", gCache, "直播扫描空闲间隔", "一轮扫描无事可做后的等待", 30, false),
 	sec("ca.scan_flush", gCache, "直播扫描落盘间隔", "", 30, false),

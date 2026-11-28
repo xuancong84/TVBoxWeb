@@ -297,3 +297,19 @@ export interface CrawlResult {
   ok: boolean
   msg: string
 }
+
+export interface DownloadJob {
+  id: string
+  vod: string
+  name: string
+  file: string
+  status: 'queued' | 'running' | 'done' | 'error' | 'canceled'
+  err?: string
+  done: number
+  total: number
+  bytes: number
+  size: number
+  updated: number
+  kind?: 'download' | 'convert'
+  keep?: boolean
+}

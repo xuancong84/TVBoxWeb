@@ -53,6 +53,7 @@ const router = createRouter({
     { path: '/play', name: 'play', component: () => import('@/views/PlayerView.vue') },
     { path: '/live', name: 'live', component: () => import('@/views/LiveView.vue') },
     { path: '/collect', name: 'collect', component: () => import('@/views/CollectView.vue') },
+    { path: '/downloads', name: 'downloads', component: () => import('@/views/DownloadView.vue') },
     { path: '/history', name: 'history', component: () => import('@/views/HistoryView.vue') },
     { path: '/settings', name: 'settings', component: () => import('@/views/SettingsView.vue') },
     { path: '/webdav', name: 'webdav', component: () => import('@/views/WebdavView.vue') },

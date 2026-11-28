@@ -59,6 +59,9 @@ const SEEK_STEP = 10000
 // 那个页面」而不是这个播放页自己了（下面 rawUrl0/siteKey 等同理，都是
 // 一次性快照，道理一样）。
 const ownFullPath = route.fullPath
+// 这一集已下载的本地地址（空 = 没有）；preferLocal=true 时优先播本地，用户在「选择线路」里选了在线线路则为 false
+const localUrl = ref('')
+const preferLocal = ref(true)
 const rawUrl0 = (route.query.url as string) || ''
 const siteKey = (route.query.site as string) || ''
 const vodId = (route.query.id as string) || ''
@@ -973,6 +976,22 @@ async function resolveUrl(skipLiveProbe = false) {
     return
   }
 
+  // 这一集已下载到本地：作为一条额外的播放源（默认优先），不走网络
+  localUrl.value = ''
+  if (siteKey !== 'webdav' && vodName && player.current?.name) {
+    try {
+      localUrl.value = (await api.downloadLocal(vodName, player.current.name)).url || ''
+    } catch {
+      /* 查询失败就照常走网络 */
+    }
+    if (localUrl.value && preferLocal.value) {
+      finalUrl = localUrl.value
+      via.value = '本地下载'
+      hint.value = ''
+      return
+    }
+  }
+
   if (directMode) {
     finalUrl = rawUrl
     via.value = '直连'
@@ -1099,7 +1118,7 @@ function proxiedFinal(forceRemux = false): string {
   // 无论直连还是走 /api/proxy 都必须带上。
   // 之前写成 directMode ? auth : undefined —— 网盘走的是普通代理模式，
   // 代理拿不到认证 → 上游 401 → <video> 触发 error → 被误报成「视频解码失败」。
-  return proxied(finalUrl, auth)
+  return proxied(finalUrl, auth, !isLive && siteKey !== 'webdav')
 }
 
 async function initPlayer() {
@@ -1196,6 +1215,12 @@ async function initPlayer() {
       })
       h.on(HlsCls.Events.ERROR, (_e: any, data: any) => {
         if (!data.fatal) return
+        // 点播：致命错误时丢弃这条地址的 m3u8/解析缓存（可能是缓存的签名已过期），
+        // 之后重试/换线路会重新解析
+        if (!isLive) {
+          api.m3u8CacheDrop(rawUrl).catch(() => {})
+          if (finalUrl && finalUrl !== rawUrl) api.m3u8CacheDrop(finalUrl).catch(() => {})
+        }
         const isNetOrMedia = data.type === HlsCls.ErrorTypes.NETWORK_ERROR || data.type === HlsCls.ErrorTypes.MEDIA_ERROR
         if (isNetOrMedia) lineFatalTotal++
         // manifest 级别的致命错误（地址返回的根本不是 m3u8，比如重定向到了一个
@@ -2239,10 +2264,12 @@ async function jumpToEpisode(i: number) {
 
 // 点播换线路（播放源）：同一集序号，从当前进度续播
 async function switchVodLine(i: number) {
-  if (isLive || i === player.lineIdx) { if (i === player.lineIdx) app.showTip('已经是当前线路'); return }
+  if (isLive) return
+  if (i === player.lineIdx && !(preferLocal.value && localUrl.value)) { app.showTip('已经是当前线路'); return }
   const pos = realPosMs()
   const name = player.lines[i]?.name || ''
-  if (!player.switchVodLine(i)) return
+  preferLocal.value = false // 明确选了在线线路
+  if (i !== player.lineIdx && !player.switchVodLine(i)) return
   directMode = player.lines[i].direct
   showQ.value = false
   app.showTip(`切换到线路：${name}`)
@@ -2250,7 +2277,20 @@ async function switchVodLine(i: number) {
   await switchEpisode(0)
 }
 
+// 在「选择线路」里选「本地」：当前集改播已下载的本地文件
+async function switchLocal() {
+  if (isLive || !localUrl.value) return
+  if (preferLocal.value) { app.showTip('已经是当前线路'); return }
+  const pos = realPosMs()
+  preferLocal.value = true
+  showQ.value = false
+  app.showTip('切换到线路：本地')
+  if (pos > 0) player.seek = pos
+  await switchEpisode(0)
+}
+
 async function switchEpisode(delta: number) {
+  if (delta !== 0) preferLocal.value = true // 换集：新的一集重新默认优先本地
   if (!player.count) {
     app.showTip(isLive ? '当前分组没有其他频道' : '当前没有可切换的剧集')
     return
@@ -2919,6 +2959,8 @@ onUnmounted(() => {
       :lines="player.current?.urls || []"
       :vod-lines="player.lines"
       :vod-line-idx="player.lineIdx"
+      :has-local="!!localUrl"
+      :use-local="!!localUrl && preferLocal"
       :line-quality="lineQuality"
       :raw-url="rawUrl"
       :sub-delay="subDelay"
@@ -2938,6 +2980,7 @@ onUnmounted(() => {
       @choose-level="chooseLevel"
       @switch-line="switchLine"
       @switch-vod-line="switchVodLine"
+      @switch-local="switchLocal"
       @update:auto-switch="autoLineSwitch = $event"
       @sub-file="onSubFile"
       @sub-url="promptSubUrl"
@@ -3159,6 +3202,8 @@ onUnmounted(() => {
       :lines="player.current?.urls || []"
       :vod-lines="player.lines"
       :vod-line-idx="player.lineIdx"
+      :has-local="!!localUrl"
+      :use-local="!!localUrl && preferLocal"
       :line-quality="lineQuality"
       :raw-url="rawUrl"
       :sub-delay="subDelay"
@@ -3178,6 +3223,7 @@ onUnmounted(() => {
       @choose-level="chooseLevel"
       @switch-line="switchLine"
       @switch-vod-line="switchVodLine"
+      @switch-local="switchLocal"
       @update:auto-switch="autoLineSwitch = $event"
       @sub-file="onSubFile"
       @sub-url="promptSubUrl"

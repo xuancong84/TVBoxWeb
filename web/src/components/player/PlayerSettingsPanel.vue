@@ -22,6 +22,10 @@ const props = withDefaults(defineProps<{
   /** 点播的全部线路（播放源）；多于 1 条时可在面板里切换 */
   vodLines?: { name: string }[]
   vodLineIdx?: number
+  /** 这一集已下载到本地：作为一条额外的播放源显示在线路里 */
+  hasLocal?: boolean
+  /** 当前正在播本地文件 */
+  useLocal?: boolean
   /** 自动选线开关：关掉后，当前线路失败时原地无限重试，不切线路/不退出 */
   autoSwitch: boolean
   subDelay: number
@@ -59,6 +63,7 @@ const emit = defineEmits<{
   (e: 'choose-level', cap: number): void
   (e: 'switch-line', url: string): void
   (e: 'switch-vod-line', idx: number): void
+  (e: 'switch-local'): void
   (e: 'update:autoSwitch', v: boolean): void
   (e: 'sub-file', ev: Event): void
   (e: 'sub-url'): void
@@ -128,14 +133,20 @@ function delayLabel(d: number) {
       </div>
       <div v-if="!props.levels.length" class="q-hint">源只提供这一档清晰度。</div>
 
-      <template v-if="!props.isLive && props.vodLines.length > 1">
-        <div class="q-section">线路（{{ props.vodLines.length }} 条）</div>
+      <template v-if="!props.isLive && (props.vodLines.length > 1 || props.hasLocal)">
+        <div class="q-section">线路（{{ props.vodLines.length + (props.hasLocal ? 1 : 0) }} 条）</div>
         <div class="q-chips">
+          <span
+            v-if="props.hasLocal"
+            class="chip"
+            :class="{ active: props.useLocal }"
+            @click="emit('switch-local')"
+          >本地</span>
           <span
             v-for="(l, i) in props.vodLines"
             :key="'vl' + i"
             class="chip"
-            :class="{ active: i === props.vodLineIdx }"
+            :class="{ active: i === props.vodLineIdx && !props.useLocal }"
             @click="emit('switch-vod-line', i)"
           >{{ l.name }}</span>
         </div>
@@ -280,14 +291,20 @@ function delayLabel(d: number) {
         >{{ labelOfLevel(lv) }}</span>
       </div>
 
-      <template v-if="!props.isLive && props.vodLines.length > 1">
-        <div class="m-q-section">线路（{{ props.vodLines.length }} 条）</div>
+      <template v-if="!props.isLive && (props.vodLines.length > 1 || props.hasLocal)">
+        <div class="m-q-section">线路（{{ props.vodLines.length + (props.hasLocal ? 1 : 0) }} 条）</div>
         <div class="m-q-chips">
+          <span
+            v-if="props.hasLocal"
+            class="chip"
+            :class="{ active: props.useLocal }"
+            @click="emit('switch-local')"
+          >本地</span>
           <span
             v-for="(l, i) in props.vodLines"
             :key="'vl' + i"
             class="chip"
-            :class="{ active: i === props.vodLineIdx }"
+            :class="{ active: i === props.vodLineIdx && !props.useLocal }"
             @click="emit('switch-vod-line', i)"
           >{{ l.name }}</span>
         </div>

@@ -48,3 +48,15 @@ func CacheFile(sub, name string, legacy ...string) string {
 	}
 	return p
 }
+
+// DownloadDir 返回「视频下载文件夹」（绝对路径，不自动创建）；留空为 ./downloads。
+func DownloadDir() string {
+	d := strings.TrimSpace(Str("download.dir"))
+	if d == "" {
+		d = "downloads"
+	}
+	if abs, err := filepath.Abs(d); err == nil {
+		return abs
+	}
+	return d
+}

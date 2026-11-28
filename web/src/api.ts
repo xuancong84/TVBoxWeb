@@ -25,7 +25,8 @@ import type {
   Subscription,
   WebdavSource,
   WebdavEntry,
-  WebdavVod
+  WebdavVod,
+  DownloadJob
 } from '@/types'
 import { idbGet, idbSet, idbDelete, idbKeys } from '@/idb'
 import {
@@ -388,6 +389,22 @@ export const api = {
   suggest: (kw: string, signal?: AbortSignal) => get<string[]>(`/suggest?kw=${encodeURIComponent(kw)}`, signal),
   resolve: (url: string) => post<{ url: string; header: Record<string, string>; via: string; ok: boolean }>('/resolve', { url }),
 
+  download: (vod: string, items: { name: string; urls: string[] }[], force = false) =>
+    post<{ added: number; dir: string; conflicts?: string[] }>('/download', { vod, items, force }),
+  downloadLocal: (vod: string, name: string) =>
+    get<{ url: string }>(`/download/local?vod=${encodeURIComponent(vod)}&name=${encodeURIComponent(name)}`),
+  downloadLocalStatus: (vod: string, names: string[]) =>
+    post<{ kinds: Record<string, 'file' | 'hls'>; ffmpeg: boolean }>('/download/local-status', { vod, names }),
+  downloadConvert: (vod: string, names: string[], keep: boolean) =>
+    post<{ added: number }>('/download/convert', { vod, names, keep }),
+  m3u8CacheStatus: (urls: string[]) =>
+    post<{ status: Record<string, { cached: boolean; height?: number }> }>('/m3u8cache/status', { urls }),
+  m3u8CacheDrop: (url: string) => post<{ ok: boolean }>('/m3u8cache/drop', { url }),
+  m3u8CacheDropMany: (urls: string[]) => post<{ ok: boolean; dropped: number }>('/m3u8cache/drop', { urls }),
+  downloads: () => get<{ dir: string; jobs: DownloadJob[] }>('/downloads'),
+  downloadCancel: (id: string) => post('/download/cancel', { id }),
+  downloadRemove: (id: string, clear = false) => post('/download/remove', { id, clear }),
+
   history: () => histRoute('vod', 'list', null, () => get<HistItem[]>('/history')),
   updateHistoryPos: (h: HistItem) => histRoute('vod', 'update', h, () => post('/history/pos', h)),
   removeHistory: (h: HistItem) => histRoute('vod', 'remove', h, () => post('/history/remove', h)),
@@ -555,8 +572,11 @@ function withToken(u: string): string {
   return t ? `${u}&token=${encodeURIComponent(t)}` : u
 }
 
-export function proxied(rawUrl: string, auth?: string): string {
-  const u = `/api/proxy?url=${encodeURIComponent(rawUrl)}`
+export function proxied(rawUrl: string, auth?: string, vod = false): string {
+  // 本地下载文件：同源直出，不再经 /api/proxy
+  if (rawUrl.startsWith('/api/dlfile/')) return withToken(rawUrl)
+  // vod=1：点播，服务端可缓存主列表 m3u8（直播不带）
+  const u = `/api/proxy?url=${encodeURIComponent(rawUrl)}${vod ? '&vod=1' : ''}`
   const withAuth = auth ? `${u}&auth=${encodeURIComponent(auth)}` : u
   // 视频分片由浏览器直接加载，无法带自定义头，令牌走 query（后端会透传到 m3u8 内部地址）
   return withToken(withAuth)
