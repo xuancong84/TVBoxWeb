@@ -169,7 +169,7 @@ watch(
 watch([curLine, () => lines.value.length], () => loadLocal())
 // 各线路已缓存的点播 m3u8：续播时不用再解析/拉取。key=线路下标
 const m3u8Cache = ref<Record<number, { n: number; height: number }>>({})
-// 已缓存 m3u8 的单集播放地址（按集显示「已缓存」）
+// 已缓存 m3u8 的单集播放地址（按集显示「已获取」）
 const cachedUrls = ref<Set<string>>(new Set())
 async function loadM3u8Cache() {
   if (!lines.value.length) return
@@ -267,7 +267,7 @@ function epDl(displayIdx: number): string {
   if (!line) return ''
   const realIdx = reverse.value ? line.eps.length - 1 - displayIdx : displayIdx
   const nm = line.eps[realIdx]?.name
-  const cached = cachedUrls.value.has(line.eps[realIdx]?.url) ? '已缓存' : ''
+  const cached = cachedUrls.value.has(line.eps[realIdx]?.url) ? '已获取' : ''
   if (dlJobs.value.some((x) => x.kind === 'convert' && x.vod === vod.value?.name && x.name === nm && (x.status === 'queued' || x.status === 'running'))) return '转换中'
   const j = dlByEp.value.get(nm)
   if (!j) return localKinds.value[nm] ? '已下载' : cached
@@ -633,7 +633,7 @@ function resumePlay() {
           @click="play(i)"
           @contextmenu.prevent.stop="openMenu($event, i)"
         >
-          {{ ep.name }}<em v-if="epDl(i)" class="ep-dl" :class="{ 'ep-dl-cache': epDl(i) === '已缓存' }">{{ epDl(i) }}</em>
+          {{ ep.name }}<em v-if="epDl(i)" class="ep-dl" :class="{ 'ep-dl-cache': epDl(i) === '已获取' }">{{ epDl(i) }}</em>
         </span>
       </div>
     </div>
@@ -872,7 +872,7 @@ function resumePlay() {
   right: 4px;
   bottom: 1px;
   font-style: normal;
-  font-size: 9px;
+  font-size: 10px;
   line-height: 1;
   color: #409eff;
 }
